@@ -87,13 +87,54 @@ class ResolvedLlmCredentials(Ka2aCredentialsModel):
     extra: dict[str, Any] | None = None
 
 
+class ResolvedMcpCredentials(Ka2aCredentialsModel):
+    server_url: str | None = None
+    token: str | None = None
+    extra: dict[str, Any] | None = None
+
+
 SecretDecryptor = Callable[[EncryptedSecret], str]
 
 
 def extract_ka2a_jwt_claim(jwt_claims: dict[str, Any]) -> Ka2aJwtClaim | None:
     value = jwt_claims.get(KA2A_JWT_CLAIM_KEY)
     if value is None:
-        return None
+        # Also support flattened claim shapes like `ka2a.llm` / `ka2a.mcp` / `ka2a.v`.
+        # This is helpful for JWT issuers that don't easily support nested JSON objects.
+        flattened: dict[str, Any] = {}
+
+        def _set_path(root: dict[str, Any], parts: list[str], val: Any) -> None:
+            cur: dict[str, Any] = root
+            for name in parts[:-1]:
+                next_obj = cur.get(name)
+                if not isinstance(next_obj, dict):
+                    next_obj = {}
+                    cur[name] = next_obj
+                cur = next_obj
+            cur[parts[-1]] = val
+
+        for k, v in jwt_claims.items():
+            if not isinstance(k, str):
+                continue
+            if k == "ka2a_llm":
+                _set_path(flattened, ["llm"], v)
+                continue
+            if k == "ka2a_mcp":
+                _set_path(flattened, ["mcp"], v)
+                continue
+            if not k.startswith(f"{KA2A_JWT_CLAIM_KEY}."):
+                continue
+            path = k[len(f"{KA2A_JWT_CLAIM_KEY}.") :]
+            if not path:
+                continue
+            parts = [p for p in path.split(".") if p]
+            if not parts:
+                continue
+            _set_path(flattened, parts, v)
+
+        value = flattened or None
+        if value is None:
+            return None
     try:
         return Ka2aJwtClaim.model_validate(value)
     except Exception:
@@ -130,6 +171,34 @@ def resolve_llm_credentials_from_metadata(
     if principal is None or principal.claims is None:
         return None
     return resolve_llm_credentials_from_claims(jwt_claims=principal.claims, decrypt=decrypt)
+
+
+def resolve_mcp_credentials_from_claims(
+    *,
+    jwt_claims: dict[str, Any],
+    decrypt: SecretDecryptor,
+) -> ResolvedMcpCredentials | None:
+    ka2a = extract_ka2a_jwt_claim(jwt_claims)
+    if ka2a is None or ka2a.mcp is None:
+        return None
+    token = decrypt(ka2a.mcp.token) if ka2a.mcp.token is not None else None
+    return ResolvedMcpCredentials(
+        server_url=ka2a.mcp.server_url,
+        token=token,
+        extra=ka2a.mcp.extra,
+    )
+
+
+def resolve_mcp_credentials_from_metadata(
+    *,
+    metadata: dict[str, Any] | None,
+    decrypt: SecretDecryptor,
+    principal_metadata_key: str = KA2A_PRINCIPAL_METADATA_KEY,
+) -> ResolvedMcpCredentials | None:
+    principal = extract_principal(metadata or {}, key=principal_metadata_key)
+    if principal is None or principal.claims is None:
+        return None
+    return resolve_mcp_credentials_from_claims(jwt_claims=principal.claims, decrypt=decrypt)
 
 
 def resolve_llm_credentials_from_env(

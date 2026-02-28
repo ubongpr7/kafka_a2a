@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -67,6 +68,8 @@ TaskProcessor = Callable[
     [Task, Message, TaskConfiguration | None, dict[str, Any] | None],
     AsyncIterator[TaskStatus | Artifact | TaskStatusUpdateEvent | TaskArtifactUpdateEvent],
 ]
+
+logger = logging.getLogger("kafka_a2a.agent")
 
 @dataclass(slots=True)
 class Ka2aAgentConfig:
@@ -661,6 +664,14 @@ class Ka2aAgent:
     ) -> None:
         async def _run() -> None:
             try:
+                logger.info(
+                    "task_start",
+                    extra={
+                        "agent": self.card.name,
+                        "taskId": task.id,
+                        "contextId": task.context_id,
+                    },
+                )
                 working_event = await self._store.append_status(
                     task_id=task.id,
                     status=TaskStatus(
@@ -709,6 +720,14 @@ class Ka2aAgent:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                logger.exception(
+                    "task_failed",
+                    extra={
+                        "agent": self.card.name,
+                        "taskId": task.id,
+                        "contextId": task.context_id,
+                    },
+                )
                 failed_event = await self._store.append_status(
                     task_id=task.id,
                     status=TaskStatus(
@@ -718,6 +737,20 @@ class Ka2aAgent:
                 )
                 self._enqueue_push(task_id=task.id, event=failed_event)
             finally:
+                try:
+                    updated = await self._store.get_task(task.id)
+                    if updated is not None:
+                        logger.info(
+                            "task_end",
+                            extra={
+                                "agent": self.card.name,
+                                "taskId": task.id,
+                                "contextId": task.context_id,
+                                "state": updated.status.state.value,
+                            },
+                        )
+                except Exception:
+                    pass
                 self._processing.pop(task.id, None)
 
         self._processing[task.id] = asyncio.create_task(_run())

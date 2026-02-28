@@ -5,21 +5,12 @@ import json
 from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from kafka_a2a.credentials import ResolvedLlmCredentials
-
-
-def _require_langchain_core() -> Any:
-    try:
-        from langchain_core.messages import AIMessage  # noqa: F401
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(
-            "Gemini LLM adapter requires the `lang` extra (e.g. `uv sync --extra lang`)."
-        ) from exc
-    from langchain_core.messages import AIMessage
-
-    return AIMessage
+from kafka_a2a.llms.chat_model import ChatResponse
+from kafka_a2a.llms.controls import RetryConfig, backoff_delay_s, llm_semaphore
 
 
 def _normalize_base_url(base_url: str | None) -> str:
@@ -41,18 +32,81 @@ def _to_gemini_contents(messages: Iterable[Any]) -> tuple[str | None, list[dict[
     system_parts: list[str] = []
     contents: list[dict[str, Any]] = []
 
+    def _as_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    def _to_parts(content: Any) -> list[dict[str, Any]]:
+        if content is None:
+            return [{"text": ""}]
+        if isinstance(content, str):
+            return [{"text": content}]
+        if isinstance(content, list):
+            out: list[dict[str, Any]] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("kind") or item.get("type") or "").strip().lower()
+                if kind in ("text",):
+                    out.append({"text": _as_text(item.get("text"))})
+                    continue
+                if kind in ("file",):
+                    file_obj = item.get("file") if isinstance(item.get("file"), dict) else {}
+                    mime = _as_text(
+                        file_obj.get("mime_type") or file_obj.get("mimeType") or "application/octet-stream"
+                    )
+                    if isinstance(file_obj.get("bytes"), str) and file_obj.get("bytes"):
+                        out.append({"inline_data": {"mime_type": mime, "data": file_obj["bytes"]}})
+                        continue
+                    if isinstance(file_obj.get("uri"), str) and file_obj.get("uri"):
+                        out.append({"file_data": {"mime_type": mime, "file_uri": file_obj["uri"]}})
+                        continue
+                    out.append({"text": f"[file mime={mime}]"})
+                    continue
+                if kind in ("image_url",):
+                    image_url = item.get("image_url") if isinstance(item.get("image_url"), dict) else {}
+                    url = _as_text(image_url.get("url") or item.get("url"))
+                    if url.startswith("data:") and ";base64," in url:
+                        meta, b64 = url.split(";base64,", 1)
+                        mime = meta[len("data:") :] or "application/octet-stream"
+                        out.append({"inline_data": {"mime_type": mime, "data": b64}})
+                        continue
+                    out.append({"file_data": {"mime_type": "image/*", "file_uri": url}})
+                    continue
+                if kind in ("data",):
+                    out.append({"text": json.dumps(item.get("data"), ensure_ascii=False)})
+                    continue
+                if kind in ("tool-call", "tool-result"):
+                    out.append({"text": json.dumps(item, ensure_ascii=False)})
+                    continue
+                out.append({"text": f"[{kind or 'part'}]"})
+            return out or [{"text": ""}]
+        return [{"text": _as_text(content)}]
+
     for msg in messages:
         msg_type = getattr(msg, "type", None) or getattr(msg, "role", None) or ""
         msg_type = str(msg_type).lower()
         content = getattr(msg, "content", None)
-        if content is None:
-            content = ""
-        if not isinstance(content, str):
-            content = str(content)
 
         if msg_type in ("system",):
-            if content:
-                system_parts.append(content)
+            if content is None:
+                continue
+            if isinstance(content, str):
+                if content:
+                    system_parts.append(content)
+                continue
+            if isinstance(content, list):
+                for p in _to_parts(content):
+                    text = p.get("text")
+                    if isinstance(text, str) and text.strip():
+                        system_parts.append(text.strip())
+                continue
+            text = _as_text(content).strip()
+            if text:
+                system_parts.append(text)
             continue
 
         role = "user"
@@ -61,10 +115,18 @@ def _to_gemini_contents(messages: Iterable[Any]) -> tuple[str | None, list[dict[
         elif msg_type in ("human", "user"):
             role = "user"
 
-        contents.append({"role": role, "parts": [{"text": content}]})
+        contents.append({"role": role, "parts": _to_parts(content)})
 
     system_text = "\n\n".join(system_parts).strip() or None
     return system_text, contents
+
+
+class UpstreamHttpError(RuntimeError):
+    def __init__(self, *, status: int, body: str, headers: dict[str, str] | None = None) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = int(status)
+        self.body = body
+        self.headers = headers or {}
 
 
 @dataclass(slots=True)
@@ -72,7 +134,7 @@ class GeminiChatModel:
     """
     Minimal Gemini GenerateContent client (REST).
 
-    Dependency-free (stdlib urllib). Returns a LangChain `AIMessage` from `ainvoke()`.
+    Dependency-free (stdlib urllib). Returns a provider-agnostic `ChatResponse` from `ainvoke()`.
     """
 
     api_key: str
@@ -81,9 +143,7 @@ class GeminiChatModel:
     timeout_s: float = 60.0
     extra: dict[str, Any] | None = None
 
-    async def ainvoke(self, messages: Iterable[Any], **_: Any) -> Any:
-        AIMessage = _require_langchain_core()
-
+    async def ainvoke(self, messages: Iterable[Any], **_: Any) -> ChatResponse:
         system_text, contents = _to_gemini_contents(messages)
         if not contents:
             contents = [{"role": "user", "parts": [{"text": ""}]}]
@@ -103,10 +163,47 @@ class GeminiChatModel:
 
         def _post() -> bytes:
             req = Request(url, data=body, headers=headers, method="POST")
-            with urlopen(req, timeout=float(self.timeout_s)) as resp:  # noqa: S310
-                return resp.read()
+            try:
+                with urlopen(req, timeout=float(self.timeout_s)) as resp:  # noqa: S310
+                    return resp.read()
+            except HTTPError as exc:
+                err_body = ""
+                try:
+                    err_body = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    err_body = ""
+                err_headers = {str(k): str(v) for k, v in dict(getattr(exc, "headers", {}) or {}).items()}
+                raise UpstreamHttpError(status=int(getattr(exc, "code", 0) or 0), body=err_body, headers=err_headers) from exc
 
-        raw = await asyncio.to_thread(_post)
+        retry_cfg = RetryConfig.from_env()
+
+        async def _post_with_retries() -> bytes:
+            attempt = 0
+            while True:
+                try:
+                    return await asyncio.to_thread(_post)
+                except UpstreamHttpError as exc:
+                    retryable = exc.status in (408, 409, 425, 429, 500, 502, 503, 504)
+                    if attempt >= max(0, retry_cfg.max_retries) or not retryable:
+                        detail = exc.body.strip() or str(exc)
+                        raise RuntimeError(f"Gemini upstream error ({exc.status}): {detail}") from exc
+                    retry_after_s: float | None = None
+                    ra = (exc.headers.get("Retry-After") or exc.headers.get("retry-after") or "").strip()
+                    if ra:
+                        try:
+                            retry_after_s = float(ra)
+                        except Exception:
+                            retry_after_s = None
+                    await asyncio.sleep(backoff_delay_s(attempt=attempt, cfg=retry_cfg, retry_after_s=retry_after_s))
+                    attempt += 1
+
+        sem = llm_semaphore()
+        if sem is None:
+            raw = await _post_with_retries()
+        else:
+            async with sem:
+                raw = await _post_with_retries()
+
         data = json.loads(raw.decode("utf-8"))
 
         try:
@@ -114,12 +211,44 @@ class GeminiChatModel:
         except Exception as exc:
             raise RuntimeError(f"Unexpected Gemini response: {data}") from exc
 
-        texts: list[str] = []
+        out_parts: list[dict[str, Any]] = []
         for part in parts:
+            if not isinstance(part, dict):
+                continue
             text = part.get("text")
-            if text:
-                texts.append(str(text))
-        return AIMessage(content="".join(texts))
+            if isinstance(text, str) and text:
+                out_parts.append({"kind": "text", "text": text})
+                continue
+            inline_data = part.get("inline_data") or part.get("inlineData")
+            if isinstance(inline_data, dict):
+                mime = inline_data.get("mime_type") or inline_data.get("mimeType") or "application/octet-stream"
+                b64 = inline_data.get("data") or ""
+                if isinstance(b64, str) and b64:
+                    out_parts.append({"kind": "file", "file": {"bytes": b64, "mimeType": str(mime)}})
+                    continue
+            file_data = part.get("file_data") or part.get("fileData")
+            if isinstance(file_data, dict):
+                mime = file_data.get("mime_type") or file_data.get("mimeType") or "application/octet-stream"
+                uri = file_data.get("file_uri") or file_data.get("fileUri") or ""
+                if isinstance(uri, str) and uri:
+                    out_parts.append({"kind": "file", "file": {"uri": uri, "mimeType": str(mime)}})
+                    continue
+            fn = part.get("function_call") or part.get("functionCall")
+            if isinstance(fn, dict):
+                name = fn.get("name") or ""
+                args = fn.get("args") or fn.get("arguments") or {}
+                if isinstance(name, str) and name:
+                    out_parts.append(
+                        {"kind": "tool-call", "name": name, "arguments": args if isinstance(args, dict) else {"value": args}}
+                    )
+                    continue
+
+        # Preserve multimodal outputs as a list; otherwise collapse to a string.
+        non_text = any((p.get("kind") or "").lower() != "text" for p in out_parts)
+        if non_text:
+            return ChatResponse(content=out_parts, raw=data)
+        text_out = "".join([str(p.get("text") or "") for p in out_parts]).strip()
+        return ChatResponse(content=text_out, raw=data)
 
 
 def create_chat_model(
@@ -146,4 +275,3 @@ def create_chat_model(
         base_url=creds.base_url,
         extra=creds.extra,
     )
-

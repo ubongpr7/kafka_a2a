@@ -17,11 +17,15 @@ Design constraints:
 - **Registry + discovery**: agents publish AgentCards to a Kafka topic (`ka2a.agent_cards`).
 - **Gateway HTTP endpoints**: `/agents`, `/tasks`, `/tasks/{id}`, `/tasks/{id}/events` (SSE), plus `/chat` + `/upload` + `/stream`.
 - **Task stores**: in-memory (default) and Redis (`KA2A_TASK_STORE=redis`).
+- **Long-session memory (optional)**: per-context summary/profile stored in memory or Redis (`KA2A_CONTEXT_MEMORY_*`).
 - **Push notifications** (optional): `tasks/pushNotificationConfig/*` + delivery to `http(s)://...` webhooks or `kafka://topic`.
 - **SaaS / multi-tenant isolation** (optional): per-task principal enforcement via request `metadata`.
-- **JWT verification hook** (optional): FastAPI gateway/proxy can verify Bearer JWTs and forward a `Principal` in metadata.
+- **JWT verification hook** (optional): FastAPI gateway/proxy can verify Bearer JWTs (HS/RS/ES, JWKS supported) and forward a `Principal` in metadata.
 - **Local/dev credentials** (optional): resolve a single set of LLM credentials from `.env` / process env.
 - **LangGraph processor** (optional): `langgraph-chat` with pluggable `KA2A_LLM_FACTORY` (default: OpenAI-compatible adapter).
+- **Router processor** (optional): `router` host agent that selects downstream agents by card/skills and delegates over Kafka.
+- **Multimodal (partial)**: `/upload` sends file bytes; Gemini adapter can pass vision parts and return file artifacts.
+- **Ops helpers**: `ka2a ensure-topics` for clusters with Kafka auto-topic-creation disabled.
 
 ## Architecture (Kafka topics)
 
@@ -56,6 +60,13 @@ cp .env.example .env
 
 ```bash
 docker compose up -d --build
+```
+
+If your Kafka cluster has **auto-topic-creation disabled**, create the required topics first:
+
+```bash
+# Uses KA2A_BOOTSTRAP_SERVERS from .env
+docker compose run --rm gateway ensure-topics --agents host,echo --client-ids gateway,proxy
 ```
 
 Optional: if you want to run Kafka locally for development, you can use `kafka/docker-compose.yml` and then point
@@ -137,6 +148,12 @@ You can add more agent services by copying `echo-agent` and pointing it at a dif
 docker compose up -d --scale echo-agent=3
 ```
 
+To make the host agent act as an orchestrator, set:
+
+```bash
+KA2A_AGENT_PROCESSOR=router
+```
+
 ## Quickstart (Python / dev)
 
 1) Start (or choose) a Kafka broker, then set `KA2A_BOOTSTRAP_SERVERS` in your `.env`:
@@ -203,6 +220,7 @@ Commands:
 - `ka2a agent` — runs an agent that consumes `ka2a.req.<agent>` and replies to client reply topics
 - `ka2a gateway` — runs the FastAPI gateway on `KA2A_GATEWAY_PORT` (default `8000`)
 - `ka2a proxy` — runs the A2A HTTP proxy on `KA2A_PROXY_PORT` (default `8001`)
+- `ka2a ensure-topics` — creates required Kafka topics when auto-topic-creation is disabled
 
 ## Agent configuration (env)
 
@@ -215,15 +233,16 @@ Agent runtime:
 - `KA2A_AGENT_DESCRIPTION`
 - `KA2A_AGENT_URL`
 - `KA2A_AGENT_VERSION` (default `0.1.0`)
-- `KA2A_AGENT_PROCESSOR` = `echo` | `prompted-echo` | `langgraph-chat` | `pkg.module:callable` (default `echo`)
+- `KA2A_AGENT_PROCESSOR` = `echo` | `prompted-echo` | `langgraph-chat` | `router` | `pkg.module:callable` (default `echo`)
 - `KA2A_SYSTEM_PROMPT` (used by `prompted-echo`)
 - `KA2A_AGENT_PUSH_NOTIFICATIONS` (`true|false`)
 - `KA2A_TASK_STORE` = `memory` | `redis` (default `memory`)
 - `KA2A_REDIS_URL` (required when `KA2A_TASK_STORE=redis`)
 - `KA2A_REDIS_NAMESPACE` (optional; default `ka2a`)
+- `KA2A_CONTEXT_HISTORY_TURNS` (default `20`; max turns injected into the LLM prompt per context)
 
 Multi-tenant isolation (optional):
-- `KA2A_TENANT_ISOLATION` (`true|false`)
+- `KA2A_TENANT_ISOLATION` (`true|false`; defaults to true when `KA2A_LLM_CREDENTIALS_SOURCE!=env`)
 - `KA2A_REQUIRE_TENANT_MATCH` (`true|false`, default true)
 - `KA2A_PRINCIPAL_METADATA_KEY` (default `urn:ka2a:principal`)
 - `KA2A_STORE_PRINCIPAL_SECRETS` (`true|false`, default false; if true, persists `claims`/`bearerToken` to stored Tasks)
@@ -231,6 +250,26 @@ Multi-tenant isolation (optional):
 AgentCard override (optional):
 - `KA2A_AGENT_CARD_PATH=/path/to/agent-card.json` (mount it in Docker and the agent will merge Kafka transport info)
   - Example cards are in `agent_cards/host.agent-card.json` and `agent_cards/echo.agent-card.json`
+
+Long-session memory (optional):
+- `KA2A_CONTEXT_MEMORY_STORE` = `off` | `memory` | `redis` (default `off`)
+- `KA2A_CONTEXT_MEMORY_SUMMARY` (`true|false`, default false)
+- `KA2A_CONTEXT_MEMORY_PROFILE` (`true|false`, default false)
+- `KA2A_CONTEXT_MEMORY_UPDATE_EVERY` (default `1`; update every N turns)
+- `KA2A_CONTEXT_MEMORY_HISTORY_ITEMS` (default `12`; items included in memory update prompt)
+- `KA2A_CONTEXT_MEMORY_MAX_SUMMARY_CHARS` (default `1200`)
+- `KA2A_CONTEXT_MEMORY_TTL_S` (optional; Redis only)
+
+Upstream LLM robustness (optional):
+- `KA2A_LLM_MAX_CONCURRENCY` (default `5`; set `0` to disable limiter)
+- `KA2A_LLM_RETRY_MAX_RETRIES` (default `3`)
+- `KA2A_LLM_RETRY_BASE_DELAY_S` (default `0.5`)
+- `KA2A_LLM_RETRY_MAX_DELAY_S` (default `8`)
+
+Router processor (optional):
+- `KA2A_ROUTER_LLM_SELECTION` (`true|false`, default true)
+- `KA2A_ROUTER_FALLBACK_AGENT` (optional; if routing is ambiguous)
+- `KA2A_DIRECTORY_AUTO_OFFSET_RESET` (default `earliest`; used by the router directory watcher)
 
 ## Push notifications (optional)
 
@@ -250,8 +289,12 @@ at the edge and forward a `Principal` into request metadata (`urn:ka2a:principal
 
 JWT env vars (gateway/proxy):
 - `KA2A_JWT_ENABLED=true`
-- `KA2A_JWT_KEY` (HS shared secret, or RS/ES public key PEM)
+- `KA2A_JWT_KEY` (HS shared secret, or RS/ES public key PEM; optional if `KA2A_JWT_JWKS_URL` is set)
   - or `KA2A_JWT_KEY_PATH=/run/secrets/jwt_public.pem`
+- `KA2A_JWT_JWKS_URL=https://.../.well-known/jwks.json` (recommended for RS256/ES256 + key rotation)
+- `KA2A_JWT_JWKS_CACHE_LIFESPAN_S=300`
+- `KA2A_JWT_JWKS_TIMEOUT_S=30`
+- `KA2A_JWT_JWKS_HEADERS={"Authorization":"Bearer ..."}`
 - `KA2A_JWT_ALGORITHMS=RS256` (or `HS256`, `ES256`, comma-separated)
 - `KA2A_JWT_USER_CLAIM=sub` (your user id claim)
 - `KA2A_JWT_TENANT_CLAIM=tenant_id` (optional)
@@ -281,6 +324,8 @@ Example JWT payload:
 Important:
 - JWT payloads are **not confidential** by default (signature != encryption). Only put encrypted blobs in claims.
 - By default, agents do **not** persist `Principal.bearerToken`/`Principal.claims` to stored Tasks.
+- If your issuer cannot embed nested JSON objects, K-A2A also accepts flattened claim keys like
+  `ka2a.llm.provider`, `ka2a.llm.apiKey`, `ka2a.mcp.*`.
 
 ## Local/dev LLM credentials from `.env` (optional)
 

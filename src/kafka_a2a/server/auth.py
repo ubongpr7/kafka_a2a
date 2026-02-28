@@ -14,18 +14,27 @@ class JwtBearerConfig:
     This is intentionally generic so it can work with Django/DRF SimpleJWT and similar setups.
     """
 
-    # HS* => shared secret; RS*/ES* => public key (PEM)
-    secret: str
+    # HS* => shared secret; RS*/ES* => public key (PEM). Optional if `jwks_url` is set.
+    secret: str = ""
     algorithms: list[str] = field(default_factory=lambda: ["HS256"])
     audience: str | None = None
     issuer: str | None = None
     leeway_s: int = 0
+
+    # JWKS support (recommended for RS*/ES* deployments with key rotation).
+    jwks_url: str | None = None
+    jwks_cache_lifespan_s: float = 300.0
+    jwks_timeout_s: float = 30.0
+    jwks_headers: dict[str, str] | None = None
 
     user_claim: str = "sub"
     tenant_claim: str | None = None
 
     forward_bearer_token: bool = False
     include_claims: bool = False
+
+    # Cached JWKS client (created lazily). Stored here to preserve caching across requests.
+    _jwks_client: Any | None = field(default=None, init=False, repr=False)
 
 
 class JwtVerificationError(Exception):
@@ -48,9 +57,21 @@ def verify_bearer_jwt(*, token: str, config: JwtBearerConfig) -> Principal:
 
     options = {"verify_aud": config.audience is not None}
     try:
+        key: Any = config.secret
+        if config.jwks_url:
+            if config._jwks_client is None:
+                config._jwks_client = jwt.PyJWKClient(
+                    config.jwks_url,
+                    cache_keys=True,
+                    lifespan=float(config.jwks_cache_lifespan_s),
+                    timeout=float(config.jwks_timeout_s),
+                    headers=dict(config.jwks_headers or {}),
+                )
+            key = config._jwks_client.get_signing_key_from_jwt(token).key
+
         claims: dict[str, Any] = jwt.decode(
             token,
-            config.secret,
+            key,
             algorithms=config.algorithms,
             audience=config.audience,
             issuer=config.issuer,

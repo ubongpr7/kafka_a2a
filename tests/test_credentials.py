@@ -6,6 +6,8 @@ from kafka_a2a.credentials import (
     KA2A_JWT_CLAIM_KEY,
     resolve_llm_credentials_from_claims,
     resolve_llm_credentials_from_metadata,
+    resolve_mcp_credentials_from_claims,
+    resolve_mcp_credentials_from_metadata,
     strip_principal_secrets_for_storage,
 )
 from kafka_a2a.models import Message, TextPart, Task
@@ -27,6 +29,20 @@ def test_resolve_llm_credentials_from_claims() -> None:
     assert cred.provider == "openai"
     assert cred.model == "gpt-4.1-mini"
     assert cred.api_key == "sk-test"
+
+
+def test_resolve_llm_credentials_from_flattened_claims() -> None:
+    claims = {
+        "ka2a.v": 1,
+        "ka2a.llm.provider": "gemini",
+        "ka2a.llm.model": "gemini-1.5-flash",
+        "ka2a.llm.apiKey": "ENC",
+    }
+    cred = resolve_llm_credentials_from_claims(jwt_claims=claims, decrypt=lambda _: "key")
+    assert cred is not None
+    assert cred.provider == "gemini"
+    assert cred.model == "gemini-1.5-flash"
+    assert cred.api_key == "key"
 
 
 def test_resolve_llm_credentials_from_metadata() -> None:
@@ -56,6 +72,37 @@ def test_strip_principal_secrets_for_storage() -> None:
     assert stored["userId"] == "u1"
     assert "bearerToken" not in stored
     assert "claims" not in stored
+
+
+def test_resolve_mcp_credentials_from_claims() -> None:
+    claims = {
+        KA2A_JWT_CLAIM_KEY: {
+            "v": 1,
+            "mcp": {"serverUrl": "https://mcp.example", "token": "ENC"},
+        }
+    }
+    cred = resolve_mcp_credentials_from_claims(jwt_claims=claims, decrypt=lambda _: "tok")
+    assert cred is not None
+    assert cred.server_url == "https://mcp.example"
+    assert cred.token == "tok"
+
+
+def test_resolve_mcp_credentials_from_metadata() -> None:
+    principal = Principal(
+        user_id="u1",
+        tenant_id="acme",
+        claims={
+            KA2A_JWT_CLAIM_KEY: {
+                "v": 1,
+                "mcp": {"serverUrl": "https://mcp.example", "token": {"ciphertext": "ENC"}},
+            }
+        },
+    )
+    metadata = with_principal({}, principal)
+    cred = resolve_mcp_credentials_from_metadata(metadata=metadata, decrypt=lambda _: "tok")
+    assert cred is not None
+    assert cred.server_url == "https://mcp.example"
+    assert cred.token == "tok"
 
 
 @pytest.mark.asyncio
@@ -105,4 +152,3 @@ async def test_agent_can_persist_principal_secrets_when_enabled() -> None:
     assert stored["userId"] == "u1"
     assert stored["bearerToken"] == "tok"
     assert stored["claims"] == {"a": 1}
-

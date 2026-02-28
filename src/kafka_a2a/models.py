@@ -200,7 +200,31 @@ class DataPart(Ka2aModel):
     metadata: dict[str, Any] | None = None
 
 
-Part = Union[TextPart, FilePart, DataPart]
+class ToolCallPart(Ka2aModel):
+    """
+    Tool invocation request emitted by an agent/LLM (MCP-ready).
+    """
+
+    kind: Literal["tool-call"] = "tool-call"
+    tool_call_id: str = Field(default_factory=lambda: str(uuid4()))
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] | None = None
+
+
+class ToolResultPart(Ka2aModel):
+    """
+    Tool invocation result (MCP-ready).
+    """
+
+    kind: Literal["tool-result"] = "tool-result"
+    tool_call_id: str
+    output: Any | None = None
+    is_error: bool | None = None
+    metadata: dict[str, Any] | None = None
+
+
+Part = Union[TextPart, FilePart, DataPart, ToolCallPart, ToolResultPart]
 
 
 class Role(str, Enum):
