@@ -30,6 +30,34 @@ async def test_task_store_records_and_fanout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_task_store_preserves_context_id_and_owns_task_id() -> None:
+    store = InMemoryTaskStore()
+    initial = Message(role="user", parts=[TextPart(text="hi")], task_id="client", context_id="ctx1")
+    task = await store.create_task(initial_message=initial)
+
+    assert task.context_id == "ctx1"
+    assert initial.context_id == "ctx1"
+
+    assert task.id != "client"
+    assert initial.task_id == task.id
+
+
+@pytest.mark.asyncio
+async def test_task_store_lists_tasks_by_context() -> None:
+    store = InMemoryTaskStore()
+    ctx = "ctx-a"
+    t1 = await store.create_task(initial_message=Message(role="user", parts=[TextPart(text="1")], context_id=ctx))
+    t2 = await store.create_task(initial_message=Message(role="user", parts=[TextPart(text="2")], context_id=ctx))
+    t3 = await store.create_task(initial_message=Message(role="user", parts=[TextPart(text="3")], context_id=ctx))
+
+    tasks = await store.list_tasks_by_context(ctx)
+    assert [t.id for t in tasks] == [t1.id, t2.id, t3.id]
+
+    tasks2 = await store.list_tasks_by_context(ctx, limit=2)
+    assert [t.id for t in tasks2] == [t2.id, t3.id]
+
+
+@pytest.mark.asyncio
 async def test_task_store_push_notification_configs_crud() -> None:
     store = InMemoryTaskStore()
     initial = Message(role="user", parts=[TextPart(text="hi")])

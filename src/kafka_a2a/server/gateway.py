@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
-from kafka_a2a.models import AgentCard, FilePart, FileWithBytes, Message, TextPart
+from kafka_a2a.models import AgentCard, FilePart, FileWithBytes, Ka2aModel, Message, TaskConfiguration, TextPart
 from kafka_a2a.protocol import METHOD_TASKS_LIST, TaskListParams, TaskListResult
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
 from kafka_a2a.server.auth import JwtBearerConfig, JwtVerificationError, parse_authorization_header, verify_bearer_jwt
@@ -37,7 +37,7 @@ class GatewayConfig:
 
 def create_gateway_app(config: GatewayConfig):
     FastAPI = _require_fastapi()
-    from fastapi import Body, File, Form, HTTPException, Request, UploadFile
+    from fastapi import File, Form, HTTPException, Request, UploadFile
     from fastapi.responses import JSONResponse, StreamingResponse
 
     transport = KafkaTransport(KafkaConfig(bootstrap_servers=config.bootstrap_servers))
@@ -48,6 +48,12 @@ def create_gateway_app(config: GatewayConfig):
     registry_task: Any | None = None
 
     app = FastAPI(title="K-A2A Gateway", version="0.1.0")
+
+    class ChatRequest(Ka2aModel):
+        text: str
+        agent_name: str | None = None
+        context_id: str | None = None
+        history_length: int | None = None
 
     def _metadata_from_request(request: Request) -> dict[str, Any] | None:
         if config.jwt is None:
@@ -182,14 +188,19 @@ def create_gateway_app(config: GatewayConfig):
     @app.post("/chat")
     async def chat(
         request: Request,
-        text: str = Body(..., embed=True),
-        agent_name: str | None = Body(None, embed=True),
+        body: ChatRequest,
     ) -> Any:
         metadata = _metadata_from_request(request)
-        msg = Message(role="user", parts=[TextPart(text=text)])
+        msg = Message(role="user", parts=[TextPart(text=body.text)], context_id=body.context_id)
+        configuration = (
+            TaskConfiguration(history_length=body.history_length) if body.history_length is not None else None
+        )
         try:
             task = await client.send_message(
-                agent_name=agent_name or config.default_agent, message=msg, metadata=metadata
+                agent_name=body.agent_name or config.default_agent,
+                message=msg,
+                configuration=configuration,
+                metadata=metadata,
             )
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail="Agent did not respond in time") from exc
@@ -200,16 +211,22 @@ def create_gateway_app(config: GatewayConfig):
         request: Request,
         file: UploadFile = File(...),
         agent_name: str | None = Form(None),
+        context_id: str | None = Form(None, alias="contextId"),
+        history_length: int | None = Form(None, alias="historyLength"),
     ) -> Any:
         metadata = _metadata_from_request(request)
         raw = await file.read()
         mime = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
         b64 = base64.b64encode(raw).decode("utf-8")
         part = FilePart(file=FileWithBytes(bytes=b64, mime_type=mime))
-        msg = Message(role="user", parts=[part])
+        msg = Message(role="user", parts=[part], context_id=context_id)
+        configuration = TaskConfiguration(history_length=history_length) if history_length is not None else None
         try:
             task = await client.send_message(
-                agent_name=agent_name or config.default_agent, message=msg, metadata=metadata
+                agent_name=agent_name or config.default_agent,
+                message=msg,
+                configuration=configuration,
+                metadata=metadata,
             )
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail="Agent did not respond in time") from exc
@@ -218,14 +235,19 @@ def create_gateway_app(config: GatewayConfig):
     @app.post("/stream")
     async def stream(
         request: Request,
-        text: str = Body(..., embed=True),
-        agent_name: str | None = Body(None, embed=True),
+        body: ChatRequest,
     ):
         metadata = _metadata_from_request(request)
-        msg = Message(role="user", parts=[TextPart(text=text)])
+        msg = Message(role="user", parts=[TextPart(text=body.text)], context_id=body.context_id)
+        configuration = (
+            TaskConfiguration(history_length=body.history_length) if body.history_length is not None else None
+        )
         try:
             events = await client.stream_message(
-                agent_name=agent_name or config.default_agent, message=msg, metadata=metadata
+                agent_name=body.agent_name or config.default_agent,
+                message=msg,
+                configuration=configuration,
+                metadata=metadata,
             )
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail="Agent did not respond in time") from exc
