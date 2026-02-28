@@ -100,6 +100,24 @@ To stream task events (SSE), capture the `id` from `/chat` and then:
 curl -N "http://localhost:8000/tasks/<task_id>/events"
 ```
 
+## Playground UI (Next.js + Redux)
+
+This repo includes a simple UI in `frontend/` that:
+- Sends streaming chat requests (`/stream`)
+- Reuses `contextId` so the agent remembers the session
+- Shows the full event timeline (task/status/artifact updates)
+
+Run it:
+
+```bash
+cd frontend
+yarn install
+cp .env.example .env.local
+yarn dev
+```
+
+Open `http://localhost:3000`. Make sure the gateway is reachable at `KA2A_GATEWAY_URL` (default `http://localhost:8000`).
+
 Test the A2A HTTP proxy:
 
 ```bash
