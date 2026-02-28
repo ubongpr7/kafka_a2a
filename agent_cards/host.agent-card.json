@@ -1,0 +1,23 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "host",
+  "description": "Host agent (example)",
+  "url": "kafka://host",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": true
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "chat",
+      "name": "Chat",
+      "description": "Basic chat skill (example).",
+      "examples": ["hello", "help me draft an email"]
+    }
+  ]
+}
+

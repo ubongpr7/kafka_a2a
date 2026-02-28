@@ -1,0 +1,297 @@
+\documentclass[12pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{graphicx}
+
+\title{\textbf{K-A2A: Kafka-Based Agent-to-Agent Protocol Specification}}
+\author{Universal Multimodal Agentic Infrastructure}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Mission Statement}
+
+This document specifies the architecture and protocol for a universal, open-source, Kafka-based Agent-to-Agent (A2A) system with full feature parity to Google's A2A protocol, but using Kafka as the exclusive communication transport layer.
+
+The system must:
+
+\begin{itemize}
+    \item Be fully event-driven
+    \item Support agent discovery via Agent Cards
+    \item Allow multi-Kafka-cluster interoperability
+    \item Be LLM-agnostic (OpenAI, Gemini, Grok, Bedrock, open-source models)
+    \item Support MCP (Model Context Protocol) tools
+    \item Provide FastAPI-based multimodal Host Agent endpoints
+    \item Be distributed, scalable, and fault tolerant
+    \item Be installable as a standard Python library
+\end{itemize}
+
+\section{Core Architectural Principle}
+
+All inter-agent communication MUST occur via Kafka.
+
+\subsection{No Direct Communication}
+Agents SHALL NOT:
+\begin{itemize}
+    \item Call each other via HTTP
+    \item Use RPC between services
+    \item Bypass Kafka transport
+\end{itemize}
+
+Kafka is the sole transport backbone.
+
+\section{System Overview}
+
+\subsection{Major Components}
+
+\begin{enumerate}
+    \item Host Agent (Multimodal, FastAPI exposed)
+    \item Distributed Agent Mesh
+    \item Kafka Transport Layer (multi-cluster capable)
+    \item Agent Registry (Agent Card Discovery)
+    \item LLM Abstraction Layer
+    \item MCP Tool Integration Layer
+    \item Inventory/Data Layer
+\end{enumerate}
+
+\section{Host Agent (Multimodal Entry Point)}
+
+The Host Agent is a multimodal intelligent gateway exposed via FastAPI endpoints.
+
+\subsection{Capabilities}
+
+\begin{itemize}
+    \item Accept text input
+    \item Accept file uploads (PDF, CSV, Images, Audio)
+    \item Accept streaming inputs (via WebRTC or LiveKit)
+    \item Perform preprocessing (transcription, embeddings, classification)
+    \item Publish structured A2A messages to Kafka
+\end{itemize}
+
+\subsection{FastAPI Endpoints}
+
+\begin{itemize}
+    \item POST /chat
+    \item POST /upload
+    \item POST /stream
+    \item GET /agent-card
+    \item GET /health
+\end{itemize}
+
+The Host Agent itself MUST publish and consume Kafka events.
+
+\section{Agent Card Specification}
+
+Every agent MUST expose an Agent Card.
+
+\subsection{Agent Card Fields}
+
+\begin{lstlisting}[language=json]
+{
+  "agent_id": "uuid",
+  "session_id": "uuid",
+  "agent_name": "forecast_agent",
+  "description": "Handles demand forecasting",
+  "version": "1.0.0",
+  "capabilities": ["forecast", "trend_analysis"],
+  "kafka": {
+    "bootstrap_servers": ["kafka1:9092"],
+    "security_protocol": "SSL",
+    "topics": {
+        "requests": "agent.requests",
+        "responses": "agent.responses",
+        "errors": "agent.errors"
+    }
+  },
+  "mcp_supported": true,
+  "llm_supported": ["openai", "bedrock", "huggingface"],
+  "health_endpoint": "https://agent.domain/health"
+}
+\end{lstlisting}
+
+\subsection{Agent Discovery}
+
+The Host Agent or Orchestrator SHALL:
+
+\begin{itemize}
+    \item Fetch Agent Cards
+    \item Validate compatibility
+    \item Connect dynamically to specified Kafka clusters
+    \item Register agent in internal registry
+\end{itemize}
+
+Multi-cluster support is mandatory.
+
+\section{Kafka A2A Message Envelope}
+
+All messages MUST conform to this schema:
+
+\begin{lstlisting}[language=json]
+{
+  "message_id": "uuid",
+  "correlation_id": "uuid",
+  "sender": "agent_name",
+  "receiver": "agent_name | broadcast",
+  "intent": "string",
+  "priority": "low|medium|high|critical",
+  "payload": {},
+  "metadata": {
+      "confidence": 0.0,
+      "requires_response": true,
+      "ttl": 3000
+  },
+  "timestamp": "ISO8601"
+}
+\end{lstlisting}
+
+\section{Multi-Kafka Connectivity}
+
+Agents MUST be able to:
+
+\begin{itemize}
+    \item Connect to multiple Kafka clusters
+    \item Subscribe to multiple topics
+    \item Maintain separate consumer groups per cluster
+\end{itemize}
+
+Agent Cards define Kafka connection details.
+
+\section{MCP Tool Integration}
+
+All agents MUST support MCP tools.
+
+\subsection{Requirements}
+
+\begin{itemize}
+    \item Tool registration
+    \item Tool invocation via intent
+    \item Structured tool result publishing
+    \item Context injection into LLM
+\end{itemize}
+
+\section{LLM Abstraction Layer}
+
+The system MUST support universal LLM integration.
+
+\subsection{Supported Providers}
+
+\begin{itemize}
+    \item OpenAI
+    \item Google Gemini
+    \item Grok
+    \item Amazon Bedrock
+    \item HuggingFace
+    \item Self-hosted models
+\end{itemize}
+
+\subsection{Abstraction Interface}
+
+\begin{lstlisting}[language=Python]
+class BaseLLMProvider:
+    def generate(self, prompt, tools=None, context=None):
+        pass
+\end{lstlisting}
+
+Agents SHALL interact only with this interface.
+
+\section{Agent Base Class Requirements}
+
+Every agent must implement:
+
+\begin{itemize}
+    \item Kafka consumer loop
+    \item Intent filtering
+    \item Schema validation
+    \item MCP tool invocation support
+    \item LLM provider abstraction
+    \item Structured logging
+    \item Health endpoint
+\end{itemize}
+
+\section{Event Flow Example}
+
+\subsection{Image Upload Scenario}
+
+\begin{enumerate}
+    \item User uploads image to Host Agent
+    \item Host extracts embeddings
+    \item Host publishes classify\_inventory\_item intent
+    \item Classification Agent consumes message
+    \item Publishes result to agent.responses
+    \item Orchestrator triggers Forecast Agent
+    \item Forecast Agent emits demand projection
+    \item Inventory database updated
+\end{enumerate}
+
+\section{Security Requirements}
+
+\begin{itemize}
+    \item Kafka ACL enforcement
+    \item TLS/mTLS communication
+    \item JWT authentication on endpoints
+    \item Encrypted sensitive payloads
+\end{itemize}
+
+\section{Scalability Model}
+
+\begin{itemize}
+    \item Horizontal scaling via Kafka partitions
+    \item Consumer groups per agent type
+    \item Kubernetes deployment readiness
+    \item Stateless or semi-stateful agents
+\end{itemize}
+
+\section{Observability}
+
+\begin{itemize}
+    \item Prometheus metrics
+    \item Kafka lag monitoring
+    \item Agent processing time tracking
+    \item Error topic monitoring
+\end{itemize}
+
+\section{Standard Library Distribution}
+
+The system MUST be distributable as:
+
+\begin{itemize}
+    \item pip-installable Python package
+    \item Docker container
+    \item Kubernetes-ready Helm chart
+\end{itemize}
+
+Package Name (Proposed):
+
+\texttt{kafka-a2a}
+
+\section{Definition of Completion}
+
+The system is considered complete when:
+
+\begin{itemize}
+    \item Agents auto-discover via Agent Cards
+    \item Agents connect across multiple Kafka clusters
+    \item Multimodal Host Agent functions via FastAPI
+    \item MCP tools function correctly
+    \item Any LLM provider can be swapped without refactoring
+    \item No direct inter-agent communication exists
+\end{itemize}
+
+\section{Final Directive}
+
+This system must maintain full A2A feature parity while using Kafka as the exclusive transport layer.
+
+This is not a messaging system.
+
+This is a distributed intelligence protocol.
+
+Build accordingly.
+
+\end{document}
