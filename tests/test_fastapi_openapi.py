@@ -12,9 +12,13 @@ def test_gateway_openapi_builds() -> None:
     schema = app.openapi()
     assert isinstance(schema, dict)
     assert "/health" in schema.get("paths", {})
+    assert "/agents" in schema.get("paths", {})
     assert "/chat" in schema.get("paths", {})
     assert "/upload" in schema.get("paths", {})
     assert "/stream" in schema.get("paths", {})
+    assert "/tasks" in schema.get("paths", {})
+    assert "/tasks/{task_id}" in schema.get("paths", {})
+    assert "/tasks/{task_id}/events" in schema.get("paths", {})
 
 
 def test_proxy_openapi_builds() -> None:
@@ -24,4 +28,3 @@ def test_proxy_openapi_builds() -> None:
     assert "/health" in schema.get("paths", {})
     assert "/" in schema.get("paths", {})
     assert "/.well-known/agent-card.json" in schema.get("paths", {})
-

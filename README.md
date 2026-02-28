@@ -15,10 +15,13 @@ Design constraints:
 - **JSON-RPC 2.0 surface** over Kafka (`message/send`, `message/stream`, `tasks/*`, `agent/getCard`, etc.).
 - **Streaming**: multiple JSON-RPC responses published to the client reply topic for `message/stream` and `tasks/resubscribe`.
 - **Registry + discovery**: agents publish AgentCards to a Kafka topic (`ka2a.agent_cards`).
+- **Gateway HTTP endpoints**: `/agents`, `/tasks`, `/tasks/{id}`, `/tasks/{id}/events` (SSE), plus `/chat` + `/upload` + `/stream`.
+- **Task stores**: in-memory (default) and Redis (`KA2A_TASK_STORE=redis`).
 - **Push notifications** (optional): `tasks/pushNotificationConfig/*` + delivery to `http(s)://...` webhooks or `kafka://topic`.
 - **SaaS / multi-tenant isolation** (optional): per-task principal enforcement via request `metadata`.
 - **JWT verification hook** (optional): FastAPI gateway/proxy can verify Bearer JWTs and forward a `Principal` in metadata.
 - **Local/dev credentials** (optional): resolve a single set of LLM credentials from `.env` / process env.
+- **LangGraph processor** (optional): `langgraph-chat` with pluggable `KA2A_LLM_FACTORY` (default: OpenAI-compatible adapter).
 
 ## Architecture (Kafka topics)
 
@@ -65,6 +68,16 @@ docker compose -f kafka/docker-compose.yml up -d
 docker compose up -d --build
 ```
 
+Optional: if you want to run Redis locally for development (task persistence), use `redis/docker-compose.yml` and
+point agents at it:
+
+```bash
+docker compose -f redis/docker-compose.yml up -d --build
+# In your K-A2A .env, set:
+#   KA2A_TASK_STORE=redis
+#   KA2A_REDIS_URL=redis://:change-me@host.docker.internal:6379/0
+```
+
 Test the gateway:
 
 ```bash
@@ -72,9 +85,19 @@ curl -sS -X POST 'http://localhost:8000/chat' \
   -H 'content-type: application/json' \
   -d '{"text":"hello"}' | jq
 
+curl -sS 'http://localhost:8000/agents' | jq
+
+curl -sS 'http://localhost:8000/tasks' | jq
+
 curl -N -X POST 'http://localhost:8000/stream' \
   -H 'content-type: application/json' \
   -d '{"text":"hello"}'
+```
+
+To stream task events (SSE), capture the `id` from `/chat` and then:
+
+```bash
+curl -N "http://localhost:8000/tasks/<task_id>/events"
 ```
 
 Test the A2A HTTP proxy:
@@ -109,6 +132,9 @@ cp .env.example .env
 
 ```bash
 uv sync --locked --extra server --extra auth --extra dev
+# Optional:
+#   --extra lang   (LangGraph processor)
+#   --extra redis  (Redis task store)
 ```
 
 3) Run an agent:
@@ -171,9 +197,12 @@ Agent runtime:
 - `KA2A_AGENT_DESCRIPTION`
 - `KA2A_AGENT_URL`
 - `KA2A_AGENT_VERSION` (default `0.1.0`)
-- `KA2A_AGENT_PROCESSOR` = `echo` | `prompted-echo` | `pkg.module:callable` (default `echo`)
+- `KA2A_AGENT_PROCESSOR` = `echo` | `prompted-echo` | `langgraph-chat` | `pkg.module:callable` (default `echo`)
 - `KA2A_SYSTEM_PROMPT` (used by `prompted-echo`)
 - `KA2A_AGENT_PUSH_NOTIFICATIONS` (`true|false`)
+- `KA2A_TASK_STORE` = `memory` | `redis` (default `memory`)
+- `KA2A_REDIS_URL` (required when `KA2A_TASK_STORE=redis`)
+- `KA2A_REDIS_NAMESPACE` (optional; default `ka2a`)
 
 Multi-tenant isolation (optional):
 - `KA2A_TENANT_ISOLATION` (`true|false`)
@@ -257,8 +286,24 @@ settings = Ka2aSettings.from_env()
 creds = settings.resolve_llm_credentials()
 ```
 
+### Using the built-in LangGraph processor
+
+Set the agent processor to `langgraph-chat` and configure an LLM factory.
+By default, K-A2A uses an OpenAI-compatible Chat Completions adapter:
+`kafka_a2a.llms.openai_compat:create_chat_model`.
+
+Example:
+
+```bash
+KA2A_AGENT_PROCESSOR=langgraph-chat
+KA2A_LLM_CREDENTIALS_SOURCE=env
+KA2A_LLM_PROVIDER=gemini
+KA2A_LLM_MODEL=gemini-1.5-flash
+GOOGLE_API_KEY=your-api-key
+```
+
 ## Roadmap / known gaps
 
-- Built-in LangGraph/LangChain agent implementations (currently you provide the processor function).
+- More built-in processors (tool calling, MCP wiring patterns).
 - Authenticated Kafka (SASL/TLS) + ACL-aware topic strategy for production.
 - First-class “tool/MCP auth” patterns (claims + metadata plumbing exists, but tools are app-specific).

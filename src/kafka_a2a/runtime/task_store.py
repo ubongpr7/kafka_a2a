@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Protocol
 from uuid import uuid4
 
 from kafka_a2a.models import (
@@ -25,6 +25,42 @@ class TaskEventRecord:
     event: TaskEvent
 
 
+class TaskStore(Protocol):
+    async def create_task(
+        self,
+        *,
+        initial_message: Message,
+        context_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Task: ...
+
+    async def get_task(self, task_id: str) -> Task | None: ...
+
+    async def list_tasks(self) -> list[Task]: ...
+
+    async def list_tasks_by_context(self, context_id: str, *, limit: int | None = None) -> list[Task]: ...
+
+    async def set_push_notification_config(
+        self, *, task_id: str, config: PushNotificationConfig
+    ) -> TaskPushNotificationConfig: ...
+
+    async def get_push_notification_config(
+        self, *, task_id: str, config_id: str | None = None
+    ) -> TaskPushNotificationConfig | None: ...
+
+    async def list_push_notification_configs(self, *, task_id: str) -> list[TaskPushNotificationConfig]: ...
+
+    async def delete_push_notification_config(self, *, task_id: str, config_id: str | None = None) -> None: ...
+
+    async def append_status(self, *, task_id: str, status: TaskStatus) -> TaskStatusUpdateEvent: ...
+
+    async def append_artifact(self, *, task_id: str, artifact: Artifact) -> TaskArtifactUpdateEvent: ...
+
+    async def iter_events(self, task_id: str, *, replay_history: bool = True) -> AsyncIterator[TaskEventRecord]: ...
+
+    async def aclose(self) -> None: ...
+
+
 class InMemoryTaskStore:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -32,6 +68,7 @@ class InMemoryTaskStore:
         self._events: dict[str, list[TaskEventRecord]] = {}
         self._subscribers: dict[str, list[asyncio.Queue[TaskEventRecord]]] = {}
         self._push_configs: dict[str, dict[str, PushNotificationConfig]] = {}
+        self._contexts: dict[str, list[str]] = {}
 
     async def create_task(
         self,
@@ -41,9 +78,10 @@ class InMemoryTaskStore:
         metadata: dict[str, Any] | None = None,
     ) -> Task:
         task_id = str(uuid4())
-        context_id = context_id or str(uuid4())
-        initial_message.task_id = initial_message.task_id or task_id
-        initial_message.context_id = initial_message.context_id or context_id
+        context_id = context_id or initial_message.context_id or str(uuid4())
+        # TaskStore owns task ids; do not accept client-provided task ids.
+        initial_message.task_id = task_id
+        initial_message.context_id = context_id
         task = Task(
             id=task_id,
             context_id=context_id,
@@ -56,6 +94,7 @@ class InMemoryTaskStore:
             self._tasks[task_id] = task
             self._events[task_id] = [TaskEventRecord(sequence=0, event=task)]
             self._subscribers.setdefault(task_id, [])
+            self._contexts.setdefault(context_id, []).append(task_id)
         return task
 
     async def get_task(self, task_id: str) -> Task | None:
@@ -66,6 +105,13 @@ class InMemoryTaskStore:
     async def list_tasks(self) -> list[Task]:
         async with self._lock:
             return list(self._tasks.values())
+
+    async def list_tasks_by_context(self, context_id: str, *, limit: int | None = None) -> list[Task]:
+        async with self._lock:
+            task_ids = list(self._contexts.get(context_id, []))
+            if limit is not None and limit >= 0:
+                task_ids = task_ids[-limit:]
+            return [self._tasks[tid] for tid in task_ids if tid in self._tasks]
 
     async def set_push_notification_config(
         self, *, task_id: str, config: PushNotificationConfig
@@ -171,16 +217,20 @@ class InMemoryTaskStore:
             except ValueError:
                 return
 
-    async def iter_events(self, task_id: str) -> AsyncIterator[TaskEventRecord]:
+    async def iter_events(self, task_id: str, *, replay_history: bool = True) -> AsyncIterator[TaskEventRecord]:
         queue, history = await self.subscribe(task_id)
         try:
-            for record in history:
-                yield record
+            if replay_history:
+                for record in history:
+                    yield record
             while True:
                 record = await queue.get()
                 yield record
         finally:
             await self.unsubscribe(task_id, queue)
+
+    async def aclose(self) -> None:
+        return None
 
     def _append_event_locked(self, task_id: str, event: TaskEvent) -> TaskEventRecord:
         records = self._events.setdefault(task_id, [])

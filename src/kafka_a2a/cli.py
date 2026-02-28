@@ -55,6 +55,10 @@ def _resolve_processor(value: str | None) -> TaskProcessor:
     if name in ("prompted-echo", "prompted_echo", "prompted_echo_processor"):
         system_prompt = os.getenv("KA2A_SYSTEM_PROMPT") or os.getenv("KA2A_AGENT_SYSTEM_PROMPT")
         return make_prompted_echo_processor(system_prompt=system_prompt)
+    if name in ("langgraph-chat", "langgraph_chat", "langgraph"):
+        from kafka_a2a.langgraph_processor import make_langgraph_chat_processor_from_env
+
+        return make_langgraph_chat_processor_from_env()
 
     if ":" in name:
         module_name, attr = name.split(":", 1)
@@ -67,7 +71,7 @@ def _resolve_processor(value: str | None) -> TaskProcessor:
         return proc  # type: ignore[return-value]
 
     raise SystemExit(
-        "Unknown processor. Use one of: echo, prompted-echo, or an import path like 'pkg.module:callable'."
+        "Unknown processor. Use one of: echo, prompted-echo, langgraph-chat, or an import path like 'pkg.module:callable'."
     )
 
 
@@ -160,7 +164,23 @@ async def _run_agent(args: argparse.Namespace) -> None:
         # Prefer the card name (it defines the A2A addressable identity).
         cfg.agent_name = card.name
 
-    agent = Ka2aAgent(config=cfg, transport=transport, registry=registry, processor=processor, card=card)
+    task_store = None
+    store_kind = (args.task_store or os.getenv("KA2A_TASK_STORE") or "memory").strip().lower()
+    if store_kind not in ("memory", "redis"):
+        raise SystemExit("Invalid task store. Use: memory | redis (via --task-store or KA2A_TASK_STORE).")
+    if store_kind == "redis":
+        from kafka_a2a.runtime.redis_task_store import RedisTaskStore
+
+        task_store = RedisTaskStore.from_env()
+
+    agent = Ka2aAgent(
+        config=cfg,
+        transport=transport,
+        registry=registry,
+        processor=processor,
+        card=card,
+        task_store=task_store,
+    )
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -267,7 +287,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_agent.add_argument(
         "--processor",
-        help="echo | prompted-echo | import path (pkg.module:callable). Defaults to KA2A_AGENT_PROCESSOR or echo.",
+        help="echo | prompted-echo | langgraph-chat | import path (pkg.module:callable). Defaults to KA2A_AGENT_PROCESSOR or echo.",
+    )
+    p_agent.add_argument(
+        "--task-store",
+        dest="task_store",
+        help="Task store backend: memory | redis. Defaults to KA2A_TASK_STORE or memory.",
     )
     p_agent.add_argument("--agent-card-path", help="Path to an AgentCard JSON file", dest="agent_card_path")
     p_agent.set_defaults(func=lambda ns: asyncio.run(_run_agent(ns)))

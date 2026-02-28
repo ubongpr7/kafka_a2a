@@ -11,10 +11,13 @@ from urllib.request import Request, urlopen
 from kafka_a2a.credentials import strip_principal_secrets_for_storage
 from kafka_a2a.errors import A2AError, A2AErrorCode
 from kafka_a2a.extensions.kafka_transport import KafkaTransportExtensionParams, build_kafka_transport_extension
+from kafka_a2a.memory import KA2A_CONVERSATION_HISTORY_METADATA_KEY
 from kafka_a2a.models import (
     AgentCapabilities,
     AgentCard,
     Artifact,
+    DataPart,
+    FilePart,
     Message,
     PushNotificationConfig,
     Role,
@@ -54,7 +57,7 @@ from kafka_a2a.protocol import (
     ListTaskPushNotificationConfigParams,
 )
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
-from kafka_a2a.runtime.task_store import InMemoryTaskStore, TaskEventRecord
+from kafka_a2a.runtime.task_store import InMemoryTaskStore, TaskEventRecord, TaskStore
 from kafka_a2a.tenancy import KA2A_PRINCIPAL_METADATA_KEY, Principal, PrincipalMatcher, extract_principal, with_principal
 from kafka_a2a.transport.kafka import EnvelopeType, KafkaEnvelope, KafkaTransport, TopicNamer
 from kafka_a2a.processors import echo_processor
@@ -81,6 +84,7 @@ class Ka2aAgentConfig:
     registry_heartbeat_s: float | None = 60.0
     request_group_id: str | None = None
     max_concurrency: int = 50
+    context_history_turns: int = 20
 
 
 class Ka2aAgent:
@@ -91,7 +95,7 @@ class Ka2aAgent:
         transport: KafkaTransport,
         topic_namer: TopicNamer | None = None,
         registry: KafkaAgentRegistry | None = None,
-        task_store: InMemoryTaskStore | None = None,
+        task_store: TaskStore | None = None,
         processor: TaskProcessor | None = None,
         card: AgentCard | None = None,
     ):
@@ -99,7 +103,7 @@ class Ka2aAgent:
         self._transport = transport
         self._topics = topic_namer or TopicNamer()
         self._registry = registry
-        self._store = task_store or InMemoryTaskStore()
+        self._store: TaskStore = task_store or InMemoryTaskStore()
         self._processor = processor or echo_processor
         self._consumer_task: asyncio.Task[None] | None = None
         self._registry_task: asyncio.Task[None] | None = None
@@ -229,6 +233,7 @@ class Ka2aAgent:
             except asyncio.CancelledError:
                 pass
             self._consumer_task = None
+        await self._store.aclose()
         await self._transport.stop()
 
     async def _dispatch_request(self, env: KafkaEnvelope) -> None:
@@ -306,16 +311,25 @@ class Ka2aAgent:
                     metadata=request_metadata,
                     principal_metadata_key=self._cfg.principal_metadata_key,
                 ) or {}
-            task = await self._store.create_task(initial_message=p.message, metadata=stored_metadata or None)
+            task = await self._store.create_task(
+                initial_message=p.message,
+                context_id=p.message.context_id,
+                metadata=stored_metadata or None,
+            )
             if p.configuration and p.configuration.push_notification_config is not None:
                 await self._store.set_push_notification_config(
                     task_id=task.id, config=p.configuration.push_notification_config
                 )
+            processor_metadata = await self._processor_metadata_for_request(
+                task=task,
+                configuration=p.configuration,
+                request_metadata=request_metadata or None,
+            )
             self._start_processing(
                 task=task,
                 message=p.message,
                 configuration=p.configuration,
-                metadata=request_metadata or None,
+                metadata=processor_metadata,
             )
             return task.model_dump(by_alias=True, exclude_none=True)
 
@@ -340,7 +354,11 @@ class Ka2aAgent:
                     metadata=request_metadata,
                     principal_metadata_key=self._cfg.principal_metadata_key,
                 ) or {}
-            task = await self._store.create_task(initial_message=p.message, metadata=stored_metadata or None)
+            task = await self._store.create_task(
+                initial_message=p.message,
+                context_id=p.message.context_id,
+                metadata=stored_metadata or None,
+            )
             if p.configuration and p.configuration.push_notification_config is not None:
                 await self._store.set_push_notification_config(
                     task_id=task.id, config=p.configuration.push_notification_config
@@ -352,11 +370,16 @@ class Ka2aAgent:
                 replay_history=True,
                 include_task=False,
             )
+            processor_metadata = await self._processor_metadata_for_request(
+                task=task,
+                configuration=p.configuration,
+                request_metadata=request_metadata or None,
+            )
             self._start_processing(
                 task=task,
                 message=p.message,
                 configuration=p.configuration,
-                metadata=request_metadata or None,
+                metadata=processor_metadata,
             )
             return task.model_dump(by_alias=True, exclude_none=True)
 
@@ -422,7 +445,7 @@ class Ka2aAgent:
                 request_id=req.id,
                 reply_to=env.reply_to,
                 task_id=p.id,
-                replay_history=True,
+                replay_history=(method == METHOD_TASKS_RESUBSCRIBE),
                 include_task=False,
             )
             return task.model_dump(by_alias=True, exclude_none=True)
@@ -520,6 +543,114 @@ class Ka2aAgent:
         if not self._principal_matcher.matches(stored=stored, request=principal):
             raise A2AError(A2AErrorCode.PERMISSION_DENIED, "Permission denied")
 
+    def _message_to_text_for_history(self, message: Message, *, max_text_bytes: int = 8192) -> str:
+        chunks: list[str] = []
+        for part in message.parts:
+            if isinstance(part, TextPart):
+                if part.text:
+                    chunks.append(part.text)
+                continue
+            if isinstance(part, FilePart):
+                file_obj = part.file
+                mime = getattr(file_obj, "mime_type", None) or "application/octet-stream"
+                if hasattr(file_obj, "uri"):
+                    chunks.append(f"[file uri={getattr(file_obj, 'uri', '')} mime={mime}]")
+                    continue
+                if hasattr(file_obj, "bytes"):
+                    b64 = getattr(file_obj, "bytes", "") or ""
+                    chunks.append(f"[file bytes={min(len(b64), max_text_bytes)}b mime={mime}]")
+                continue
+            if isinstance(part, DataPart):
+                chunks.append("[data]")
+                continue
+            chunks.append(f"[{getattr(part, 'kind', 'part')}]")
+        out = "\n".join(chunks).strip()
+        if len(out) > max_text_bytes:
+            out = out[:max_text_bytes].rstrip() + "…"
+        return out
+
+    def _task_user_text(self, task: Task) -> str:
+        if task.history:
+            for msg in task.history:
+                if msg.role == Role.user:
+                    return self._message_to_text_for_history(msg)
+        if task.status.message is not None and task.status.message.role == Role.user:
+            return self._message_to_text_for_history(task.status.message)
+        return ""
+
+    def _task_assistant_text(self, task: Task) -> str:
+        for artifact in reversed(task.artifacts or []):
+            if (artifact.name or "") != "result":
+                continue
+            text = "\n".join([p.text for p in artifact.parts if isinstance(p, TextPart)]).strip()
+            if text:
+                return text
+
+        if task.history:
+            for msg in reversed(task.history):
+                if msg.role != Role.agent:
+                    continue
+                text = self._message_to_text_for_history(msg)
+                if text and text not in ("working", "completed"):
+                    return text
+
+        if task.status.message is not None and task.status.message.role == Role.agent:
+            text = self._message_to_text_for_history(task.status.message)
+            if text and text not in ("working", "completed"):
+                return text
+
+        return ""
+
+    def _history_turns(self, configuration: TaskConfiguration | None) -> int:
+        if configuration is not None and configuration.history_length is not None:
+            return max(0, int(configuration.history_length))
+        return max(0, int(getattr(self._cfg, "context_history_turns", 0) or 0))
+
+    async def _processor_metadata_for_request(
+        self,
+        *,
+        task: Task,
+        configuration: TaskConfiguration | None,
+        request_metadata: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        history_turns = self._history_turns(configuration)
+        if history_turns <= 0:
+            return request_metadata
+
+        # Hard cap to avoid unbounded context growth from misconfiguration.
+        history_turns = min(history_turns, 50)
+
+        principal = None
+        if self._cfg.tenant_isolation:
+            principal = extract_principal(request_metadata or {}, key=self._cfg.principal_metadata_key)
+
+        # We ask for N+1 so the current task is included, then drop it.
+        tasks = await self._store.list_tasks_by_context(task.context_id, limit=history_turns + 1)
+        conversation: list[dict[str, str]] = []
+        for t in tasks:
+            if t.id == task.id:
+                continue
+            if self._cfg.tenant_isolation:
+                if principal is None:
+                    continue
+                stored = self._task_principal(t)
+                if stored is None or not self._principal_matcher.matches(stored=stored, request=principal):
+                    continue
+
+            user_text = self._task_user_text(t)
+            assistant_text = self._task_assistant_text(t)
+            if user_text:
+                conversation.append({"role": "user", "content": user_text})
+            if assistant_text:
+                conversation.append({"role": "assistant", "content": assistant_text})
+
+        if not conversation:
+            return request_metadata
+
+        merged = dict(request_metadata or {})
+        merged[KA2A_CONVERSATION_HISTORY_METADATA_KEY] = conversation
+        return merged
+
     def _start_processing(
         self,
         *,
@@ -557,14 +688,24 @@ class Ka2aAgent:
                         continue
                     raise TypeError(f"Unsupported task event type: {type(event).__name__}")
 
-                completed_event = await self._store.append_status(
-                    task_id=task.id,
-                    status=TaskStatus(
-                        state=TaskState.completed,
-                        message=Message(role=Role.agent, parts=[TextPart(text="completed")]),
-                    ),
-                )
-                self._enqueue_push(task_id=task.id, event=completed_event)
+                updated = await self._store.get_task(task.id)
+                final_states = {
+                    TaskState.completed,
+                    TaskState.failed,
+                    TaskState.canceled,
+                    TaskState.rejected,
+                    TaskState.input_required,
+                    TaskState.auth_required,
+                }
+                if updated is None or updated.status.state not in final_states:
+                    completed_event = await self._store.append_status(
+                        task_id=task.id,
+                        status=TaskStatus(
+                            state=TaskState.completed,
+                            message=Message(role=Role.agent, parts=[TextPart(text="completed")]),
+                        ),
+                    )
+                    self._enqueue_push(task_id=task.id, event=completed_event)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -591,25 +732,12 @@ class Ka2aAgent:
         include_task: bool,
     ) -> None:
         async def _forward() -> None:
-            queue, history = await self._store.subscribe(task_id)
-            try:
-                records = history if replay_history else []
-                for record in records:
-                    if not include_task and isinstance(record.event, Task):
-                        continue
-                    await self._send_stream_result(reply_to, request_id, record)
-                    if isinstance(record.event, TaskStatusUpdateEvent) and record.event.final:
-                        return
-
-                while True:
-                    record = await queue.get()
-                    if not include_task and isinstance(record.event, Task):
-                        continue
-                    await self._send_stream_result(reply_to, request_id, record)
-                    if isinstance(record.event, TaskStatusUpdateEvent) and record.event.final:
-                        break
-            finally:
-                await self._store.unsubscribe(task_id, queue)
+            async for record in self._store.iter_events(task_id, replay_history=replay_history):
+                if not include_task and isinstance(record.event, Task):
+                    continue
+                await self._send_stream_result(reply_to, request_id, record)
+                if isinstance(record.event, TaskStatusUpdateEvent) and record.event.final:
+                    break
 
         asyncio.create_task(_forward())
 

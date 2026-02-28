@@ -28,6 +28,7 @@ from kafka_a2a.protocol import (
     METHOD_TASKS_PUSH_NOTIFICATION_CONFIG_GET,
     METHOD_TASKS_PUSH_NOTIFICATION_CONFIG_LIST,
     METHOD_TASKS_PUSH_NOTIFICATION_CONFIG_SET,
+    METHOD_TASKS_SUBSCRIBE,
     METHOD_TASKS_RESUBSCRIBE,
     DeleteTaskPushNotificationConfigParams,
     GetTaskPushNotificationConfigParams,
@@ -360,7 +361,8 @@ class Ka2aClient:
         self._pending[request_id] = fut
 
         params = TaskQueryParams(id=task_id, metadata=metadata).model_dump(by_alias=True, exclude_none=True)
-        req = RpcRequest(id=request_id, method=METHOD_TASKS_RESUBSCRIBE, params=params)
+        method = METHOD_TASKS_RESUBSCRIBE if resubscribe else METHOD_TASKS_SUBSCRIBE
+        req = RpcRequest(id=request_id, method=method, params=params)
         env = KafkaEnvelope(
             type=EnvelopeType.request,
             correlation_id=request_id,
