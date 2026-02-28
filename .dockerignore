@@ -8,7 +8,6 @@ __pycache__/
 .mypy_cache/
 .git/
 .gitignore
-uv.lock
 tests/
 examples/
 kafka/

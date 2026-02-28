@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
@@ -33,7 +31,7 @@ def _require_fastapi() -> Any:
         from fastapi import FastAPI  # noqa: F401
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(
-            "FastAPI server extras not installed. Install with: pip install 'kafka-a2a[server]'"
+            "FastAPI server extras not installed. Install the `server` extra (e.g. `uv sync --extra server`)."
         ) from exc
     from fastapi import FastAPI
 
@@ -164,7 +162,7 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                     async for ev in events:
                         result_obj = ev
                         if hasattr(result_obj, "model_dump"):
-                            result_obj = result_obj.model_dump(by_alias=True, exclude_none=True)
+                            result_obj = result_obj.model_dump(mode="json", by_alias=True, exclude_none=True)
                         payload = _jsonrpc_success(
                             request_id,
                             result_obj,
@@ -194,7 +192,7 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                     metadata=with_principal(p.metadata or {}, principal) if principal else p.metadata,
                 )
                 return JSONResponse(
-                    _jsonrpc_success(request_id, task.model_dump(by_alias=True, exclude_none=True))
+                    _jsonrpc_success(request_id, task.model_dump(mode="json", by_alias=True, exclude_none=True))
                 )
 
             if method == METHOD_TASKS_GET:
@@ -205,7 +203,7 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                     metadata=with_principal(p.metadata or {}, principal) if principal else p.metadata,
                 )
                 return JSONResponse(
-                    _jsonrpc_success(request_id, task.model_dump(by_alias=True, exclude_none=True))
+                    _jsonrpc_success(request_id, task.model_dump(mode="json", by_alias=True, exclude_none=True))
                 )
 
             if method == METHOD_TASKS_CANCEL:
@@ -216,7 +214,7 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                     metadata=with_principal(p.metadata or {}, principal) if principal else p.metadata,
                 )
                 return JSONResponse(
-                    _jsonrpc_success(request_id, task.model_dump(by_alias=True, exclude_none=True))
+                    _jsonrpc_success(request_id, task.model_dump(mode="json", by_alias=True, exclude_none=True))
                 )
 
             if method in (

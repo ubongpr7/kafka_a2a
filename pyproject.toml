@@ -52,7 +52,7 @@ dev = [
 ka2a = "kafka_a2a.cli:main"
 
 [project.urls]
-Repository = "https://example.invalid/k-a2a"
+Repository = "https://github.com/ubongpr7/kafka_a2a"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kafka_a2a"]

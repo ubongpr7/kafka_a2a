@@ -5,88 +5,43 @@ x-ka2a-image: &ka2a_image
   build:
     context: .
     args:
-      KA2A_PIP_EXTRAS: "server,auth"
+      KA2A_UV_EXTRAS: "server,auth"
+  env_file:
+    - .env
 
 services:
-
-  kafka:
-    image: confluentinc/cp-kafka:7.8.3
-    container_name: ka2a-kafka
-    ports:
-      # Use 9094 from your host machine. Inside the Docker network, use kafka:9092.
-      - "9092:9092"
-      - "9094:9094"
-    environment:
-      KAFKA_KRAFT_MODE: "true"
-      CLUSTER_ID: "1L6g7nGhU-eAKfL--X25wo"
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_PUBLIC://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_PUBLIC:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
-      # Internal (Docker) + external (host) advertised listeners.
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_PUBLIC://${KAFKA_PUBLIC_HOST:-localhost}:9094
-    volumes:
-      - kafka_kraft:/var/lib/kafka/data
-
   host-agent:
     <<: *ka2a_image
-    depends_on:
-      - kafka
     volumes:
       - ./agent_cards:/app/agent_cards:ro
-    environment:
-      KA2A_BOOTSTRAP_SERVERS: kafka:9092
-      KA2A_AGENT_NAME: host
-      KA2A_AGENT_CARD_PATH: /app/agent_cards/host.agent-card.json
-      KA2A_AGENT_PROCESSOR: prompted-echo
-      KA2A_SYSTEM_PROMPT: "You are the host agent. (Replace this with your system prompt.)"
-      KA2A_AGENT_PUSH_NOTIFICATIONS: "true"
-    command: ["agent"]
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/host.agent-card.json",
+        "--processor",
+        "prompted-echo",
+        "--push-notifications",
+      ]
 
   echo-agent:
     <<: *ka2a_image
-    depends_on:
-      - kafka
     volumes:
       - ./agent_cards:/app/agent_cards:ro
-    environment:
-      KA2A_BOOTSTRAP_SERVERS: kafka:9092
-      KA2A_AGENT_NAME: echo
-      KA2A_AGENT_CARD_PATH: /app/agent_cards/echo.agent-card.json
-      KA2A_AGENT_PROCESSOR: echo
-    command: ["agent"]
+    command: ["agent", "--agent-card-path", "/app/agent_cards/echo.agent-card.json", "--processor", "echo"]
 
   gateway:
     <<: *ka2a_image
     depends_on:
-      - kafka
       - host-agent
     ports:
       - "8000:8000"
-    environment:
-      KA2A_BOOTSTRAP_SERVERS: kafka:9092
-      KA2A_DEFAULT_AGENT: host
-      KA2A_GATEWAY_HOST: 0.0.0.0
-      KA2A_GATEWAY_PORT: 8000
-    command: ["gateway"]
+    command: ["gateway", "--default-agent", "host", "--host", "0.0.0.0", "--port", "8000"]
 
   a2a-proxy:
     <<: *ka2a_image
     depends_on:
-      - kafka
       - host-agent
     ports:
       - "8001:8001"
-    environment:
-      KA2A_BOOTSTRAP_SERVERS: kafka:9092
-      KA2A_AGENT_NAME: host
-      KA2A_PROXY_HOST: 0.0.0.0
-      KA2A_PROXY_PORT: 8001
-    command: ["proxy"]
-
-volumes:
-  kafka_kraft:
+    command: ["proxy", "--agent-name", "host", "--host", "0.0.0.0", "--port", "8001"]

@@ -101,7 +101,12 @@ def _jwt_from_env(prefix: str = "KA2A_JWT_") -> JwtBearerConfig | None:
 async def _run_agent(args: argparse.Namespace) -> None:
     bootstrap = args.bootstrap_servers or os.getenv("KA2A_BOOTSTRAP_SERVERS", "localhost:9092")
 
-    name = args.agent_name or os.getenv("KA2A_AGENT_NAME") or ""
+    card: AgentCard | None = None
+    card_path = args.agent_card_path or os.getenv("KA2A_AGENT_CARD_PATH")
+    if card_path:
+        card = _load_agent_card(card_path)
+
+    name = args.agent_name or os.getenv("KA2A_AGENT_NAME") or (card.name if card and card.name else "")
     if not name:
         prefix = os.getenv("KA2A_AGENT_NAME_PREFIX", "")
         name = f"{prefix}{socket.gethostname()}"
@@ -109,18 +114,39 @@ async def _run_agent(args: argparse.Namespace) -> None:
     transport = KafkaTransport(KafkaConfig(bootstrap_servers=bootstrap, client_id=f"ka2a-agent-{name}"))
     registry = KafkaAgentRegistry(transport=transport, sender=name)
 
+    push_notifications = (
+        args.push_notifications
+        if args.push_notifications is not None
+        else _parse_bool(os.getenv("KA2A_AGENT_PUSH_NOTIFICATIONS"), default=False)
+    )
+    tenant_isolation = (
+        args.tenant_isolation
+        if args.tenant_isolation is not None
+        else _parse_bool(os.getenv("KA2A_TENANT_ISOLATION"), default=False)
+    )
+    require_tenant_match = (
+        args.require_tenant_match
+        if args.require_tenant_match is not None
+        else _parse_bool(os.getenv("KA2A_REQUIRE_TENANT_MATCH"), default=True)
+    )
+    store_principal_secrets = (
+        args.store_principal_secrets
+        if args.store_principal_secrets is not None
+        else _parse_bool(os.getenv("KA2A_STORE_PRINCIPAL_SECRETS"), default=False)
+    )
+
     cfg = Ka2aAgentConfig(
         agent_name=name,
         description=args.description or os.getenv("KA2A_AGENT_DESCRIPTION"),
         url=args.url or os.getenv("KA2A_AGENT_URL"),
         version=args.version or os.getenv("KA2A_AGENT_VERSION", "0.1.0"),
-        push_notifications=_parse_bool(os.getenv("KA2A_AGENT_PUSH_NOTIFICATIONS"), default=False),
+        push_notifications=push_notifications,
         push_delivery_timeout_s=float(os.getenv("KA2A_PUSH_DELIVERY_TIMEOUT_S") or "5.0"),
         push_queue_maxsize=int(os.getenv("KA2A_PUSH_QUEUE_MAXSIZE") or "1000"),
-        tenant_isolation=_parse_bool(os.getenv("KA2A_TENANT_ISOLATION"), default=False),
-        require_tenant_match=_parse_bool(os.getenv("KA2A_REQUIRE_TENANT_MATCH"), default=True),
+        tenant_isolation=tenant_isolation,
+        require_tenant_match=require_tenant_match,
         principal_metadata_key=os.getenv("KA2A_PRINCIPAL_METADATA_KEY") or "urn:ka2a:principal",
-        store_principal_secrets=_parse_bool(os.getenv("KA2A_STORE_PRINCIPAL_SECRETS"), default=False),
+        store_principal_secrets=store_principal_secrets,
         registry_heartbeat_s=(
             float(os.getenv("KA2A_REGISTRY_HEARTBEAT_S")) if os.getenv("KA2A_REGISTRY_HEARTBEAT_S") else 60.0
         ),
@@ -130,13 +156,9 @@ async def _run_agent(args: argparse.Namespace) -> None:
 
     processor = _resolve_processor(args.processor)
 
-    card: AgentCard | None = None
-    card_path = args.agent_card_path or os.getenv("KA2A_AGENT_CARD_PATH")
-    if card_path:
-        card = _load_agent_card(card_path)
-        if card.name and card.name != cfg.agent_name:
-            # Prefer the card name (it defines the A2A addressable identity).
-            cfg.agent_name = card.name
+    if card is not None and card.name and card.name != cfg.agent_name:
+        # Prefer the card name (it defines the A2A addressable identity).
+        cfg.agent_name = card.name
 
     agent = Ka2aAgent(config=cfg, transport=transport, registry=registry, processor=processor, card=card)
 
@@ -159,7 +181,7 @@ def _require_uvicorn() -> Any:
     try:
         import uvicorn  # type: ignore
     except Exception as exc:  # pragma: no cover
-        raise SystemExit("Server extras not installed. Install with: pip install 'kafka-a2a[server]'") from exc
+        raise SystemExit("Server extras not installed. Install the `server` extra (e.g. `uv sync --extra server`).") from exc
     return uvicorn
 
 
@@ -216,6 +238,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent.add_argument("--url")
     p_agent.add_argument("--version")
     p_agent.add_argument(
+        "--push-notifications",
+        dest="push_notifications",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable tasks push notifications. Defaults to KA2A_AGENT_PUSH_NOTIFICATIONS.",
+    )
+    p_agent.add_argument(
+        "--tenant-isolation",
+        dest="tenant_isolation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable multi-tenant task isolation. Defaults to KA2A_TENANT_ISOLATION.",
+    )
+    p_agent.add_argument(
+        "--require-tenant-match",
+        dest="require_tenant_match",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Require tenant match for task access. Defaults to KA2A_REQUIRE_TENANT_MATCH (true).",
+    )
+    p_agent.add_argument(
+        "--store-principal-secrets",
+        dest="store_principal_secrets",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Persist bearer token/claims to the task store. Defaults to KA2A_STORE_PRINCIPAL_SECRETS (false).",
+    )
+    p_agent.add_argument(
         "--processor",
         help="echo | prompted-echo | import path (pkg.module:callable). Defaults to KA2A_AGENT_PROCESSOR or echo.",
     )
@@ -240,6 +290,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Local/dev convenience: if a `.env` file exists, load it (without overriding real env vars).
+    try:  # pragma: no cover
+        from kafka_a2a.settings import load_dotenv
+
+        load_dotenv(".env", override=False)
+    except Exception:
+        pass
+
     parser = build_parser()
     args = parser.parse_args(argv)
     func: Callable[[argparse.Namespace], Any] = args.func
@@ -248,4 +306,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-

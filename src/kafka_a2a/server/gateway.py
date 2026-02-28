@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import mimetypes
 import base64
@@ -18,7 +16,7 @@ def _require_fastapi() -> Any:
         from fastapi import FastAPI  # noqa: F401
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(
-            "FastAPI server extras not installed. Install with: pip install 'kafka-a2a[server]'"
+            "FastAPI server extras not installed. Install the `server` extra (e.g. `uv sync --extra server`)."
         ) from exc
     from fastapi import FastAPI
 
@@ -80,7 +78,7 @@ def create_gateway_app(config: GatewayConfig):
         task = await client.send_message(
             agent_name=agent_name or config.default_agent, message=msg, metadata=metadata
         )
-        return JSONResponse(task.model_dump(by_alias=True, exclude_none=True))
+        return JSONResponse(task.model_dump(mode="json", by_alias=True, exclude_none=True))
 
     @app.post("/upload")
     async def upload(
@@ -106,7 +104,7 @@ def create_gateway_app(config: GatewayConfig):
         task = await client.send_message(
             agent_name=agent_name or config.default_agent, message=msg, metadata=metadata
         )
-        return JSONResponse(task.model_dump(by_alias=True, exclude_none=True))
+        return JSONResponse(task.model_dump(mode="json", by_alias=True, exclude_none=True))
 
     @app.post("/stream")
     async def stream(
@@ -133,7 +131,7 @@ def create_gateway_app(config: GatewayConfig):
             async for ev in events:
                 payload: Any = ev
                 if hasattr(ev, "model_dump"):
-                    payload = ev.model_dump(by_alias=True, exclude_none=True)
+                    payload = ev.model_dump(mode="json", by_alias=True, exclude_none=True)
                 yield f"data: {json.dumps(payload)}\n\n"
 
         return StreamingResponse(_event_source(), media_type="text/event-stream")

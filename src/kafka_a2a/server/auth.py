@@ -43,7 +43,7 @@ def verify_bearer_jwt(*, token: str, config: JwtBearerConfig) -> Principal:
         import jwt  # type: ignore
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(
-            "JWT auth requires PyJWT. Install with: pip install 'kafka-a2a[auth]'"
+            "JWT auth requires PyJWT. Install the `auth` extra (e.g. `uv sync --extra auth`)."
         ) from exc
 
     options = {"verify_aud": config.audience is not None}

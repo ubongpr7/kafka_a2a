@@ -36,22 +36,33 @@ Wire format:
 ## Quickstart (Docker Compose)
 
 This repo ships a single `docker-compose.yml` that starts:
-- Kafka (PLAINTEXT)
 - Two example agents (`host-agent`, `echo-agent`)
 - A gateway (`/chat`, `/upload`, `/stream`)
 - An A2A-compatible HTTP proxy (JSON-RPC POST `/` + SSE streaming + Agent Card endpoint)
 
-Run:
+Kafka is expected to be provisioned separately (remote broker, MSK, Confluent Cloud, or your own server).
+
+1) Create a `.env` file (required):
+
+```bash
+cp .env.example .env
+# Edit .env and set KA2A_BOOTSTRAP_SERVERS (e.g. 3.217.248.209:9092)
+```
+
+2) Build + start the services:
 
 ```bash
 docker compose up -d --build
 ```
 
-If you run this stack on a remote host, set `KAFKA_PUBLIC_HOST` so Kafka advertises a reachable address for the
-public listener:
+Optional: if you want to run Kafka locally for development, you can use `kafka/docker-compose.yml` and then point
+the app stack at it (on macOS this is typically `host.docker.internal:9094`):
 
 ```bash
-KAFKA_PUBLIC_HOST=YOUR_SERVER_IP docker compose up -d --build
+docker compose -f kafka/docker-compose.yml up -d
+# In .env, set:
+#   KA2A_BOOTSTRAP_SERVERS=host.docker.internal:9094
+docker compose up -d --build
 ```
 
 Test the gateway:
@@ -78,48 +89,45 @@ curl -sS -X POST 'http://localhost:8001/' \
 
 ### Multiple agents
 
-Add more agent services in `docker-compose.yml` (copy the `echo-agent` service and change `KA2A_AGENT_NAME`), or
-run a scalable worker pool by omitting `KA2A_AGENT_NAME` and using a prefix:
+You can add more agent services by copying `echo-agent` and pointing it at a different AgentCard JSON file
+(`agent_cards/*.agent-card.json`). For a simple worker pool, scale a single agent service:
 
 ```bash
-# In your agent service env:
-#   KA2A_AGENT_NAME_PREFIX=worker-
-# Then:
 docker compose up -d --scale echo-agent=3
 ```
 
-If `KA2A_AGENT_NAME` is not set, `ka2a agent` uses `KA2A_AGENT_NAME_PREFIX + <container-hostname>`.
-
 ## Quickstart (Python / dev)
 
-1) Start Kafka:
+1) Start (or choose) a Kafka broker, then set `KA2A_BOOTSTRAP_SERVERS` in your `.env`:
 
 ```bash
-docker compose up -d kafka
+cp .env.example .env
+# Edit .env and set KA2A_BOOTSTRAP_SERVERS
 ```
 
-2) Install:
+2) Install (uv):
 
 ```bash
-python3 -m pip install -e '.[server,auth,dev]'
+uv sync --locked --extra server --extra auth --extra dev
 ```
 
 3) Run an agent:
 
 ```bash
-KA2A_BOOTSTRAP_SERVERS=localhost:9094 ka2a agent --agent-name echo
+ka2a agent --agent-name echo
 ```
 
 4) Run the gateway:
 
 ```bash
-KA2A_BOOTSTRAP_SERVERS=localhost:9094 KA2A_DEFAULT_AGENT=echo ka2a gateway
+KA2A_DEFAULT_AGENT=echo ka2a gateway
 ```
 
 ## Repo layout
 
 - `src/kafka_a2a/` — library
-- `docker-compose.yml` — full stack (Kafka + example agents + gateway + proxy)
+- `docker-compose.yml` — agents + gateway + proxy (requires external Kafka)
+- `kafka/docker-compose.yml` — optional local Kafka (dev convenience)
 - `agent_cards/` — sample AgentCard JSON files
 
 ## Docker image
@@ -133,15 +141,15 @@ docker build -t kafka-a2a:local .
 Run components:
 
 ```bash
-docker run --rm -e KA2A_BOOTSTRAP_SERVERS=localhost:9094 kafka-a2a:local --help
-docker run --rm -e KA2A_BOOTSTRAP_SERVERS=localhost:9094 kafka-a2a:local agent
-docker run --rm -p 8000:8000 -e KA2A_BOOTSTRAP_SERVERS=localhost:9094 kafka-a2a:local gateway
-docker run --rm -p 8001:8001 -e KA2A_BOOTSTRAP_SERVERS=localhost:9094 -e KA2A_AGENT_NAME=echo kafka-a2a:local proxy
+docker run --rm --env-file .env kafka-a2a:local --help
+docker run --rm --env-file .env kafka-a2a:local agent
+docker run --rm -p 8000:8000 --env-file .env kafka-a2a:local gateway
+docker run --rm -p 8001:8001 --env-file .env kafka-a2a:local proxy --agent-name host
 ```
 
 Notes:
-- In the provided `docker-compose.yml`, containers use `kafka:9092` internally.
-- From your **host**, use `localhost:9094` (the broker’s public listener).
+- `KA2A_BOOTSTRAP_SERVERS` must be reachable from the container. If your broker runs on your host machine, use a
+  host-reachable address (on macOS: `host.docker.internal:<port>`).
 
 ## CLI
 
