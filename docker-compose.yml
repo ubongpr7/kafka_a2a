@@ -20,7 +20,7 @@ services:
         "--agent-card-path",
         "/app/agent_cards/host.agent-card.json",
         "--processor",
-        "langgraph-chat",
+        "router",
         "--push-notifications",
       ]
 
@@ -29,6 +29,24 @@ services:
     volumes:
       - ./agent_cards:/app/agent_cards:ro
     command: ["agent", "--agent-card-path", "/app/agent_cards/echo.agent-card.json", "--processor", "echo"]
+
+  weather-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+    command: ["agent", "--agent-card-path", "/app/agent_cards/weather.agent-card.json", "--processor", "weather"]
+
+  sports-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+    command: ["agent", "--agent-card-path", "/app/agent_cards/sports.agent-card.json", "--processor", "sports"]
+
+  finance-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+    command: ["agent", "--agent-card-path", "/app/agent_cards/finance.agent-card.json", "--processor", "finance"]
 
   gateway:
     <<: *ka2a_image

@@ -63,6 +63,18 @@ def _resolve_processor(value: str | None) -> TaskProcessor:
         from kafka_a2a.router_processor import make_router_processor_from_env
 
         return make_router_processor_from_env()
+    if name in ("weather", "weather-agent", "weather_agent"):
+        from kafka_a2a.specialized_agents import make_weather_agent_processor_from_env
+
+        return make_weather_agent_processor_from_env()
+    if name in ("sports", "sports-agent", "sports_agent", "sports-journalist", "sports_journalist"):
+        from kafka_a2a.specialized_agents import make_sports_journalist_agent_processor_from_env
+
+        return make_sports_journalist_agent_processor_from_env()
+    if name in ("finance", "finance-agent", "finance_agent", "financial", "financial-analysis", "financial_analysis"):
+        from kafka_a2a.specialized_agents import make_financial_analysis_agent_processor_from_env
+
+        return make_financial_analysis_agent_processor_from_env()
 
     if ":" in name:
         module_name, attr = name.split(":", 1)

@@ -1,0 +1,30 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "weather",
+  "description": "Weather agent that answers forecast/conditions questions using web search + LLM synthesis.",
+  "url": "kafka://weather",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "weather_lookup",
+      "name": "Weather Lookup",
+      "description": "Find current conditions, forecasts, and weather advisories for a city/region; cite sources.",
+      "tags": ["weather", "forecast", "temperature", "humidity", "rain", "advisory", "climate"],
+      "examples": [
+        "What's the weather in New York today?",
+        "Give me a 7-day forecast for Lagos.",
+        "Any weather advisories for London this weekend?"
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}
+

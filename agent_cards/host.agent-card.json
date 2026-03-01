@@ -1,7 +1,7 @@
 {
   "protocolVersion": "0.3.0",
   "name": "host",
-  "description": "Host agent (example)",
+  "description": "Host router agent that discovers other agents via the registry and delegates tasks over Kafka.",
   "url": "kafka://host",
   "preferredTransport": "kafka",
   "version": "0.1.0",
@@ -13,11 +13,17 @@
   "defaultOutputModes": ["text"],
   "skills": [
     {
-      "id": "chat",
-      "name": "Chat",
-      "description": "Basic chat skill (example).",
-      "examples": ["hello", "help me draft an email"]
+      "id": "route",
+      "name": "Route & Orchestrate",
+      "description": "Select the best agent for a request, delegate the task, and aggregate results.",
+      "tags": ["router", "orchestration", "delegation"],
+      "examples": [
+        "What's the weather in London today?",
+        "Summarize last night's Lakers game.",
+        "Analyze AMD vs NVIDIA fundamentals."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
     }
   ]
 }
-

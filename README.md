@@ -43,7 +43,7 @@ Wire format:
 ## Quickstart (Docker Compose)
 
 This repo ships a single `docker-compose.yml` that starts:
-- Two example agents (`host-agent`, `echo-agent`)
+- Example agents (`host-agent` router, plus `echo-agent`, `weather-agent`, `sports-agent`, `finance-agent`)
 - A gateway (`/chat`, `/upload`, `/stream`)
 - An A2A-compatible HTTP proxy (JSON-RPC POST `/` + SSE streaming + Agent Card endpoint)
 
@@ -66,7 +66,7 @@ If your Kafka cluster has **auto-topic-creation disabled**, create the required 
 
 ```bash
 # Uses KA2A_BOOTSTRAP_SERVERS from .env
-docker compose run --rm gateway ensure-topics --agents host,echo --client-ids gateway,proxy
+docker compose run --rm gateway ensure-topics --agents host,echo,weather,sports,finance --client-ids gateway,proxy
 ```
 
 Optional: if you want to run Kafka locally for development, you can use `kafka/docker-compose.yml` and then point

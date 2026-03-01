@@ -252,6 +252,7 @@ def make_router_processor_from_env() -> TaskProcessor:
         # Delegate to the selected agent and aggregate its final result.
         delegated_task_id: str | None = None
         last_result_parts: list[Any] | None = None
+        child_artifacts: dict[str, list[Any]] = {}
         last_final_message: str | None = None
 
         stream = await state.client.stream_message(
@@ -264,8 +265,13 @@ def make_router_processor_from_env() -> TaskProcessor:
             if isinstance(ev, Task):
                 delegated_task_id = ev.id
                 continue
-            if isinstance(ev, TaskArtifactUpdateEvent) and (ev.artifact.name or "") == "result":
-                last_result_parts = list(ev.artifact.parts or [])
+            if isinstance(ev, TaskArtifactUpdateEvent):
+                name = (ev.artifact.name or "").strip()
+                if name == "result":
+                    last_result_parts = list(ev.artifact.parts or [])
+                    continue
+                if name:
+                    child_artifacts[name] = list(ev.artifact.parts or [])
                 continue
             if isinstance(ev, TaskStatusUpdateEvent) and ev.final:
                 msg = ev.status.message
@@ -283,6 +289,8 @@ def make_router_processor_from_env() -> TaskProcessor:
 
         if delegated_task_id:
             yield Artifact(name="delegation", parts=[DataPart(data={"agent": selected, "taskId": delegated_task_id})])
+        for name, parts2 in child_artifacts.items():
+            yield Artifact(name=f"{selected}.{name}", parts=parts2)
         yield Artifact(name="result", parts=parts)
         yield TaskStatus(state=TaskState.completed, message=Message(role=Role.agent, parts=parts))
 
