@@ -7,6 +7,13 @@ This folder provides a **single-node Kafka (KRaft) broker** configured for:
 
 It is meant for local/dev and for validating that K-A2A can connect to a secured broker.
 
+Note: Confluent's `cp-kafka` images require `KAFKA_OPTS` to be set when SASL listeners are enabled.
+This compose handles it automatically via `kafka/sasl/init-jaas.sh`.
+
+Note: This single-node KRaft compose keeps the controller listener as `PLAINTEXT`, so internal controller traffic
+is `User:ANONYMOUS`. To allow the broker to start with ACLs enabled, `.env.example` includes `User:ANONYMOUS` in
+`KAFKA_SUPER_USERS`. For production, prefer securing the controller listener instead.
+
 ## 1) Start the broker
 
 ```bash
@@ -16,8 +23,8 @@ cp .env.example .env
 docker compose up -d
 ```
 
-Note: if you change the `admin` username/password in `.env`, also update `kafka/sasl/admin.properties`
-so the init/CLI tools can authenticate.
+Note: This compose auto-generates `/etc/kafka/secrets/admin.properties` inside the containers from the same
+JAAS `username`/`password` you configured in `.env` (so you don’t have to keep a separate file in sync).
 
 ## Server + TLS (recommended)
 
@@ -50,6 +57,12 @@ See `kafka/sasl/Caddyfile.example`.
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.server.yml up -d
 ```
+
+Note: `docker-compose.server.yml` uses the Compose merge tag `!override` to replace the base `ports:` list.
+If your `docker compose` is very old and errors on `!override`, upgrade Compose or change `docker-compose.yml`
+to bind `9094` to `127.0.0.1` directly.
+
+Tip: on a server, you can start from `kafka/sasl/.env.server.example` instead of `.env.example`.
 
 If you get `address already in use` for port `9094`, set `KA2A_KAFKA_HOST_PORT` in `kafka/sasl/.env` (example: `19094`)
 and update your TCP proxy upstream accordingly.

@@ -1,6 +1,6 @@
 services:
   kafka:
-    ports:
+    ports: !override
       # Bind the public listener to localhost only; put a TCP proxy (Caddy L4 / nginx stream / HAProxy)
       # in front for TLS termination on your domain.
       #

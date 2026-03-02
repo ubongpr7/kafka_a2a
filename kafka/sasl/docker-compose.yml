@@ -8,7 +8,9 @@ services:
       - .env
     volumes:
       - kafka_kraft_sasl:/var/lib/kafka/data
-      - ./admin.properties:/etc/kafka/secrets/admin.properties:ro
+      - ./init-jaas.sh:/init-jaas.sh:ro
+    command:
+      ["bash", "-lc", "bash /init-jaas.sh && source /etc/kafka/secrets/ka2a_env.sh && /etc/confluent/docker/run"]
     healthcheck:
       test:
         [
@@ -30,11 +32,10 @@ services:
     env_file:
       - .env
     volumes:
-      - ./admin.properties:/etc/kafka/secrets/admin.properties:ro
       - ./init-acls.sh:/init-acls.sh:ro
-    command: ["bash", "-lc", "/init-acls.sh"]
+      - ./init-jaas.sh:/init-jaas.sh:ro
+    command: ["bash", "-lc", "bash /init-jaas.sh && bash /init-acls.sh"]
     restart: "no"
 
 volumes:
   kafka_kraft_sasl:
-
