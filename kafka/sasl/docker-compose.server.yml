@@ -1,0 +1,7 @@
+services:
+  kafka:
+    ports:
+      # Bind the public listener to localhost only; put a TCP proxy (Caddy L4 / nginx stream / HAProxy)
+      # in front for TLS termination on your domain.
+      - "127.0.0.1:9094:9094"
+

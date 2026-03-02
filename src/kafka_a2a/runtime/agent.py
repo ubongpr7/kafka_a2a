@@ -31,6 +31,7 @@ from kafka_a2a.models import (
     TaskArtifactUpdateEvent,
     TextPart,
 )
+from kafka_a2a.ops import Timer, inc_counter, trace_id_from_metadata
 from kafka_a2a.protocol import (
     METHOD_AGENT_GET_AUTHENTICATED_EXTENDED_CARD,
     METHOD_AGENT_GET_CARD,
@@ -60,7 +61,7 @@ from kafka_a2a.protocol import (
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
 from kafka_a2a.runtime.task_store import InMemoryTaskStore, TaskEventRecord, TaskStore
 from kafka_a2a.tenancy import KA2A_PRINCIPAL_METADATA_KEY, Principal, PrincipalMatcher, extract_principal, with_principal
-from kafka_a2a.transport.kafka import EnvelopeType, KafkaEnvelope, KafkaTransport, TopicNamer
+from kafka_a2a.transport.kafka import EnvelopeType, KafkaAgentRegistryConfig, KafkaEnvelope, KafkaTransport, TopicNamer
 from kafka_a2a.processors import echo_processor
 
 
@@ -104,7 +105,7 @@ class Ka2aAgent:
     ):
         self._cfg = config
         self._transport = transport
-        self._topics = topic_namer or TopicNamer()
+        self._topics = topic_namer or TopicNamer.from_env()
         self._registry = registry
         self._store: TaskStore = task_store or InMemoryTaskStore()
         self._processor = processor or echo_processor
@@ -125,7 +126,7 @@ class Ka2aAgent:
                     else list(self._transport.config.bootstrap_servers)
                 ),
                 request_topic=self._topics.agent_requests(config.agent_name),
-                registry_topic=(self._registry.topic if self._registry else "ka2a.agent_cards"),
+                registry_topic=(self._registry.topic if self._registry else KafkaAgentRegistryConfig.from_env().topic),
                 replies_prefix=self._topics.replies_prefix,
                 events_prefix=self._topics.events_prefix,
             )
@@ -198,7 +199,18 @@ class Ka2aAgent:
                 async for msg in consumer:
                     try:
                         env = KafkaEnvelope.from_bytes(msg.value)
-                    except Exception:
+                    except Exception as exc:
+                        await self._transport.publish_dlq(
+                            reason="envelope_decode_error",
+                            error=str(exc),
+                            topic=str(getattr(msg, "topic", "")),
+                            partition=getattr(msg, "partition", None),
+                            offset=getattr(msg, "offset", None),
+                            timestamp_ms=getattr(msg, "timestamp", None),
+                            key=getattr(msg, "key", None),
+                            headers=list(getattr(msg, "headers", None) or []),
+                            value=getattr(msg, "value", None),
+                        )
                         continue
                     if env.type != EnvelopeType.request:
                         continue
@@ -663,13 +675,17 @@ class Ka2aAgent:
         metadata: dict[str, Any] | None,
     ) -> None:
         async def _run() -> None:
+            trace_id = trace_id_from_metadata(metadata)
+            timer = Timer("task_processing_seconds")
             try:
+                inc_counter("tasks_started_total")
                 logger.info(
                     "task_start",
                     extra={
                         "agent": self.card.name,
                         "taskId": task.id,
                         "contextId": task.context_id,
+                        **({"traceId": trace_id} if trace_id else {}),
                     },
                 )
                 working_event = await self._store.append_status(
@@ -720,12 +736,14 @@ class Ka2aAgent:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                inc_counter("tasks_failed_total")
                 logger.exception(
                     "task_failed",
                     extra={
                         "agent": self.card.name,
                         "taskId": task.id,
                         "contextId": task.context_id,
+                        **({"traceId": trace_id} if trace_id else {}),
                     },
                 )
                 failed_event = await self._store.append_status(
@@ -740,6 +758,8 @@ class Ka2aAgent:
                 try:
                     updated = await self._store.get_task(task.id)
                     if updated is not None:
+                        inc_counter("tasks_finished_total")
+                        inc_counter(f"tasks_finished_total.state.{updated.status.state.value}")
                         logger.info(
                             "task_end",
                             extra={
@@ -747,10 +767,12 @@ class Ka2aAgent:
                                 "taskId": task.id,
                                 "contextId": task.context_id,
                                 "state": updated.status.state.value,
+                                **({"traceId": trace_id} if trace_id else {}),
                             },
                         )
                 except Exception:
                     pass
+                timer.stop()
                 self._processing.pop(task.id, None)
 
         self._processing[task.id] = asyncio.create_task(_run())

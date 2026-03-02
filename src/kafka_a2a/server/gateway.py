@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.models import AgentCard, FilePart, FileWithBytes, Ka2aModel, Message, TaskConfiguration, TextPart
+from kafka_a2a.ops import ensure_trace_metadata, metrics_enabled, metrics_snapshot
 from kafka_a2a.protocol import METHOD_TASKS_LIST, TaskListParams, TaskListResult
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
 from kafka_a2a.server.auth import JwtBearerConfig, JwtVerificationError, parse_authorization_header, verify_bearer_jwt
@@ -40,7 +41,9 @@ def create_gateway_app(config: GatewayConfig):
     from fastapi import File, Form, HTTPException, Request, UploadFile
     from fastapi.responses import JSONResponse, StreamingResponse
 
-    transport = KafkaTransport(KafkaConfig(bootstrap_servers=config.bootstrap_servers))
+    transport = KafkaTransport(
+        KafkaConfig.from_env(bootstrap_servers=config.bootstrap_servers, client_id=config.client_id)
+    )
     client = Ka2aClient(transport=transport, config=Ka2aClientConfig(client_id=config.client_id))
     registry = KafkaAgentRegistry(transport=transport, sender=config.client_id or "gateway")
 
@@ -56,16 +59,17 @@ def create_gateway_app(config: GatewayConfig):
         history_length: int | None = None
 
     def _metadata_from_request(request: Request) -> dict[str, Any] | None:
-        if config.jwt is None:
-            return None
-        try:
-            token = parse_authorization_header(request.headers.get("authorization"))
-            principal = verify_bearer_jwt(token=token, config=config.jwt)
-        except JwtVerificationError as exc:
-            raise HTTPException(status_code=401, detail=str(exc)) from exc
-        except RuntimeError as exc:  # pragma: no cover
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        return with_principal({}, principal)
+        metadata: dict[str, Any] | None = None
+        if config.jwt is not None:
+            try:
+                token = parse_authorization_header(request.headers.get("authorization"))
+                principal = verify_bearer_jwt(token=token, config=config.jwt)
+            except JwtVerificationError as exc:
+                raise HTTPException(status_code=401, detail=str(exc)) from exc
+            except RuntimeError as exc:  # pragma: no cover
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            metadata = with_principal({}, principal)
+        return ensure_trace_metadata(metadata, headers=request.headers)
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -108,6 +112,12 @@ def create_gateway_app(config: GatewayConfig):
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    if metrics_enabled():
+
+        @app.get("/metrics")
+        async def metrics() -> Any:
+            return JSONResponse(metrics_snapshot())
 
     @app.get("/agents")
     async def agents(request: Request) -> Any:

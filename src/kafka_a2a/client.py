@@ -87,7 +87,7 @@ class Ka2aClient:
     ):
         self._transport = transport
         self._cfg = config or Ka2aClientConfig()
-        self._topics = topic_namer or TopicNamer()
+        self._topics = topic_namer or TopicNamer.from_env()
 
         self.client_id = self._cfg.client_id or str(uuid4())
         self.reply_topic = self._cfg.reply_topic or self._topics.client_replies(self.client_id)
@@ -115,7 +115,18 @@ class Ka2aClient:
             async for msg in self._consumer:
                 try:
                     env = KafkaEnvelope.from_bytes(msg.value)
-                except Exception:
+                except Exception as exc:
+                    await self._transport.publish_dlq(
+                        reason="envelope_decode_error",
+                        error=str(exc),
+                        topic=str(getattr(msg, "topic", "")),
+                        partition=getattr(msg, "partition", None),
+                        offset=getattr(msg, "offset", None),
+                        timestamp_ms=getattr(msg, "timestamp", None),
+                        key=getattr(msg, "key", None),
+                        headers=list(getattr(msg, "headers", None) or []),
+                        value=getattr(msg, "value", None),
+                    )
                     continue
                 if env.correlation_id is None:
                     continue

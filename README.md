@@ -12,9 +12,11 @@ Design constraints:
 
 - **A2A-like models**: AgentCard (+ signatures field), capabilities, skills, tasks, artifacts, streaming updates.
 - **Kafka transport** (`aiokafka`): request/response envelopes with correlation IDs.
+- **Kafka SASL/TLS (optional)**: connect to secured Kafka by setting `KA2A_KAFKA_SECURITY_PROTOCOL` + SASL/TLS env vars.
 - **JSON-RPC 2.0 surface** over Kafka (`message/send`, `message/stream`, `tasks/*`, `agent/getCard`, etc.).
 - **Streaming**: multiple JSON-RPC responses published to the client reply topic for `message/stream` and `tasks/resubscribe`.
 - **Registry + discovery**: agents publish AgentCards to a Kafka topic (`ka2a.agent_cards`).
+- **Topic strategy (optional)**: namespace/prefix topics via `KA2A_TOPIC_NAMESPACE` / `KA2A_*_PREFIX` for multi-deploy + ACL-friendly setups.
 - **Gateway HTTP endpoints**: `/agents`, `/tasks`, `/tasks/{id}`, `/tasks/{id}/events` (SSE), plus `/chat` + `/upload` + `/stream`.
 - **Task stores**: in-memory (default) and Redis (`KA2A_TASK_STORE=redis`).
 - **Long-session memory (optional)**: per-context summary/profile stored in memory or Redis (`KA2A_CONTEXT_MEMORY_*`).
@@ -23,9 +25,11 @@ Design constraints:
 - **JWT verification hook** (optional): FastAPI gateway/proxy can verify Bearer JWTs (HS/RS/ES, JWKS supported) and forward a `Principal` in metadata.
 - **Local/dev credentials** (optional): resolve a single set of LLM credentials from `.env` / process env.
 - **LangGraph processor** (optional): `langgraph-chat` with pluggable `KA2A_LLM_FACTORY` (default: OpenAI-compatible adapter).
+- **Tool calling (MCP-ready, optional)**: `langgraph-chat` can execute tools via `ToolCallPart`/`ToolResultPart` (built-in MCP HTTP executor available).
 - **Router processor** (optional): `router` host agent that selects downstream agents by card/skills and delegates over Kafka.
 - **Multimodal (partial)**: `/upload` sends file bytes; Gemini adapter can pass vision parts and return file artifacts.
 - **Ops helpers**: `ka2a ensure-topics` for clusters with Kafka auto-topic-creation disabled.
+- **Ops (optional)**: DLQ publishing for malformed Kafka messages (`KA2A_DLQ_ENABLED`), `/metrics` endpoint (`KA2A_METRICS_ENABLED`), and trace propagation (`KA2A_TRACE_ENABLED`).
 
 ## Architecture (Kafka topics)
 
@@ -35,6 +39,10 @@ K-A2A uses a small set of topics (defaults shown):
 - Client reply topic: `ka2a.reply.<client_id>`
 - Task events topic: `ka2a.evt.<task_id>` (used for push-to-Kafka notifications)
 - Agent card registry topic: `ka2a.agent_cards`
+
+Optional topic namespacing/prefixing:
+- Set `KA2A_TOPIC_NAMESPACE=<name>` to automatically prefix the default topics (and DLQ) with `<name>.`
+- Or override `KA2A_REQUESTS_PREFIX`, `KA2A_REPLIES_PREFIX`, `KA2A_EVENTS_PREFIX`, `KA2A_REGISTRY_TOPIC` explicitly
 
 Wire format:
 - All messages are `KafkaEnvelope` objects (`EnvelopeType.request|response|event|registry`)
@@ -66,7 +74,7 @@ If your Kafka cluster has **auto-topic-creation disabled**, create the required 
 
 ```bash
 # Uses KA2A_BOOTSTRAP_SERVERS from .env
-docker compose run --rm gateway ensure-topics --agents host,echo,weather,sports,finance --client-ids gateway,proxy
+docker compose run --rm gateway ensure-topics --agents host,echo,weather,sports,finance --client-ids gateway,proxy,router
 ```
 
 Optional: if you want to run Kafka locally for development, you can use `kafka/docker-compose.yml` and then point
@@ -78,6 +86,16 @@ docker compose -f kafka/docker-compose.yml up -d
 #   KA2A_BOOTSTRAP_SERVERS=host.docker.internal:9094
 docker compose up -d --build
 ```
+
+Optional: if you want a **secured local Kafka** (SASL/PLAIN + ACLs), use `kafka/sasl/docker-compose.yml`:
+
+```bash
+cd kafka/sasl
+cp .env.example .env
+docker compose up -d
+```
+
+For server deployment (TLS + SASL + ACLs), see `kafka/sasl/README.md` and the TCP-proxy example `kafka/sasl/Caddyfile.example`.
 
 Optional: if you want to run Redis locally for development (task persistence), use `redis/docker-compose.yml` and
 point agents at it:
@@ -227,6 +245,29 @@ Commands:
 Common:
 - `KA2A_BOOTSTRAP_SERVERS` (default `localhost:9092`)
 
+Kafka topics (optional):
+- `KA2A_TOPIC_NAMESPACE` (optional; prefixes default topics with `<namespace>.`)
+- `KA2A_REQUESTS_PREFIX` (default `ka2a.req`)
+- `KA2A_REPLIES_PREFIX` (default `ka2a.reply`)
+- `KA2A_EVENTS_PREFIX` (default `ka2a.evt`)
+- `KA2A_REGISTRY_TOPIC` (default `ka2a.agent_cards`)
+
+Kafka security (optional):
+- `KA2A_KAFKA_SECURITY_PROTOCOL` = `PLAINTEXT` | `SSL` | `SASL_PLAINTEXT` | `SASL_SSL` (default `PLAINTEXT`)
+- `KA2A_KAFKA_SASL_MECHANISM` = `PLAIN` | `SCRAM-SHA-256` | `SCRAM-SHA-512` (required for SASL)
+- `KA2A_KAFKA_SASL_USERNAME`, `KA2A_KAFKA_SASL_PASSWORD` (or `KA2A_KAFKA_SASL_PASSWORD_ENV`)
+- `KA2A_KAFKA_SSL_CA_FILE`, `KA2A_KAFKA_SSL_CERT_FILE`, `KA2A_KAFKA_SSL_KEY_FILE`
+- `KA2A_KAFKA_SSL_KEY_PASSWORD` (or `KA2A_KAFKA_SSL_KEY_PASSWORD_ENV`)
+- `KA2A_KAFKA_SSL_CHECK_HOSTNAME` (default true)
+- `KA2A_KAFKA_SSL_INSECURE_SKIP_VERIFY` (default false)
+
+Ops (optional):
+- `KA2A_DLQ_ENABLED` (`true|false`, default false)
+- `KA2A_DLQ_TOPIC` (default `ka2a.dlq`)
+- `KA2A_DLQ_MAX_VALUE_BYTES` (default `16384`)
+- `KA2A_METRICS_ENABLED` (`true|false`, default false; enables `/metrics`)
+- `KA2A_TRACE_ENABLED` (`true|false`, default false; propagates `urn:ka2a:trace` in metadata)
+
 Agent runtime:
 - `KA2A_AGENT_NAME` (default: `<prefix><hostname>`)
 - `KA2A_AGENT_NAME_PREFIX` (default: empty; used when `KA2A_AGENT_NAME` is unset)
@@ -270,6 +311,16 @@ Router processor (optional):
 - `KA2A_ROUTER_LLM_SELECTION` (`true|false`, default true)
 - `KA2A_ROUTER_FALLBACK_AGENT` (optional; if routing is ambiguous)
 - `KA2A_DIRECTORY_AUTO_OFFSET_RESET` (default `earliest`; used by the router directory watcher)
+
+Tools / MCP (optional):
+- Requires installing the MCP extra: `uv sync --extra mcp`
+- `KA2A_TOOLS_ENABLED` (`true|false`, default false; only used by `langgraph-chat`)
+- `KA2A_TOOLS_SOURCE` = `mcp` (built-in) or leave unset + set `KA2A_TOOL_EXECUTOR` for custom executors
+- `KA2A_TOOLS_MAX_STEPS` (default `5`)
+- `KA2A_MCP_SERVER_URL` (Streamable HTTP endpoint, e.g. `http://localhost:8005/mcp`)
+- `KA2A_MCP_TOKEN` (optional; or `KA2A_MCP_TOKEN_ENV`)
+- `KA2A_MCP_TIMEOUT_S` (default `30`)
+- `KA2A_MCP_TOOLS_CACHE_S` (default `60`)
 
 ## Push notifications (optional)
 
@@ -367,6 +418,6 @@ GOOGLE_API_KEY=your-api-key
 
 ## Roadmap / known gaps
 
-- More built-in processors (tool calling, MCP wiring patterns).
-- Authenticated Kafka (SASL/TLS) + ACL-aware topic strategy for production.
-- First-class “tool/MCP auth” patterns (claims + metadata plumbing exists, but tools are app-specific).
+- Token-level streaming UX in the Playground UI.
+- True multimodal across more providers (bytes/uris in, structured artifacts out).
+- More built-in processors and tool patterns (e.g., richer planning/execution styles).

@@ -29,7 +29,7 @@ class KafkaAgentRegistry:
         sender: str | None = None,
     ):
         self._transport = transport
-        self._cfg = registry or KafkaAgentRegistryConfig()
+        self._cfg = registry or KafkaAgentRegistryConfig.from_env()
         self._sender = sender
 
     @property

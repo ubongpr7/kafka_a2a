@@ -27,6 +27,7 @@ from kafka_a2a.models import (
 from kafka_a2a.processors import TaskEvent, TaskProcessor
 from kafka_a2a.settings import Ka2aSettings
 from kafka_a2a.tenancy import extract_principal
+from kafka_a2a.tools import ToolContext, ToolExecutor, ToolSpec
 
 
 def _require_lang() -> Any:
@@ -212,6 +213,10 @@ def make_langgraph_chat_processor_from_env() -> TaskProcessor:
 
     system_prompt = (os.getenv("KA2A_SYSTEM_PROMPT") or os.getenv("KA2A_AGENT_SYSTEM_PROMPT") or "").strip()
 
+    tools_enabled = _parse_bool(os.getenv("KA2A_TOOLS_ENABLED"), default=False)
+    tools_source = (os.getenv("KA2A_TOOLS_SOURCE") or "").strip().lower() or "off"
+    tools_max_steps = int(os.getenv("KA2A_TOOLS_MAX_STEPS") or "5")
+
     memory_store_kind = (os.getenv("KA2A_CONTEXT_MEMORY_STORE") or "off").strip().lower()
     memory_enable_summary = _parse_bool(os.getenv("KA2A_CONTEXT_MEMORY_SUMMARY"), default=False)
     memory_enable_profile = _parse_bool(os.getenv("KA2A_CONTEXT_MEMORY_PROFILE"), default=False)
@@ -227,6 +232,63 @@ def make_langgraph_chat_processor_from_env() -> TaskProcessor:
 
     class _State(TypedDict):
         messages: list[Any]
+
+    def _build_tool_executor() -> ToolExecutor | None:
+        if not tools_enabled or tools_source in ("", "off", "false", "0", "none"):
+            return None
+
+        if tools_source in ("mcp", "mcp-http", "mcp_http", "mcp_http_tools"):
+            from kafka_a2a.mcp_tools import McpHttpToolExecutor
+
+            return McpHttpToolExecutor.from_env()
+
+        override = (os.getenv("KA2A_TOOL_EXECUTOR") or "").strip()
+        if override:
+            obj = _import_path(override)
+            if callable(obj) and not hasattr(obj, "call_tool"):
+                obj = obj()
+            if not hasattr(obj, "list_tools") or not hasattr(obj, "call_tool"):
+                raise ValueError("KA2A_TOOL_EXECUTOR must be a ToolExecutor or a callable returning one.")
+            return obj  # type: ignore[return-value]
+
+        return None
+
+    def _tool_prompt_block(tools: list[ToolSpec]) -> str:
+        if not tools:
+            return ""
+        tools_obj = [
+            {
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.input_schema,
+            }
+            for t in tools
+        ]
+        return (
+            "\n\nAvailable tools (JSON):\n"
+            + json.dumps(tools_obj, ensure_ascii=False)
+            + "\n\nTool calling rules:\n"
+            + "- If you need a tool, respond with STRICT JSON only (no markdown).\n"
+            + '- Output MUST be either a single object or a list of objects shaped like: {"kind":"tool-call","name":"...","arguments":{...}}.\n'
+            + "- You may call multiple tools in one response.\n"
+            + "- After tool results are provided, respond normally with your final answer.\n"
+        )
+
+    def _parts_from_model_content(content: Any) -> list[Any]:
+        if isinstance(content, str):
+            text = content.strip()
+            if text.startswith("```"):
+                text = text.strip("`").strip()
+            if text.startswith("{") or text.startswith("["):
+                try:
+                    obj = json.loads(text)
+                except Exception:
+                    obj = None
+                if isinstance(obj, dict):
+                    return _ka2a_parts_from_model_content([obj])
+                if isinstance(obj, list):
+                    return _ka2a_parts_from_model_content(obj)
+        return _ka2a_parts_from_model_content(content)
 
     async def _load_memory(*, context_id: str, metadata: dict[str, Any] | None) -> ContextMemory | None:
         if memory_store is None:
@@ -374,6 +436,20 @@ def make_langgraph_chat_processor_from_env() -> TaskProcessor:
         lc_messages: list[Any] = []
         mem = await _load_memory(context_id=task.context_id, metadata=metadata)
         sys = _system_prompt_with_memory(base=system_prompt, memory=mem)
+        tool_executor = _build_tool_executor()
+        tool_ctx = ToolContext.from_metadata(
+            metadata=metadata,
+            decrypt=decryptor,
+            principal_metadata_key=os.getenv("KA2A_PRINCIPAL_METADATA_KEY") or "urn:ka2a:principal",
+        )
+        tool_specs: list[ToolSpec] = []
+        if tool_executor is not None:
+            try:
+                tool_specs = await tool_executor.list_tools(ctx=tool_ctx)
+            except Exception:
+                tool_specs = []
+        if tool_specs:
+            sys = (sys or "") + _tool_prompt_block(tool_specs)
         if sys:
             lc_messages.append(SystemMessage(content=sys))
 
@@ -400,27 +476,78 @@ def make_langgraph_chat_processor_from_env() -> TaskProcessor:
 
         lc_messages.append(HumanMessage(content=user_content))
 
-        async def _call_model(state: _State) -> _State:
-            resp = await llm.ainvoke(state["messages"])
-            return {"messages": [*state["messages"], resp]}
-
-        graph = StateGraph(_State)
-        graph.add_node("model", _call_model)
-        graph.set_entry_point("model")
-        graph.add_edge("model", END)
-        app = graph.compile()
-
-        result = await app.ainvoke({"messages": lc_messages})
-        out_messages = result.get("messages") or []
         response_parts: list[Any] = []
         response_text = ""
-        if out_messages:
-            last = out_messages[-1]
-            content = getattr(last, "content", "") if hasattr(last, "content") else ""
-            response_parts = _ka2a_parts_from_model_content(content)
-            response_text = "\n".join([p.text for p in response_parts if isinstance(p, TextPart)]).strip()
-            if not response_text:
-                response_text = str(content) if not isinstance(content, str) else content
+
+        if tool_executor is None:
+
+            async def _call_model(state: _State) -> _State:
+                resp = await llm.ainvoke(state["messages"])
+                return {"messages": [*state["messages"], AIMessage(content=resp.content)]}
+
+            graph = StateGraph(_State)
+            graph.add_node("model", _call_model)
+            graph.set_entry_point("model")
+            graph.add_edge("model", END)
+            app = graph.compile()
+
+            result = await app.ainvoke({"messages": lc_messages})
+            out_messages = result.get("messages") or []
+            if out_messages:
+                last = out_messages[-1]
+                content = getattr(last, "content", "") if hasattr(last, "content") else ""
+                response_parts = _parts_from_model_content(content)
+                response_text = "\n".join([p.text for p in response_parts if isinstance(p, TextPart)]).strip()
+                if not response_text:
+                    response_text = str(content) if not isinstance(content, str) else content
+
+        else:
+            steps = max(0, tools_max_steps)
+            messages2: list[Any] = list(lc_messages)
+
+            for _ in range(steps + 1):
+                resp = await llm.ainvoke(messages2)
+                messages2.append(AIMessage(content=resp.content))
+
+                parts = _parts_from_model_content(resp.content)
+                tool_calls = [p for p in parts if isinstance(p, ToolCallPart)]
+                if not tool_calls:
+                    response_parts = parts
+                    response_text = "\n".join([p.text for p in response_parts if isinstance(p, TextPart)]).strip()
+                    if not response_text:
+                        response_text = str(resp.content) if not isinstance(resp.content, str) else resp.content
+                    break
+
+                yield Artifact(name="tool_calls", parts=tool_calls)
+
+                tool_results: list[ToolResultPart] = []
+                for call in tool_calls:
+                    try:
+                        output = await tool_executor.call_tool(
+                            name=call.name, arguments=call.arguments, ctx=tool_ctx
+                        )
+                        tool_results.append(
+                            ToolResultPart(tool_call_id=call.tool_call_id, output=output, is_error=False)
+                        )
+                    except Exception as exc:
+                        tool_results.append(
+                            ToolResultPart(
+                                tool_call_id=call.tool_call_id,
+                                output={"error": str(exc)},
+                                is_error=True,
+                            )
+                        )
+
+                yield Artifact(name="tool_results", parts=tool_results)
+                messages2.append(
+                    HumanMessage(
+                        content=[p.model_dump(by_alias=True, exclude_none=True) for p in tool_results]
+                    )
+                )
+
+            if not response_parts:
+                response_parts = [TextPart(text="Tool execution limit reached.")]
+                response_text = "Tool execution limit reached."
 
         artifact = Artifact(name="result", parts=response_parts or [TextPart(text=response_text)])
         yield artifact

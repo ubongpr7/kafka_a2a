@@ -1,0 +1,35 @@
+{
+	# NOTE: This requires Caddy compiled with the layer4 app:
+	#   xcaddy build --with github.com/mholt/caddy-l4
+	#
+	# This config uses the Layer 4 app as a listener wrapper so it can run alongside
+	# Caddy's normal HTTP app on :443, while still terminating TLS and proxying raw
+	# TCP (Kafka) based on SNI.
+	#
+	# Why a wrapper? It keeps ACME/cert issuance working and avoids port conflicts.
+	servers {
+		listener_wrappers {
+			layer4 {
+				# Route Kafka TLS connections for this SNI to the local broker listener.
+				#
+				# IMPORTANT: exclude ACME TLS-ALPN challenges so Caddy can renew certs.
+				@kafka_tls {
+					tls sni kafka.interaims.com
+					not tls alpn acme-tls/1
+				}
+				route @kafka_tls {
+					tls
+					proxy 127.0.0.1:9094
+				}
+			}
+			tls
+		}
+	}
+}
+
+# This HTTP site exists mainly to let Caddy manage TLS certificates for the domain.
+# HTTPS requests to this host will normally be intercepted by the layer4 wrapper above.
+kafka.interaims.com {
+	respond "Kafka endpoint. Use a Kafka client, not a browser." 200
+}
+

@@ -152,7 +152,9 @@ def make_router_processor_from_env() -> TaskProcessor:
         async with state.lock:
             if state.started:
                 return
-            transport = KafkaTransport(KafkaConfig(bootstrap_servers=bootstrap, client_id=f"ka2a-router-{uuid4()}"))
+            transport = KafkaTransport(
+                KafkaConfig.from_env(bootstrap_servers=bootstrap, client_id=f"ka2a-router-{uuid4()}")
+            )
             client = Ka2aClient(transport=transport, config=Ka2aClientConfig(client_id=os.getenv("KA2A_ROUTER_CLIENT_ID")))
             await client.start()
 

@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.errors import A2AError
+from kafka_a2a.ops import ensure_trace_metadata, metrics_enabled, metrics_snapshot
 from kafka_a2a.protocol import (
     METHOD_AGENT_GET_AUTHENTICATED_EXTENDED_CARD,
     METHOD_MESSAGE_SEND,
@@ -64,7 +65,9 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
     from fastapi import Request
     from fastapi.responses import JSONResponse, StreamingResponse
 
-    transport = KafkaTransport(KafkaConfig(bootstrap_servers=config.bootstrap_servers))
+    transport = KafkaTransport(
+        KafkaConfig.from_env(bootstrap_servers=config.bootstrap_servers, client_id=config.client_id)
+    )
     client = Ka2aClient(transport=transport, config=Ka2aClientConfig(client_id=config.client_id))
 
     app = FastAPI(title=config.title, version=config.version)
@@ -80,6 +83,12 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    if metrics_enabled():
+
+        @app.get("/metrics")
+        async def metrics() -> Any:
+            return JSONResponse(metrics_snapshot())
 
     @app.get("/.well-known/agent-card.json")
     async def agent_card(request: Request) -> Any:
@@ -138,6 +147,10 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
         if not isinstance(method, str):
             return JSONResponse(_jsonrpc_error(request_id, -32600, "Invalid Request"))
 
+        def _metadata(md: dict[str, Any] | None) -> dict[str, Any] | None:
+            out = with_principal(md or {}, principal) if principal else md
+            return ensure_trace_metadata(out, headers=request.headers)
+
         if method in (METHOD_MESSAGE_STREAM, METHOD_TASKS_RESUBSCRIBE):
 
             async def _event_source() -> AsyncIterator[str]:
@@ -148,7 +161,7 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                             agent_name=config.agent_name,
                             message=p.message,
                             configuration=p.configuration,
-                            metadata=with_principal(p.metadata or {}, principal) if principal else p.metadata,
+                            metadata=_metadata(p.metadata),
                         )
                     else:
                         p = TaskIdParams.model_validate(params)
@@ -156,7 +169,7 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                             agent_name=config.agent_name,
                             task_id=p.id,
                             resubscribe=True,
-                            metadata=with_principal(p.metadata or {}, principal) if principal else p.metadata,
+                            metadata=_metadata(p.metadata),
                         )
 
                     async for ev in events:
@@ -189,7 +202,7 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                     agent_name=config.agent_name,
                     message=p.message,
                     configuration=p.configuration,
-                    metadata=with_principal(p.metadata or {}, principal) if principal else p.metadata,
+                    metadata=_metadata(p.metadata),
                 )
                 return JSONResponse(
                     _jsonrpc_success(request_id, task.model_dump(mode="json", by_alias=True, exclude_none=True))
@@ -200,7 +213,7 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                 task = await client.get_task(
                     agent_name=config.agent_name,
                     task_id=p.id,
-                    metadata=with_principal(p.metadata or {}, principal) if principal else p.metadata,
+                    metadata=_metadata(p.metadata),
                 )
                 return JSONResponse(
                     _jsonrpc_success(request_id, task.model_dump(mode="json", by_alias=True, exclude_none=True))
@@ -211,7 +224,7 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                 task = await client.cancel_task(
                     agent_name=config.agent_name,
                     task_id=p.id,
-                    metadata=with_principal(p.metadata or {}, principal) if principal else p.metadata,
+                    metadata=_metadata(p.metadata),
                 )
                 return JSONResponse(
                     _jsonrpc_success(request_id, task.model_dump(mode="json", by_alias=True, exclude_none=True))
@@ -223,10 +236,14 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                 METHOD_TASKS_PUSH_NOTIFICATION_CONFIG_LIST,
                 METHOD_TASKS_PUSH_NOTIFICATION_CONFIG_DELETE,
             ):
-                if principal:
-                    params = dict(params)
-                    params["metadata"] = with_principal(params.get("metadata") or {}, principal)
-                result = await client.call(agent_name=config.agent_name, method=method, params=params)
+                params2 = dict(params)
+                md0 = params2.get("metadata") if isinstance(params2.get("metadata"), dict) else None
+                md = _metadata(md0)
+                if md is not None:
+                    params2["metadata"] = md
+                else:
+                    params2.pop("metadata", None)
+                result = await client.call(agent_name=config.agent_name, method=method, params=params2)
                 return JSONResponse(_jsonrpc_success(request_id, result))
 
             if method == METHOD_AGENT_GET_AUTHENTICATED_EXTENDED_CARD:

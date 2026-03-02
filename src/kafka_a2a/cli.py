@@ -17,7 +17,7 @@ from kafka_a2a.runtime.agent import Ka2aAgent, Ka2aAgentConfig
 from kafka_a2a.server.a2a_http import A2AHttpProxyConfig, create_a2a_http_proxy_app
 from kafka_a2a.server.auth import JwtBearerConfig
 from kafka_a2a.server.gateway import GatewayConfig, create_gateway_app
-from kafka_a2a.transport.kafka import KafkaConfig, KafkaTransport
+from kafka_a2a.transport.kafka import KafkaAgentRegistryConfig, KafkaConfig, KafkaDlqConfig, KafkaTransport, TopicNamer
 
 
 def _parse_bool(value: str | None, *, default: bool = False) -> bool:
@@ -158,7 +158,7 @@ async def _run_agent(args: argparse.Namespace) -> None:
         prefix = os.getenv("KA2A_AGENT_NAME_PREFIX", "")
         name = f"{prefix}{socket.gethostname()}"
 
-    transport = KafkaTransport(KafkaConfig(bootstrap_servers=bootstrap, client_id=f"ka2a-agent-{name}"))
+    transport = KafkaTransport(KafkaConfig.from_env(bootstrap_servers=bootstrap, client_id=f"ka2a-agent-{name}"))
     registry = KafkaAgentRegistry(transport=transport, sender=name)
 
     push_notifications = (
@@ -256,18 +256,28 @@ async def _ensure_topics(args: argparse.Namespace) -> None:
     partitions = int(args.partitions or os.getenv("KA2A_KAFKA_TOPIC_PARTITIONS") or "1")
     repl = int(args.replication_factor or os.getenv("KA2A_KAFKA_TOPIC_REPLICATION_FACTOR") or "1")
 
-    registry_topic = (os.getenv("KA2A_REGISTRY_TOPIC") or "ka2a.agent_cards").strip()
-
     agents = _split_csv(args.agents or os.getenv("KA2A_AGENT_NAMES"))
     client_ids = _split_csv(args.client_ids or os.getenv("KA2A_CLIENT_IDS"))
 
-    topics: set[str] = {registry_topic}
-    for name in agents:
-        topics.add(f"ka2a.req.{name}")
-    for cid in client_ids:
-        topics.add(f"ka2a.reply.{cid}")
+    # Common service IDs that should use stable reply topics when Kafka auto-create is disabled.
+    for var in ("KA2A_GATEWAY_CLIENT_ID", "KA2A_PROXY_CLIENT_ID", "KA2A_ROUTER_CLIENT_ID"):
+        value = (os.getenv(var) or "").strip()
+        if value:
+            client_ids.append(value)
 
-    if not topics:
+    topics = TopicNamer.from_env()
+    registry_cfg = KafkaAgentRegistryConfig.from_env()
+    dlq_cfg = KafkaDlqConfig.from_env()
+
+    topic_names: set[str] = {registry_cfg.topic}
+    for name in agents:
+        topic_names.add(topics.agent_requests(name))
+    for cid in client_ids:
+        topic_names.add(topics.client_replies(cid))
+    if dlq_cfg.enabled:
+        topic_names.add(dlq_cfg.topic)
+
+    if not topic_names:
         raise SystemExit("No topics to create.")
 
     try:
@@ -276,13 +286,22 @@ async def _ensure_topics(args: argparse.Namespace) -> None:
     except Exception as exc:  # pragma: no cover
         raise SystemExit("aiokafka admin client is required (aiokafka>=0.11.0).") from exc
 
-    admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap, client_id=os.getenv("KA2A_ADMIN_CLIENT_ID") or "ka2a-admin")
+    admin_cfg = KafkaConfig.from_env(
+        bootstrap_servers=bootstrap,
+        client_id=os.getenv("KA2A_ADMIN_CLIENT_ID") or "ka2a-admin",
+    )
+    admin = AIOKafkaAdminClient(**admin_cfg.aiokafka_kwargs())
     await admin.start()
     try:
         existing = set(await admin.list_topics())
         to_create = [
-            NewTopic(name=t, num_partitions=partitions, replication_factor=repl)
-            for t in sorted(topics)
+            NewTopic(
+                name=t,
+                num_partitions=partitions,
+                replication_factor=repl,
+                topic_configs={"cleanup.policy": "compact"} if t == registry_cfg.topic else None,
+            )
+            for t in sorted(topic_names)
             if t not in existing
         ]
         if not to_create:
@@ -294,7 +313,7 @@ async def _ensure_topics(args: argparse.Namespace) -> None:
             # Race: topic created by another process.
             pass
         print("Ensured topics:")
-        for t in sorted(topics):
+        for t in sorted(topic_names):
             print(f" - {t}")
     finally:
         await admin.close()
