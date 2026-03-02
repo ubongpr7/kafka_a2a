@@ -3,5 +3,6 @@ services:
     ports:
       # Bind the public listener to localhost only; put a TCP proxy (Caddy L4 / nginx stream / HAProxy)
       # in front for TLS termination on your domain.
-      - "127.0.0.1:9094:9094"
-
+      #
+      # If port 9094 is already in use on the host, set `KA2A_KAFKA_HOST_PORT` in `kafka/sasl/.env`.
+      - "127.0.0.1:${KA2A_KAFKA_HOST_PORT:-9094}:9094"

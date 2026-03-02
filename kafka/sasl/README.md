@@ -51,12 +51,15 @@ See `kafka/sasl/Caddyfile.example`.
 docker compose -f docker-compose.yml -f docker-compose.server.yml up -d
 ```
 
+If you get `address already in use` for port `9094`, set `KA2A_KAFKA_HOST_PORT` in `kafka/sasl/.env` (example: `19094`)
+and update your TCP proxy upstream accordingly.
+
 - Decide what port you want the public endpoint to be:
   - If your proxy listens on `:443`, you must advertise `kafka.interaims.com:443`
   - If your proxy listens on `:9094`, you must advertise `kafka.interaims.com:9094`
 
 In this compose, the host-facing broker listener is `9094` (the internal Docker listener is `9092`), so:
-- If your proxy runs on the **host**, proxy to `127.0.0.1:9094`
+- If your proxy runs on the **host**, proxy to `127.0.0.1:9094` (or `127.0.0.1:$KA2A_KAFKA_HOST_PORT` if you changed it)
 - If your proxy runs in **Docker on the same network**, proxy to `kafka:9092`
 
 Then configure K-A2A to connect to the proxy endpoint using `SASL_SSL` (TLS to the proxy) + SASL creds.
