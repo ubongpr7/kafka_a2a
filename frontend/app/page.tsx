@@ -189,13 +189,10 @@ export default function HomePage() {
               <input
                 className="text"
                 value={session?.agentName || ""}
-                onChange={(e) =>
-                  session &&
-                  dispatch(updateSessionConfig({ sessionId: session.sessionId, agentName: e.target.value }))
-                }
                 placeholder="host"
-                disabled={!session || session.isStreaming}
+                disabled
               />
+              <div className="hint">All UI requests go to <code>host</code>; it delegates to other agents.</div>
             </div>
 
             <div className="field">

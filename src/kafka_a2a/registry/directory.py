@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from kafka_a2a.models import AgentCard
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
+
+logger = logging.getLogger("kafka_a2a.directory")
 
 
 def _utc_now() -> datetime:
@@ -55,14 +58,26 @@ class KafkaAgentDirectory:
         self._stop.clear()
 
         async def _consume() -> None:
-            async for entry in self._registry.watch(
-                group_id=self._cfg.group_id,
-                auto_offset_reset=self._cfg.auto_offset_reset,
-                stop_event=self._stop,
-            ):
-                self._entries[entry.agent_name] = DirectoryEntry(card=entry.card, last_seen=_utc_now())
-                if self._stop.is_set():
-                    break
+            while not self._stop.is_set():
+                try:
+                    async for entry in self._registry.watch(
+                        group_id=self._cfg.group_id,
+                        auto_offset_reset=self._cfg.auto_offset_reset,
+                        stop_event=self._stop,
+                    ):
+                        self._entries[entry.agent_name] = DirectoryEntry(card=entry.card, last_seen=_utc_now())
+                        if self._stop.is_set():
+                            break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Best-effort background watcher. Kafka can be temporarily unavailable;
+                    # keep retrying instead of crashing the directory permanently.
+                    logger.warning("agent directory watch failed; retrying", exc_info=True)
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
 
         async def _prune() -> None:
             if self._cfg.entry_ttl_s is None:

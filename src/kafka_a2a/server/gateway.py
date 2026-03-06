@@ -38,7 +38,7 @@ class GatewayConfig:
 
 def create_gateway_app(config: GatewayConfig):
     FastAPI = _require_fastapi()
-    from fastapi import File, Form, HTTPException, Request, UploadFile
+    from fastapi import File, Form, HTTPException, Query, Request, UploadFile
     from fastapi.responses import JSONResponse, StreamingResponse
 
     transport = KafkaTransport(
@@ -141,9 +141,16 @@ def create_gateway_app(config: GatewayConfig):
         limit: int | None = None,
         offset: int | None = None,
         status: str | None = None,
+        context_id: str | None = Query(None, alias="contextId"),
     ) -> Any:
         metadata = _metadata_from_request(request)
-        params = TaskListParams(limit=limit, offset=offset, status=status, metadata=metadata).model_dump(
+        params = TaskListParams(
+            limit=limit,
+            offset=offset,
+            status=status,
+            context_id=context_id,
+            metadata=metadata,
+        ).model_dump(
             by_alias=True, exclude_none=True
         )
         try:

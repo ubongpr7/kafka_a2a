@@ -135,6 +135,7 @@ class TaskListParams(Ka2aProtocolModel):
     limit: int | None = None
     offset: int | None = None
     status: str | None = None
+    context_id: str | None = None
     include_artifacts: bool | None = None
     metadata: dict[str, Any] | None = None
 

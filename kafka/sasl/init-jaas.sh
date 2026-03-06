@@ -43,6 +43,18 @@ if [[ -z "${admin_user}" || -z "${admin_pass}" ]]; then
   exit 1
 fi
 
+if [[ -d "${ADMIN_PROPS_FILE}" ]]; then
+  echo "[ka2a-sasl] ${ADMIN_PROPS_FILE} is a directory, expected a file." >&2
+  echo "[ka2a-sasl] If you bind-mounted admin.properties from the host, ensure the host path is a *file*, not a folder." >&2
+  exit 1
+fi
+
+if [[ -e "${ADMIN_PROPS_FILE}" && ! -w "${ADMIN_PROPS_FILE}" ]]; then
+  echo "[ka2a-sasl] ${ADMIN_PROPS_FILE} exists but is not writable; leaving it unchanged." >&2
+  echo "[ka2a-sasl] Ensure it matches the admin username/password in your JAAS config so healthchecks/ACL init can authenticate." >&2
+  exit 0
+fi
+
 cat >"${ADMIN_PROPS_FILE}" <<EOF
 # Admin client properties for Kafka CLI tools (kafka-topics, kafka-acls, etc.)
 security.protocol=SASL_PLAINTEXT

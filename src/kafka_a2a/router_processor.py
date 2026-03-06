@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -90,6 +91,32 @@ def _score_card(card: AgentCard, query: str) -> int:
     return score
 
 
+_ROUTER_INTROSPECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(list|show|display)\b.*\bagents?\b", re.IGNORECASE),
+    re.compile(r"\bwhat\b.*\bagents?\b", re.IGNORECASE),
+    re.compile(r"\bavailable\b.*\bagents?\b", re.IGNORECASE),
+    re.compile(r"\bregistered\b.*\bagents?\b", re.IGNORECASE),
+    re.compile(r"\bagents?\b.*\b(available|registered|here|in this|in your|on this)\b", re.IGNORECASE),
+    re.compile(
+        r"\bagents?\b.*\b(work with|working with|do you have|can you use|can you talk to)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bagent\s*cards?\b", re.IGNORECASE),
+    re.compile(r"\b(skills|capabilities)\b", re.IGNORECASE),
+    re.compile(r"\bwho are you\b", re.IGNORECASE),
+    re.compile(r"\bwhat can you do\b", re.IGNORECASE),
+)
+
+
+def _is_router_introspection_query(query: str) -> bool:
+    q = (query or "").strip()
+    if not q:
+        return False
+    if q.strip().lower() in {"help", "agents", "list agents"}:
+        return True
+    return any(p.search(q) for p in _ROUTER_INTROSPECTION_PATTERNS)
+
+
 @dataclass(slots=True)
 class _RouterState:
     started: bool = False
@@ -123,6 +150,8 @@ def make_router_processor_from_env() -> TaskProcessor:
 
     directory_ttl_s = float(os.getenv("KA2A_DIRECTORY_ENTRY_TTL_S") or "300")
     directory_offset_reset = (os.getenv("KA2A_DIRECTORY_AUTO_OFFSET_RESET") or "earliest").strip().lower()
+    directory_warmup_timeout_s = float(os.getenv("KA2A_DIRECTORY_WARMUP_TIMEOUT_S") or "3.0")
+    directory_warmup_settle_s = float(os.getenv("KA2A_DIRECTORY_WARMUP_SETTLE_S") or "0.5")
 
     # LLM selection (optional): reuse the same LLM creds resolution as langgraph processor.
     settings = Ka2aSettings.from_env()
@@ -147,6 +176,41 @@ def make_router_processor_from_env() -> TaskProcessor:
         return _import_path("kafka_a2a.llms.openai_compat:create_chat_model")
 
     state = _RouterState()
+
+    async def _list_downstream_cards() -> list[AgentCard]:
+        """
+        Best-effort snapshot of downstream agent cards.
+
+        The directory watcher runs in the background and may take a short moment to
+        hydrate when the host receives its first request after boot.
+        """
+
+        assert state.directory is not None
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, directory_warmup_timeout_s)
+
+        last_names: set[str] | None = None
+        settle_deadline: float | None = None
+        best: list[AgentCard] = []
+
+        while True:
+            cards_now = [c for c in state.directory.list() if c.name and c.name != agent_name]
+            cards_now.sort(key=lambda c: c.name)
+            best = cards_now or best
+
+            names_now = {c.name for c in cards_now}
+            if names_now != (last_names or set()):
+                last_names = set(names_now)
+                settle_deadline = loop.time() + max(0.0, directory_warmup_settle_s)
+
+            if names_now and settle_deadline is not None and loop.time() >= settle_deadline:
+                return cards_now
+
+            if loop.time() >= deadline:
+                return best
+
+            await asyncio.sleep(0.05)
 
     async def _ensure_started() -> None:
         async with state.lock:
@@ -226,14 +290,47 @@ def make_router_processor_from_env() -> TaskProcessor:
         assert state.directory is not None
 
         user_text = "\n".join([p.text for p in message.parts if isinstance(p, TextPart)]).strip()
-        cards = [c for c in state.directory.list() if c.name and c.name != agent_name]
-        cards.sort(key=lambda c: c.name)
+        cards = await _list_downstream_cards()
 
         if not cards:
             yield Artifact(name="result", parts=[TextPart(text="No downstream agents are registered yet.")])
             yield TaskStatus(
                 state=TaskState.completed,
                 message=Message(role=Role.agent, parts=[TextPart(text="No downstream agents are registered yet.")]),
+            )
+            return
+
+        if _is_router_introspection_query(user_text):
+            yield Artifact(
+                name="router",
+                parts=[
+                    DataPart(
+                        data={
+                            "selectedAgent": agent_name,
+                            "availableAgents": [c.name for c in cards],
+                            "mode": "introspection",
+                        }
+                    )
+                ],
+            )
+            yield Artifact(
+                name="agents",
+                parts=[DataPart(data={"agents": [_card_summary(c) for c in cards]})],
+            )
+            lines = ["I am the host router agent.", "", "Available agents:"]
+            for c in cards:
+                desc = (c.description or "").strip()
+                if desc:
+                    lines.append(f"- {c.name}: {desc}")
+                else:
+                    lines.append(f"- {c.name}")
+            lines.append("")
+            lines.append('Ask me a question normally and I will delegate to the best agent (or pass `"agent_name"` to force one).')
+            text = "\n".join(lines).strip()
+            yield Artifact(name="result", parts=[TextPart(text=text)])
+            yield TaskStatus(
+                state=TaskState.completed,
+                message=Message(role=Role.agent, parts=[TextPart(text=text)], context_id=task.context_id),
             )
             return
 

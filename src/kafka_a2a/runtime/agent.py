@@ -410,7 +410,10 @@ class Ka2aAgent:
 
         if method == METHOD_TASKS_LIST:
             p = TaskListParams.model_validate(params)
-            tasks = await self._store.list_tasks()
+            if p.context_id:
+                tasks = await self._store.list_tasks_by_context(p.context_id)
+            else:
+                tasks = await self._store.list_tasks()
             if self._cfg.tenant_isolation:
                 principal = self._require_principal(p.metadata or {})
                 tasks = [
