@@ -145,7 +145,8 @@ cp .env.example .env.local
 yarn dev
 ```
 
-Open `http://localhost:3000`. Make sure the gateway is reachable at `KA2A_GATEWAY_URL` (default `http://localhost:8000`).
+Open `http://localhost:3000`. Make sure the gateway is reachable at `NEXT_PUBLIC_KA2A_GATEWAY_URL` (default `http://localhost:8000`).
+For a hosted backend, set `NEXT_PUBLIC_KA2A_GATEWAY_URL` in `frontend/.env.local` to the remote URL, for example `https://dev.agents.interaims.com`.
 
 Test the A2A HTTP proxy:
 

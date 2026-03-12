@@ -13,7 +13,7 @@ yarn dev
 
 Open http://localhost:3000.
 
-Make sure the Gateway is running on `http://localhost:8000` (or update `KA2A_GATEWAY_URL` in `.env.local`).
+Set `NEXT_PUBLIC_KA2A_GATEWAY_URL` in `.env.local` to the gateway you want the browser to call directly, for example `https://dev.agents.interaims.com`.
 
 ## Features
 

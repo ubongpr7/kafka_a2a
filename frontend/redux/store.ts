@@ -3,6 +3,7 @@ import { persistReducer, FLUSH, REHYDRATE, PAUSE, PERSIST, PURGE, REGISTER } fro
 import createWebStorage from "redux-persist/lib/storage/createWebStorage"
 import globalReducer from "./state"
 import ka2aReducer from "./features/ka2a/ka2aSlice"
+import { apiSlice } from "./services/apiSlice"
 
 const createNoopStorage = () => ({
   getItem() {
@@ -32,6 +33,7 @@ const ka2aPersistConfig = {
 }
 
 const rootReducer = combineReducers({
+  [apiSlice.reducerPath]: apiSlice.reducer,
   global: persistReducer(globalPersistConfig, globalReducer),
   ka2a: persistReducer(ka2aPersistConfig, ka2aReducer),
 })
@@ -44,7 +46,7 @@ export const makeStore = () => {
         serializableCheck: {
           ignoredActions: [FLUSH, REHYDRATE, PAUSE, PERSIST, PURGE, REGISTER],
         },
-      }),
+      }).concat(apiSlice.middleware),
   })
 }
 

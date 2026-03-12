@@ -2,6 +2,7 @@ import asyncio
 import json
 import mimetypes
 import base64
+import os
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -36,9 +37,18 @@ class GatewayConfig:
     jwt: JwtBearerConfig | None = None
 
 
+_DEFAULT_CORS_ALLOW_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
+
+def _parse_csv_env(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def create_gateway_app(config: GatewayConfig):
     FastAPI = _require_fastapi()
     from fastapi import File, Form, HTTPException, Query, Request, UploadFile
+    from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse, StreamingResponse
 
     transport = KafkaTransport(
@@ -51,6 +61,15 @@ def create_gateway_app(config: GatewayConfig):
     registry_task: Any | None = None
 
     app = FastAPI(title="K-A2A Gateway", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_parse_csv_env("KA2A_CORS_ALLOW_ORIGINS"),
+        allow_origin_regex=os.environ.get("KA2A_CORS_ALLOW_ORIGIN_REGEX", _DEFAULT_CORS_ALLOW_ORIGIN_REGEX),
+        allow_credentials=False,
+        allow_methods=_parse_csv_env("KA2A_CORS_ALLOW_METHODS") or ["GET", "POST", "OPTIONS"],
+        allow_headers=_parse_csv_env("KA2A_CORS_ALLOW_HEADERS")
+        or ["Authorization", "Content-Type", "X-Requested-With"],
+    )
 
     class ChatRequest(Ka2aModel):
         text: str

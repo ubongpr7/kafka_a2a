@@ -10,6 +10,7 @@ import {
   setActiveSession,
   updateSessionConfig,
 } from "@/redux/features/ka2a/ka2aSlice"
+import { useGetGatewayHealthQuery } from "@/redux/features/ka2a/ka2aApiSlice"
 import { sendStreamMessage } from "@/redux/features/ka2a/ka2aThunks"
 import { ThemeSwitchButton } from "@/redux/theme-switch-button"
 
@@ -32,36 +33,24 @@ const _fmtTime = (iso?: string) => {
 export default function HomePage() {
   const dispatch = useAppDispatch()
   const { sessions, activeSessionId } = useAppSelector((s) => s.ka2a)
+  const { data: gatewayHealth, isError: gatewayError, isLoading: gatewayLoading } = useGetGatewayHealthQuery(
+    undefined,
+    {
+      pollingInterval: 5000,
+      refetchOnFocus: true,
+      refetchOnReconnect: true,
+    },
+  )
 
   const session = activeSessionId ? sessions[activeSessionId] : undefined
   const [text, setText] = React.useState("")
-  const [gatewayOk, setGatewayOk] = React.useState<boolean | null>(null)
+  const gatewayOk = gatewayHealth?.status === "ok" ? true : gatewayError ? false : gatewayLoading ? null : false
 
   React.useEffect(() => {
     if (!activeSessionId) {
       dispatch(createSession())
     }
   }, [activeSessionId, dispatch])
-
-  // React.useEffect(() => {
-  //   let cancelled = false
-  //   const run = async () => {
-  //     try {
-  //       const resp = await fetch("/api/ka2a/health", { cache: "no-store" })
-  //       if (cancelled) return
-  //       setGatewayOk(resp.ok)
-  //     } catch {
-  //       if (cancelled) return
-  //       setGatewayOk(false)
-  //     }
-  //   }
-  //   run()
-  //   const t = setInterval(run, 5000)
-  //   return () => {
-  //     cancelled = true
-  //     clearInterval(t)
-  //   }
-  // }, [])
 
   const onSend = async () => {
     if (!session) return
