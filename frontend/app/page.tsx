@@ -43,25 +43,25 @@ export default function HomePage() {
     }
   }, [activeSessionId, dispatch])
 
-  React.useEffect(() => {
-    let cancelled = false
-    const run = async () => {
-      try {
-        const resp = await fetch("/api/ka2a/health", { cache: "no-store" })
-        if (cancelled) return
-        setGatewayOk(resp.ok)
-      } catch {
-        if (cancelled) return
-        setGatewayOk(false)
-      }
-    }
-    run()
-    const t = setInterval(run, 5000)
-    return () => {
-      cancelled = true
-      clearInterval(t)
-    }
-  }, [])
+  // React.useEffect(() => {
+  //   let cancelled = false
+  //   const run = async () => {
+  //     try {
+  //       const resp = await fetch("/api/ka2a/health", { cache: "no-store" })
+  //       if (cancelled) return
+  //       setGatewayOk(resp.ok)
+  //     } catch {
+  //       if (cancelled) return
+  //       setGatewayOk(false)
+  //     }
+  //   }
+  //   run()
+  //   const t = setInterval(run, 5000)
+  //   return () => {
+  //     cancelled = true
+  //     clearInterval(t)
+  //   }
+  // }, [])
 
   const onSend = async () => {
     if (!session) return

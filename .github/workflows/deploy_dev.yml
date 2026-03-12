@@ -1,0 +1,77 @@
+name: Deploy (Dev)
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-dev-${{ github.repository }}
+  cancel-in-progress: true
+
+env:
+  DEPLOY_PATH: inventory/${{ github.event.repository.name }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s' "${{ secrets.DEV_EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 400 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.DEV_EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync Repo To Server
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            "${{ secrets.DEV_EC2_USER }}@${{ secrets.DEV_EC2_HOST }}" \
+            "mkdir -p '${{ env.DEPLOY_PATH }}'"
+
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.venv' \
+            --exclude='.env' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='.pytest_cache' \
+            --exclude='.ruff_cache' \
+            --exclude='frontend/node_modules' \
+            --exclude='frontend/.next' \
+            ./ "${{ secrets.DEV_EC2_USER }}@${{ secrets.DEV_EC2_HOST }}:${{ env.DEPLOY_PATH }}/"
+
+      - name: Write .env (From Secret)
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            "${{ secrets.DEV_EC2_USER }}@${{ secrets.DEV_EC2_HOST }}" <<'EOF'
+            set -euo pipefail
+            cd "${{ env.DEPLOY_PATH }}"
+
+            cat > .env <<'__KA2A_ENV_FILE__'
+          ${{ secrets.DEV_ENV_FILE }}
+          __KA2A_ENV_FILE__
+            chmod 600 .env
+          EOF
+
+      - name: Deploy With Docker Compose
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            "${{ secrets.DEV_EC2_USER }}@${{ secrets.DEV_EC2_HOST }}" <<'EOF'
+            set -euo pipefail
+            cd "${{ env.DEPLOY_PATH }}"
+            docker compose up -d --build --remove-orphans
+            docker image prune -f
+          EOF
+
+      - name: Verify
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            "${{ secrets.DEV_EC2_USER }}@${{ secrets.DEV_EC2_HOST }}" \
+            "cd '${{ env.DEPLOY_PATH }}' && docker compose ps"
+

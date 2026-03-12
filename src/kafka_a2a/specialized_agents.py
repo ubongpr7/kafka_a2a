@@ -6,6 +6,10 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from kafka_a2a.credentials import (
+    resolve_tavily_credentials_from_env,
+    resolve_tavily_credentials_from_metadata,
+)
 from kafka_a2a.llms.controls import RetryConfig
 from kafka_a2a.memory import KA2A_CONVERSATION_HISTORY_METADATA_KEY
 from kafka_a2a.models import (
@@ -207,7 +211,8 @@ def _make_tavily_research_agent_processor(*, system_prompt: str) -> TaskProcesso
             return _import_path("kafka_a2a.llms.gemini:create_chat_model")
         return _import_path("kafka_a2a.llms.openai_compat:create_chat_model")
 
-    tavily_api_key = (os.getenv("TAVILY_API_KEY") or "").strip() or None
+    tavily_env_creds = resolve_tavily_credentials_from_env()
+    tavily_api_key = tavily_env_creds.api_key if tavily_env_creds is not None else None
     tavily_max_results = int(os.getenv("KA2A_TAVILY_MAX_RESULTS") or "5")
     tavily_search_depth = (os.getenv("KA2A_TAVILY_SEARCH_DEPTH") or "basic").strip()
 
@@ -238,12 +243,20 @@ def _make_tavily_research_agent_processor(*, system_prompt: str) -> TaskProcesso
         llm_messages: list[_LlmMsg] = [_LlmMsg(type="system", content=system_prompt)]
         _add_history(llm_messages, history)
 
+        tavily_creds = None
+        if decryptor is not None:
+            try:
+                tavily_creds = resolve_tavily_credentials_from_metadata(metadata=metadata, decrypt=decryptor)
+            except Exception:
+                tavily_creds = None
+        request_tavily_api_key = tavily_creds.api_key if tavily_creds is not None else tavily_api_key
+
         sources: list[dict[str, Any]] = []
         search_block = ""
-        if tavily_api_key and user_text:
+        if request_tavily_api_key and user_text:
             try:
                 results = await tavily_search(
-                    api_key=tavily_api_key,
+                    api_key=request_tavily_api_key,
                     query=user_text,
                     max_results=tavily_max_results,
                     search_depth=tavily_search_depth,
@@ -320,4 +333,3 @@ def make_financial_analysis_agent_processor_from_env() -> TaskProcessor:
         "Focus on explaining drivers, risks, and scenarios. If the ticker/company/region/timeframe is unclear, ask."
     )
     return _make_tavily_research_agent_processor(system_prompt=system)
-

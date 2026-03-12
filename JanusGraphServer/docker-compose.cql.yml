@@ -1,0 +1,31 @@
+services:
+  cassandra:
+    image: ${CASSANDRA_IMAGE:-cassandra:4.1}
+    container_name: ${CASSANDRA_CONTAINER_NAME:-janusgraph-cassandra}
+    restart: unless-stopped
+    environment:
+      CASSANDRA_CLUSTER_NAME: ${CASSANDRA_CLUSTER_NAME:-janusgraph}
+      MAX_HEAP_SIZE: ${CASSANDRA_MAX_HEAP_SIZE:-1G}
+      HEAP_NEWSIZE: ${CASSANDRA_HEAP_NEWSIZE:-256M}
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES' 127.0.0.1 9042 >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  janusgraph:
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    environment:
+      JANUS_PROPS_TEMPLATE: cql
+      janusgraph.storage.hostname: ${JANUS_CQL_HOSTS:-cassandra}
+      janusgraph.storage.cql.keyspace: ${JANUS_CQL_KEYSPACE:-janusgraph}
+      JANUS_STORAGE_TIMEOUT: ${JANUS_STORAGE_TIMEOUT:-240}
+
+volumes:
+  cassandra_data:
+    name: ${CASSANDRA_DATA_VOLUME:-janusgraph_cassandra_data}

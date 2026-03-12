@@ -69,6 +69,15 @@ class Ka2aMcpClaim(Ka2aCredentialsModel):
     extra: dict[str, Any] | None = None
 
 
+class Ka2aTavilyClaim(Ka2aCredentialsModel):
+    """
+    Tavily credential claim for web-search enabled agents.
+    """
+
+    api_key: EncryptedSecret | None = None
+    extra: dict[str, Any] | None = None
+
+
 class Ka2aJwtClaim(Ka2aCredentialsModel):
     """
     Root K-A2A namespaced JWT claim (`ka2a`).
@@ -77,6 +86,7 @@ class Ka2aJwtClaim(Ka2aCredentialsModel):
     v: int = 1
     llm: Ka2aLlmClaim | None = None
     mcp: Ka2aMcpClaim | None = None
+    tavily: Ka2aTavilyClaim | None = None
 
 
 class ResolvedLlmCredentials(Ka2aCredentialsModel):
@@ -93,13 +103,18 @@ class ResolvedMcpCredentials(Ka2aCredentialsModel):
     extra: dict[str, Any] | None = None
 
 
+class ResolvedTavilyCredentials(Ka2aCredentialsModel):
+    api_key: str
+    extra: dict[str, Any] | None = None
+
+
 SecretDecryptor = Callable[[EncryptedSecret], str]
 
 
 def extract_ka2a_jwt_claim(jwt_claims: dict[str, Any]) -> Ka2aJwtClaim | None:
     value = jwt_claims.get(KA2A_JWT_CLAIM_KEY)
     if value is None:
-        # Also support flattened claim shapes like `ka2a.llm` / `ka2a.mcp` / `ka2a.v`.
+        # Also support flattened claim shapes like `ka2a.llm` / `ka2a.tavily` / `ka2a.mcp` / `ka2a.v`.
         # This is helpful for JWT issuers that don't easily support nested JSON objects.
         flattened: dict[str, Any] = {}
 
@@ -121,6 +136,9 @@ def extract_ka2a_jwt_claim(jwt_claims: dict[str, Any]) -> Ka2aJwtClaim | None:
                 continue
             if k == "ka2a_mcp":
                 _set_path(flattened, ["mcp"], v)
+                continue
+            if k == "ka2a_tavily":
+                _set_path(flattened, ["tavily"], v)
                 continue
             if not k.startswith(f"{KA2A_JWT_CLAIM_KEY}."):
                 continue
@@ -201,6 +219,32 @@ def resolve_mcp_credentials_from_metadata(
     return resolve_mcp_credentials_from_claims(jwt_claims=principal.claims, decrypt=decrypt)
 
 
+def resolve_tavily_credentials_from_claims(
+    *,
+    jwt_claims: dict[str, Any],
+    decrypt: SecretDecryptor,
+) -> ResolvedTavilyCredentials | None:
+    ka2a = extract_ka2a_jwt_claim(jwt_claims)
+    if ka2a is None or ka2a.tavily is None or ka2a.tavily.api_key is None:
+        return None
+    return ResolvedTavilyCredentials(
+        api_key=decrypt(ka2a.tavily.api_key),
+        extra=ka2a.tavily.extra,
+    )
+
+
+def resolve_tavily_credentials_from_metadata(
+    *,
+    metadata: dict[str, Any] | None,
+    decrypt: SecretDecryptor,
+    principal_metadata_key: str = KA2A_PRINCIPAL_METADATA_KEY,
+) -> ResolvedTavilyCredentials | None:
+    principal = extract_principal(metadata or {}, key=principal_metadata_key)
+    if principal is None or principal.claims is None:
+        return None
+    return resolve_tavily_credentials_from_claims(jwt_claims=principal.claims, decrypt=decrypt)
+
+
 def resolve_llm_credentials_from_env(
     *,
     env: Mapping[str, str] | None = None,
@@ -269,6 +313,30 @@ def resolve_llm_credentials_from_env(
         model=model,
         base_url=base_url,
     )
+
+
+def resolve_tavily_credentials_from_env(
+    *,
+    env: Mapping[str, str] | None = None,
+    api_key_key: str = "TAVILY_API_KEY",
+    ka2a_api_key_key: str = "KA2A_TAVILY_API_KEY",
+    api_key_env_key: str = "KA2A_TAVILY_API_KEY_ENV",
+) -> ResolvedTavilyCredentials | None:
+    env_map = env or os.environ
+
+    api_key = (env_map.get(ka2a_api_key_key) or "").strip() or None
+    if not api_key:
+        api_key = (env_map.get(api_key_key) or "").strip() or None
+
+    if not api_key:
+        api_key_env = (env_map.get(api_key_env_key) or "").strip() or None
+        if api_key_env:
+            api_key = (env_map.get(api_key_env) or "").strip() or None
+
+    if not api_key:
+        return None
+
+    return ResolvedTavilyCredentials(api_key=api_key)
 
 
 def strip_principal_secrets_for_storage(

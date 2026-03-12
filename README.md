@@ -351,6 +351,11 @@ JWT env vars (gateway/proxy):
 - `KA2A_JWT_TENANT_CLAIM=tenant_id` (optional)
 - `KA2A_JWT_INCLUDE_CLAIMS=true` (if you want agents/tools to read custom claims like `ka2a`)
 
+JWT secret decryption (agent side):
+- `KA2A_SECRET_DECRYPTOR=kafka_a2a.secrets:decrypt_fernet_secret`
+- `KA2A_FERNET_KEY=<same key used by your identity service to encrypt secrets>`
+- Optional key rotation fallback: `KA2A_FERNET_KEYS=<comma-separated old keys>`
+
 ### JWT claim schema (optional)
 
 K-A2A reserves a top-level namespaced claim key: `ka2a` (see `src/kafka_a2a/credentials.py`).
@@ -366,7 +371,10 @@ Example JWT payload:
     "llm": {
       "provider": "openai",
       "model": "gpt-4.1-mini",
-      "apiKey": { "ciphertext": "BASE64(...)", "alg": "A256GCM", "kid": "enc-key-2026-02" }
+      "apiKey": { "ciphertext": "BASE64(...)", "alg": "fernet" }
+    },
+    "tavily": {
+      "apiKey": { "ciphertext": "BASE64(...)", "alg": "fernet" }
     }
   }
 }
@@ -376,7 +384,7 @@ Important:
 - JWT payloads are **not confidential** by default (signature != encryption). Only put encrypted blobs in claims.
 - By default, agents do **not** persist `Principal.bearerToken`/`Principal.claims` to stored Tasks.
 - If your issuer cannot embed nested JSON objects, K-A2A also accepts flattened claim keys like
-  `ka2a.llm.provider`, `ka2a.llm.apiKey`, `ka2a.mcp.*`.
+  `ka2a.llm.provider`, `ka2a.llm.apiKey`, `ka2a.tavily.apiKey`, `ka2a.mcp.*`.
 
 ## Local/dev LLM credentials from `.env` (optional)
 

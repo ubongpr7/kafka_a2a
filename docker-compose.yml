@@ -53,13 +53,13 @@ services:
     depends_on:
       - host-agent
     ports:
-      - "8000:8000"
-    command: ["gateway", "--default-agent", "host", "--host", "0.0.0.0", "--port", "8000"]
+      - "7006:7006"
+    command: ["gateway", "--default-agent", "host", "--host", "0.0.0.0", "--port", "7006"]
 
   a2a-proxy:
     <<: *ka2a_image
     depends_on:
       - host-agent
     ports:
-      - "8001:8001"
-    command: ["proxy", "--agent-name", "host", "--host", "0.0.0.0", "--port", "8001"]
+      - "7007:7007"
+    command: ["proxy", "--agent-name", "host", "--host", "0.0.0.0", "--port", "7007"]

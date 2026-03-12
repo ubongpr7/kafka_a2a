@@ -8,6 +8,9 @@ from kafka_a2a.credentials import (
     resolve_llm_credentials_from_metadata,
     resolve_mcp_credentials_from_claims,
     resolve_mcp_credentials_from_metadata,
+    resolve_tavily_credentials_from_claims,
+    resolve_tavily_credentials_from_env,
+    resolve_tavily_credentials_from_metadata,
     strip_principal_secrets_for_storage,
 )
 from kafka_a2a.models import Message, TextPart, Task
@@ -103,6 +106,60 @@ def test_resolve_mcp_credentials_from_metadata() -> None:
     assert cred is not None
     assert cred.server_url == "https://mcp.example"
     assert cred.token == "tok"
+
+
+def test_resolve_tavily_credentials_from_claims() -> None:
+    claims = {
+        KA2A_JWT_CLAIM_KEY: {
+            "v": 1,
+            "tavily": {"apiKey": "ENC"},
+        }
+    }
+    cred = resolve_tavily_credentials_from_claims(jwt_claims=claims, decrypt=lambda _: "tvly")
+    assert cred is not None
+    assert cred.api_key == "tvly"
+
+
+def test_resolve_tavily_credentials_from_flattened_claims() -> None:
+    claims = {
+        "ka2a.v": 1,
+        "ka2a.tavily.apiKey": "ENC",
+    }
+    cred = resolve_tavily_credentials_from_claims(jwt_claims=claims, decrypt=lambda _: "tvly")
+    assert cred is not None
+    assert cred.api_key == "tvly"
+
+
+def test_resolve_tavily_credentials_from_flattened_alias_claims() -> None:
+    claims = {
+        "ka2a_tavily": {"apiKey": "ENC"},
+    }
+    cred = resolve_tavily_credentials_from_claims(jwt_claims=claims, decrypt=lambda _: "tvly")
+    assert cred is not None
+    assert cred.api_key == "tvly"
+
+
+def test_resolve_tavily_credentials_from_metadata() -> None:
+    principal = Principal(
+        user_id="u1",
+        tenant_id="acme",
+        claims={
+            KA2A_JWT_CLAIM_KEY: {
+                "v": 1,
+                "tavily": {"apiKey": {"ciphertext": "ENC", "alg": "fernet"}},
+            }
+        },
+    )
+    metadata = with_principal({}, principal)
+    cred = resolve_tavily_credentials_from_metadata(metadata=metadata, decrypt=lambda _: "tvly")
+    assert cred is not None
+    assert cred.api_key == "tvly"
+
+
+def test_resolve_tavily_credentials_from_env() -> None:
+    cred = resolve_tavily_credentials_from_env(env={"KA2A_TAVILY_API_KEY": "tvly-key"})
+    assert cred is not None
+    assert cred.api_key == "tvly-key"
 
 
 @pytest.mark.asyncio

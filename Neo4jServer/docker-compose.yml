@@ -1,0 +1,32 @@
+services:
+  neo4j:
+    image: ${NEO4J_IMAGE:-neo4j:5-community}
+    container_name: ${NEO4J_CONTAINER_NAME:-neo4j-server}
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/change-this-password}
+      NEO4J_PLUGINS: ${NEO4J_PLUGINS:-["apoc"]}
+      NEO4J_server_default__listen__address: 0.0.0.0
+      NEO4J_server_http_advertised__address: ${NEO4J_HTTP_ADVERTISED_ADDRESS:-localhost:7474}
+      NEO4J_server_bolt_advertised__address: ${NEO4J_BOLT_ADVERTISED_ADDRESS:-localhost:7687}
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL_SIZE:-512m}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX_SIZE:-1G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE_SIZE:-512m}
+    ports:
+      - "${NEO4J_HTTP_BIND_ADDRESS:-0.0.0.0}:${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_BIND_ADDRESS:-0.0.0.0}:${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/var/lib/neo4j/import
+      - neo4j_plugins:/plugins
+
+volumes:
+  neo4j_data:
+    name: ${NEO4J_DATA_VOLUME:-neo4j_data}
+  neo4j_logs:
+    name: ${NEO4J_LOGS_VOLUME:-neo4j_logs}
+  neo4j_import:
+    name: ${NEO4J_IMPORT_VOLUME:-neo4j_import}
+  neo4j_plugins:
+    name: ${NEO4J_PLUGINS_VOLUME:-neo4j_plugins}

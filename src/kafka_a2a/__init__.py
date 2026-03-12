@@ -29,17 +29,26 @@ from .credentials import (
     Ka2aJwtClaim,
     Ka2aLlmClaim,
     Ka2aMcpClaim,
+    Ka2aTavilyClaim,
     ResolvedLlmCredentials,
+    ResolvedMcpCredentials,
+    ResolvedTavilyCredentials,
     extract_ka2a_jwt_claim,
     resolve_llm_credentials_from_claims,
     resolve_llm_credentials_from_env,
     resolve_llm_credentials_from_metadata,
+    resolve_mcp_credentials_from_claims,
+    resolve_mcp_credentials_from_metadata,
+    resolve_tavily_credentials_from_claims,
+    resolve_tavily_credentials_from_env,
+    resolve_tavily_credentials_from_metadata,
     strip_principal_secrets_for_storage,
 )
 from .settings import Ka2aSettings, load_dotenv
 from .tenancy import KA2A_PRINCIPAL_METADATA_KEY, Principal
 from .client import Ka2aClient, Ka2aClientConfig
 from .runtime import Ka2aAgent, InMemoryTaskStore
+from .secrets import decrypt_fernet_secret
 
 __all__ = [
     "__version__",
@@ -70,11 +79,19 @@ __all__ = [
     "Ka2aJwtClaim",
     "Ka2aLlmClaim",
     "Ka2aMcpClaim",
+    "Ka2aTavilyClaim",
     "ResolvedLlmCredentials",
+    "ResolvedMcpCredentials",
+    "ResolvedTavilyCredentials",
     "extract_ka2a_jwt_claim",
     "resolve_llm_credentials_from_claims",
     "resolve_llm_credentials_from_env",
     "resolve_llm_credentials_from_metadata",
+    "resolve_mcp_credentials_from_claims",
+    "resolve_mcp_credentials_from_metadata",
+    "resolve_tavily_credentials_from_claims",
+    "resolve_tavily_credentials_from_env",
+    "resolve_tavily_credentials_from_metadata",
     "strip_principal_secrets_for_storage",
     "Ka2aSettings",
     "load_dotenv",
@@ -84,4 +101,5 @@ __all__ = [
     "Ka2aClientConfig",
     "Ka2aAgent",
     "InMemoryTaskStore",
+    "decrypt_fernet_secret",
 ]
