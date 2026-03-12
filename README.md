@@ -147,6 +147,7 @@ yarn dev
 
 Open `http://localhost:3000`. Make sure the gateway is reachable at `NEXT_PUBLIC_KA2A_GATEWAY_URL` (default `http://localhost:8000`).
 For a hosted backend, set `NEXT_PUBLIC_KA2A_GATEWAY_URL` in `frontend/.env.local` to the remote URL, for example `https://dev.agents.interaims.com`.
+To disable gateway/proxy request timeouts to downstream agents, set `KA2A_GATEWAY_REQUEST_TIMEOUT_S=0` (and `KA2A_PROXY_REQUEST_TIMEOUT_S=0` if you use the A2A HTTP proxy).
 
 Test the A2A HTTP proxy:
 

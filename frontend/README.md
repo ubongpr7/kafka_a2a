@@ -14,6 +14,7 @@ yarn dev
 Open http://localhost:3000.
 
 Set `NEXT_PUBLIC_KA2A_GATEWAY_URL` in `.env.local` to the gateway you want the browser to call directly, for example `https://dev.agents.interaims.com`.
+If you do not want the browser to abort long-running agent requests, keep `NEXT_PUBLIC_KA2A_REQUEST_TIMEOUT_MS=0` (or leave it unset).
 
 ## Features
 

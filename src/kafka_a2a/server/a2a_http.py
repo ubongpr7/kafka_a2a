@@ -55,6 +55,7 @@ class A2AHttpProxyConfig:
     bootstrap_servers: str
     agent_name: str
     client_id: str | None = None
+    request_timeout_s: float | None = None
     title: str = "K-A2A (A2A JSON-RPC over Kafka)"
     version: str = "0.1.0"
     jwt: JwtBearerConfig | None = None
@@ -68,7 +69,10 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
     transport = KafkaTransport(
         KafkaConfig.from_env(bootstrap_servers=config.bootstrap_servers, client_id=config.client_id)
     )
-    client = Ka2aClient(transport=transport, config=Ka2aClientConfig(client_id=config.client_id))
+    client = Ka2aClient(
+        transport=transport,
+        config=Ka2aClientConfig(client_id=config.client_id, request_timeout_s=config.request_timeout_s),
+    )
 
     app = FastAPI(title=config.title, version=config.version)
 

@@ -74,7 +74,13 @@ class Ka2aClientConfig:
     client_id: str | None = None
     reply_topic: str | None = None
     reply_group_id: str | None = None
-    request_timeout_s: float = 30.0
+    request_timeout_s: float | None = 30.0
+
+
+async def _await_with_optional_timeout(fut: asyncio.Future[RpcResponse], timeout_s: float | None) -> RpcResponse:
+    if timeout_s is None or timeout_s <= 0:
+        return await fut
+    return await asyncio.wait_for(fut, timeout=timeout_s)
 
 
 class Ka2aClient:
@@ -185,7 +191,7 @@ class Ka2aClient:
         await self._transport.send(topic=self._topics.agent_requests(agent_name), envelope=env)
 
         timeout = timeout_s if timeout_s is not None else self._cfg.request_timeout_s
-        resp = await asyncio.wait_for(fut, timeout=timeout)
+        resp = await _await_with_optional_timeout(fut, timeout)
         if resp.error is not None:
             raise A2AError(code=resp.error.code, message=resp.error.message, data=resp.error.data)
         return resp.result
@@ -336,7 +342,7 @@ class Ka2aClient:
         await self._transport.send(topic=self._topics.agent_requests(agent_name), envelope=env)
 
         timeout = self._cfg.request_timeout_s
-        resp = await asyncio.wait_for(fut, timeout=timeout)
+        resp = await _await_with_optional_timeout(fut, timeout)
         if resp.error is not None:
             self._streams.pop(request_id, None)
             raise A2AError(code=resp.error.code, message=resp.error.message, data=resp.error.data)
@@ -385,7 +391,7 @@ class Ka2aClient:
         await self._transport.send(topic=self._topics.agent_requests(agent_name), envelope=env)
 
         timeout = self._cfg.request_timeout_s
-        resp = await asyncio.wait_for(fut, timeout=timeout)
+        resp = await _await_with_optional_timeout(fut, timeout)
         if resp.error is not None:
             self._streams.pop(request_id, None)
             raise A2AError(code=resp.error.code, message=resp.error.message, data=resp.error.data)

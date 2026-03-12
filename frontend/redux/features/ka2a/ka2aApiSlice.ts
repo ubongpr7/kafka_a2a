@@ -24,6 +24,14 @@ const _getGatewayBaseUrl = () => {
   return _stripTrailingSlash(base)
 }
 
+const _getRequestTimeoutMs = () => {
+  const raw = (process.env.NEXT_PUBLIC_KA2A_REQUEST_TIMEOUT_MS || "").trim()
+  if (!raw) return 0
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0
+  return Math.floor(parsed)
+}
+
 const _fetchError = (error: unknown): { error: FetchBaseQueryError } => ({
   error: {
     status: "FETCH_ERROR",
@@ -37,11 +45,52 @@ const _httpError = (status: number, data: unknown): { error: FetchBaseQueryError
 
 const _parseJson = <T>(text: string): T => JSON.parse(text) as T
 
-const _requestJson = async <T>(path: string): Promise<{ data: T } | { error: FetchBaseQueryError }> => {
+const _fetchWithOptionalTimeout = async (
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  externalSignal?: AbortSignal,
+) => {
+  const timeoutMs = _getRequestTimeoutMs()
+  if (!externalSignal && timeoutMs <= 0) {
+    return fetch(input, init)
+  }
+
+  const controller = new AbortController()
+  const cleanup: Array<() => void> = []
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort(externalSignal.reason)
+    } else {
+      const abortFromExternal = () => controller.abort(externalSignal.reason)
+      externalSignal.addEventListener("abort", abortFromExternal, { once: true })
+      cleanup.push(() => externalSignal.removeEventListener("abort", abortFromExternal))
+    }
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  if (timeoutMs > 0) {
+    timer = setTimeout(() => {
+      controller.abort(new Error(`Request timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+  }
+
   try {
-    const resp = await fetch(`${_getGatewayBaseUrl()}${path}`, {
+    return await fetch(input, { ...init, signal: controller.signal })
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    cleanup.forEach((fn) => fn())
+  }
+}
+
+const _requestJson = async <T>(
+  path: string,
+  signal?: AbortSignal,
+): Promise<{ data: T } | { error: FetchBaseQueryError }> => {
+  try {
+    const resp = await _fetchWithOptionalTimeout(`${_getGatewayBaseUrl()}${path}`, {
       cache: "no-store",
-    })
+    }, signal)
     const text = await resp.text()
 
     if (!resp.ok) {
@@ -98,15 +147,15 @@ const _parseSseChunks = async (
 export const ka2aApiSlice = apiSlice.injectEndpoints({
   endpoints: (builder) => ({
     getGatewayHealth: builder.query<GatewayHealth, void>({
-      queryFn: async () => _requestJson<GatewayHealth>("/health"),
+      queryFn: async (_arg, api) => _requestJson<GatewayHealth>("/health", api.signal),
     }),
     listAgents: builder.query<AgentCard[], void>({
-      queryFn: async () => _requestJson<AgentCard[]>("/agents"),
+      queryFn: async (_arg, api) => _requestJson<AgentCard[]>("/agents", api.signal),
     }),
     streamMessage: builder.mutation<void, StreamMessageArgs>({
       queryFn: async (args, api) => {
         try {
-          const resp = await fetch(`${_getGatewayBaseUrl()}/stream`, {
+          const resp = await _fetchWithOptionalTimeout(`${_getGatewayBaseUrl()}/stream`, {
             method: "POST",
             headers: {
               "content-type": "application/json",
@@ -117,7 +166,7 @@ export const ka2aApiSlice = apiSlice.injectEndpoints({
               contextId: args.contextId,
               historyLength: args.historyLength,
             }),
-          })
+          }, api.signal)
 
           if (!resp.ok) {
             const detail = await resp.text().catch(() => "")

@@ -34,6 +34,7 @@ class GatewayConfig:
     bootstrap_servers: str
     default_agent: str
     client_id: str | None = None
+    request_timeout_s: float | None = None
     jwt: JwtBearerConfig | None = None
 
 
@@ -54,7 +55,10 @@ def create_gateway_app(config: GatewayConfig):
     transport = KafkaTransport(
         KafkaConfig.from_env(bootstrap_servers=config.bootstrap_servers, client_id=config.client_id)
     )
-    client = Ka2aClient(transport=transport, config=Ka2aClientConfig(client_id=config.client_id))
+    client = Ka2aClient(
+        transport=transport,
+        config=Ka2aClientConfig(client_id=config.client_id, request_timeout_s=config.request_timeout_s),
+    )
     registry = KafkaAgentRegistry(transport=transport, sender=config.client_id or "gateway")
 
     agent_cards: dict[str, AgentCard] = {}
