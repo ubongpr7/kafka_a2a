@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "agents": {
+    "inventory-host": {
+      "servers": [
+        {
+          "id": "products",
+          "serverUrl": "http://product-mcp:8000/mcp",
+          "toolNamePrefix": "product.",
+          "auth": {
+            "mode": "forward_bearer"
+          },
+          "tools": [
+            "search",
+            "get"
+          ]
+        },
+        {
+          "id": "inventory",
+          "serverUrl": "http://inventory-mcp:8000/mcp",
+          "toolNamePrefix": "inventory.",
+          "auth": {
+            "mode": "forward_bearer"
+          },
+          "tools": [
+            "get_stock",
+            "reserve_stock",
+            "adjust_stock"
+          ]
+        },
+        {
+          "id": "pos",
+          "serverUrl": "http://pos-mcp:8000/mcp",
+          "toolNamePrefix": "pos.",
+          "auth": {
+            "mode": "forward_bearer"
+          }
+        },
+        {
+          "id": "utilities",
+          "serverUrl": "http://utility-mcp:8000/mcp",
+          "toolNamePrefix": "util.",
+          "auth": {
+            "mode": "none"
+          }
+        }
+      ]
+    }
+  }
+}

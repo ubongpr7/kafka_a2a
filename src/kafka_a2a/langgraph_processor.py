@@ -181,7 +181,7 @@ def _ka2a_parts_from_model_content(content: Any) -> list[Any]:
     return [TextPart(text=str(content))]
 
 
-def make_langgraph_chat_processor_from_env() -> TaskProcessor:
+def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> TaskProcessor:
     _require_lang()
 
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -238,9 +238,9 @@ def make_langgraph_chat_processor_from_env() -> TaskProcessor:
             return None
 
         if tools_source in ("mcp", "mcp-http", "mcp_http", "mcp_http_tools"):
-            from kafka_a2a.mcp_tools import McpHttpToolExecutor
+            from kafka_a2a.mcp_tools import MultiMcpToolExecutor
 
-            return McpHttpToolExecutor.from_env()
+            return MultiMcpToolExecutor.from_env(agent_name=agent_name)
 
         override = (os.getenv("KA2A_TOOL_EXECUTOR") or "").strip()
         if override:
@@ -252,6 +252,8 @@ def make_langgraph_chat_processor_from_env() -> TaskProcessor:
             return obj  # type: ignore[return-value]
 
         return None
+
+    tool_executor = _build_tool_executor()
 
     def _tool_prompt_block(tools: list[ToolSpec]) -> str:
         if not tools:
@@ -436,7 +438,6 @@ def make_langgraph_chat_processor_from_env() -> TaskProcessor:
         lc_messages: list[Any] = []
         mem = await _load_memory(context_id=task.context_id, metadata=metadata)
         sys = _system_prompt_with_memory(base=system_prompt, memory=mem)
-        tool_executor = _build_tool_executor()
         tool_ctx = ToolContext.from_metadata(
             metadata=metadata,
             decrypt=decryptor,

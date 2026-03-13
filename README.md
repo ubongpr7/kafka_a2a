@@ -147,6 +147,7 @@ yarn dev
 
 Open `http://localhost:3000`. Make sure the gateway is reachable at `NEXT_PUBLIC_KA2A_GATEWAY_URL` (default `http://localhost:8000`).
 For a hosted backend, set `NEXT_PUBLIC_KA2A_GATEWAY_URL` in `frontend/.env.local` to the remote URL, for example `https://dev.agents.interaims.com`.
+If your browser client sends `credentials: "include"`, set `KA2A_CORS_ALLOW_CREDENTIALS=true` on the gateway and use a specific origin or origin regex instead of `*`.
 To disable gateway/proxy request timeouts to downstream agents, set `KA2A_GATEWAY_REQUEST_TIMEOUT_S=0` (and `KA2A_PROXY_REQUEST_TIMEOUT_S=0` if you use the A2A HTTP proxy).
 
 Test the A2A HTTP proxy:
@@ -317,12 +318,16 @@ Router processor (optional):
 Tools / MCP (optional):
 - Requires installing the MCP extra: `uv sync --extra mcp`
 - `KA2A_TOOLS_ENABLED` (`true|false`, default false; only used by `langgraph-chat`)
-- `KA2A_TOOLS_SOURCE` = `mcp` (built-in) or leave unset + set `KA2A_TOOL_EXECUTOR` for custom executors
+- `KA2A_TOOLS_SOURCE` = `mcp` (built-in multi-MCP executor) or leave unset + set `KA2A_TOOL_EXECUTOR` for a fully custom executor
 - `KA2A_TOOLS_MAX_STEPS` (default `5`)
+- `KA2A_MCP_CONFIG_PATH` (optional JSON file with per-agent MCP server/tool config)
+- `KA2A_MCP_AGENT_NAME` (optional override for config lookup; defaults to `KA2A_AGENT_NAME`)
+- `KA2A_TOOL_EXECUTOR` (optional extra/local executor import path; when `KA2A_TOOLS_SOURCE=mcp`, this is composed with the built-in MCP executor)
 - `KA2A_MCP_SERVER_URL` (Streamable HTTP endpoint, e.g. `http://localhost:8005/mcp`)
 - `KA2A_MCP_TOKEN` (optional; or `KA2A_MCP_TOKEN_ENV`)
 - `KA2A_MCP_TIMEOUT_S` (default `30`)
 - `KA2A_MCP_TOOLS_CACHE_S` (default `60`)
+- Legacy single-server envs (`KA2A_MCP_SERVER_URL`, `KA2A_MCP_TOKEN`) still work when `KA2A_MCP_CONFIG_PATH` is unset.
 
 ## Push notifications (optional)
 
@@ -351,7 +356,14 @@ JWT env vars (gateway/proxy):
 - `KA2A_JWT_ALGORITHMS=RS256` (or `HS256`, `ES256`, comma-separated)
 - `KA2A_JWT_USER_CLAIM=sub` (your user id claim)
 - `KA2A_JWT_TENANT_CLAIM=tenant_id` (optional)
+- `KA2A_JWT_FORWARD_BEARER_TOKEN=true` (required if MCP tools should run with the end-user token)
 - `KA2A_JWT_INCLUDE_CLAIMS=true` (if you want agents/tools to read custom claims like `ka2a`)
+
+For the `intera_users` token shape used in this inventory platform:
+- Set `KA2A_JWT_USER_CLAIM=user_id`
+- Set `KA2A_JWT_TENANT_CLAIM=profile_id`
+- Enable `KA2A_JWT_FORWARD_BEARER_TOKEN=true`
+- Enable `KA2A_JWT_INCLUDE_CLAIMS=true`
 
 JWT secret decryption (agent side):
 - `KA2A_SECRET_DECRYPTOR=kafka_a2a.secrets:decrypt_fernet_secret`
@@ -425,6 +437,60 @@ KA2A_LLM_PROVIDER=gemini
 KA2A_LLM_MODEL=gemini-1.5-flash
 GOOGLE_API_KEY=your-api-key
 ```
+
+Example multi-MCP setup for one agent:
+
+```bash
+KA2A_AGENT_PROCESSOR=langgraph-chat
+KA2A_TOOLS_ENABLED=true
+KA2A_TOOLS_SOURCE=mcp
+KA2A_MCP_CONFIG_PATH=./mcp-tools.example.json
+KA2A_JWT_ENABLED=true
+KA2A_JWT_USER_CLAIM=user_id
+KA2A_JWT_TENANT_CLAIM=profile_id
+KA2A_JWT_FORWARD_BEARER_TOKEN=true
+KA2A_JWT_INCLUDE_CLAIMS=true
+```
+
+Example `mcp-tools.example.json`:
+
+```json
+{
+  "version": 1,
+  "agents": {
+    "inventory-host": {
+      "servers": [
+        {
+          "id": "products",
+          "serverUrl": "http://product-mcp:8000/mcp",
+          "toolNamePrefix": "product.",
+          "auth": { "mode": "forward_bearer" },
+          "tools": ["search", "get"]
+        },
+        {
+          "id": "inventory",
+          "serverUrl": "http://inventory-mcp:8000/mcp",
+          "toolNamePrefix": "inventory.",
+          "auth": { "mode": "forward_bearer" },
+          "tools": ["get_stock", "reserve_stock", "adjust_stock"]
+        },
+        {
+          "id": "utilities",
+          "serverUrl": "http://utility-mcp:8000/mcp",
+          "toolNamePrefix": "util.",
+          "auth": { "mode": "none" }
+        }
+      ]
+    }
+  }
+}
+```
+
+Supported MCP auth modes in the JSON config:
+- `none`: no auth header
+- `static`: use a configured token or `tokenEnv`
+- `context`: use request-scoped `ka2a.mcp.token` credentials
+- `forward_bearer`: forward the end-user bearer token from the gateway
 
 ## Roadmap / known gaps
 

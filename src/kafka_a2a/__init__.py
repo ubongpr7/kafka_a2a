@@ -49,6 +49,17 @@ from .tenancy import KA2A_PRINCIPAL_METADATA_KEY, Principal
 from .client import Ka2aClient, Ka2aClientConfig
 from .runtime import Ka2aAgent, InMemoryTaskStore
 from .secrets import decrypt_fernet_secret
+from .mcp_tools import (
+    CompositeToolExecutor,
+    McpAgentConfig,
+    McpAgentConfigFile,
+    McpHttpToolExecutor,
+    McpHttpToolExecutorConfig,
+    McpServerAuthConfig,
+    McpServerConfig,
+    MultiMcpToolExecutor,
+    MultiMcpToolExecutorConfig,
+)
 
 __all__ = [
     "__version__",
@@ -102,4 +113,13 @@ __all__ = [
     "Ka2aAgent",
     "InMemoryTaskStore",
     "decrypt_fernet_secret",
+    "CompositeToolExecutor",
+    "McpAgentConfig",
+    "McpAgentConfigFile",
+    "McpHttpToolExecutor",
+    "McpHttpToolExecutorConfig",
+    "McpServerAuthConfig",
+    "McpServerConfig",
+    "MultiMcpToolExecutor",
+    "MultiMcpToolExecutorConfig",
 ]

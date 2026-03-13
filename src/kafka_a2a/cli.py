@@ -62,7 +62,7 @@ def _load_agent_card(path: str) -> AgentCard:
     return AgentCard.model_validate(data)
 
 
-def _resolve_processor(value: str | None) -> TaskProcessor:
+def _resolve_processor(value: str | None, *, agent_name: str | None = None) -> TaskProcessor:
     name = (value or os.getenv("KA2A_AGENT_PROCESSOR") or "echo").strip()
     if name in ("echo", "echo_processor"):
         return echo_processor
@@ -72,7 +72,7 @@ def _resolve_processor(value: str | None) -> TaskProcessor:
     if name in ("langgraph-chat", "langgraph_chat", "langgraph"):
         from kafka_a2a.langgraph_processor import make_langgraph_chat_processor_from_env
 
-        return make_langgraph_chat_processor_from_env()
+        return make_langgraph_chat_processor_from_env(agent_name=agent_name)
     if name in ("router", "host-router", "router-agent", "router_agent"):
         from kafka_a2a.router_processor import make_router_processor_from_env
 
@@ -218,7 +218,7 @@ async def _run_agent(args: argparse.Namespace) -> None:
         context_history_turns=int(os.getenv("KA2A_CONTEXT_HISTORY_TURNS") or "20"),
     )
 
-    processor = _resolve_processor(args.processor)
+    processor = _resolve_processor(args.processor, agent_name=name)
 
     if card is not None and card.name and card.name != cfg.agent_name:
         # Prefer the card name (it defines the A2A addressable identity).

@@ -35,3 +35,17 @@ def test_gateway_enables_cors_middleware() -> None:
     app = create_gateway_app(GatewayConfig(bootstrap_servers="localhost:9092", default_agent="echo"))
     middleware_classes = [middleware.cls for middleware in app.user_middleware]
     assert CORSMiddleware in middleware_classes
+
+
+def test_gateway_cors_credentials_can_be_enabled_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KA2A_CORS_ALLOW_CREDENTIALS", "true")
+    app = create_gateway_app(GatewayConfig(bootstrap_servers="localhost:9092", default_agent="echo"))
+    cors_middleware = next(middleware for middleware in app.user_middleware if middleware.cls is CORSMiddleware)
+    assert cors_middleware.kwargs["allow_credentials"] is True
+
+
+def test_gateway_cors_credentials_default_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KA2A_CORS_ALLOW_CREDENTIALS", raising=False)
+    app = create_gateway_app(GatewayConfig(bootstrap_servers="localhost:9092", default_agent="echo"))
+    cors_middleware = next(middleware for middleware in app.user_middleware if middleware.cls is CORSMiddleware)
+    assert cors_middleware.kwargs["allow_credentials"] is False

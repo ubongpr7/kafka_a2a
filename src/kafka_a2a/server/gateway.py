@@ -46,6 +46,18 @@ def _parse_csv_env(name: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def create_gateway_app(config: GatewayConfig):
     FastAPI = _require_fastapi()
     from fastapi import File, Form, HTTPException, Query, Request, UploadFile
@@ -69,7 +81,7 @@ def create_gateway_app(config: GatewayConfig):
         CORSMiddleware,
         allow_origins=_parse_csv_env("KA2A_CORS_ALLOW_ORIGINS"),
         allow_origin_regex=os.environ.get("KA2A_CORS_ALLOW_ORIGIN_REGEX", _DEFAULT_CORS_ALLOW_ORIGIN_REGEX),
-        allow_credentials=False,
+        allow_credentials=_parse_bool_env("KA2A_CORS_ALLOW_CREDENTIALS", default=False),
         allow_methods=_parse_csv_env("KA2A_CORS_ALLOW_METHODS") or ["GET", "POST", "OPTIONS"],
         allow_headers=_parse_csv_env("KA2A_CORS_ALLOW_HEADERS")
         or ["Authorization", "Content-Type", "X-Requested-With"],
