@@ -371,7 +371,10 @@ class KafkaDelegationBackend:
 DELEGATION_TOOL_SPECS: dict[str, ToolSpec] = {
     "list_available_agents": ToolSpec(
         name="list_available_agents",
-        description="List downstream specialist agents registered in Kafka with their descriptions and skills.",
+        description=(
+            "List downstream specialist agents registered in Kafka. Use only when routing is ambiguous or "
+            "the user explicitly asks which specialists are available, then summarize the result in plain text."
+        ),
         input_schema={
             "type": "object",
             "properties": {},
@@ -381,7 +384,10 @@ DELEGATION_TOOL_SPECS: dict[str, ToolSpec] = {
     ),
     "delegate_to_agent": ToolSpec(
         name="delegate_to_agent",
-        description="Delegate a domain-specific task to the best downstream agent or to a named agent.",
+        description=(
+            "Delegate a domain-specific task to the best downstream agent or to a named agent. "
+            "Do not use for greetings, small talk, or simple capability questions."
+        ),
         input_schema={
             "type": "object",
             "properties": {

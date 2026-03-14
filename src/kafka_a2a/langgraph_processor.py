@@ -64,6 +64,74 @@ def _parse_bool(value: str | None, *, default: bool = False) -> bool:
     return default
 
 
+def _render_tool_prompt_block(tools: list[ToolSpec]) -> str:
+    if not tools:
+        return ""
+    tools_obj = [
+        {
+            "name": t.name,
+            "description": t.description,
+            "inputSchema": t.input_schema,
+        }
+        for t in tools
+    ]
+    return (
+        "\n\nAvailable tools (JSON):\n"
+        + json.dumps(tools_obj, ensure_ascii=False)
+        + "\n\nTool calling rules:\n"
+        + "- Use tools only when they are necessary to complete the user's request.\n"
+        + "- For greetings, small talk, capability questions, or simple summaries, answer normally in plain text.\n"
+        + "- Use interaction/formatting tools only when the frontend needs structured UI such as a form, selection, confirmation, wizard, or table.\n"
+        + "- If you need a tool, respond with STRICT JSON only (no markdown).\n"
+        + '- Output MUST be either a single object or a list of objects shaped like: {"kind":"tool-call","name":"...","arguments":{...}}.\n'
+        + '- Never output bare tool names or pseudo-tool JSON such as {"kind":"list_available_agents"} or {"kind":"create_dynamic_form"}.\n'
+        + "- You may call multiple tools in one response.\n"
+        + "- After tool results are provided, respond normally with your final answer unless the tool itself is a deliberate frontend interaction payload.\n"
+    )
+
+
+def _normalize_tool_call_payload(value: Any, *, tool_names: set[str]) -> Any:
+    if not tool_names:
+        return value
+    if isinstance(value, list):
+        return [_normalize_tool_call_payload(item, tool_names=tool_names) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    kind = str(value.get("kind") or "").strip()
+    name = str(value.get("name") or "").strip()
+
+    candidate_name: str | None = None
+    if kind == "tool-call" and name in tool_names:
+        candidate_name = name
+    elif name in tool_names:
+        candidate_name = name
+    elif kind in tool_names:
+        candidate_name = kind
+
+    if not candidate_name:
+        return value
+
+    arguments = value.get("arguments", value.get("args", value.get("parameters", {})))
+    if arguments is None:
+        arguments = {}
+    elif not isinstance(arguments, dict):
+        arguments = {"value": arguments}
+
+    normalized: dict[str, Any] = {
+        "kind": "tool-call",
+        "name": candidate_name,
+        "arguments": arguments,
+    }
+    tool_call_id = value.get("tool_call_id")
+    if isinstance(tool_call_id, str) and tool_call_id.strip():
+        normalized["tool_call_id"] = tool_call_id.strip()
+    metadata = value.get("metadata")
+    if isinstance(metadata, dict) and metadata:
+        normalized["metadata"] = metadata
+    return normalized
+
+
 def _to_model_user_content(message: Message, *, max_text_bytes: int = 8192) -> str | list[dict[str, Any]]:
     """
     Convert an incoming K-A2A `Message` into a LangChain `HumanMessage.content`.
@@ -256,28 +324,7 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
 
     tool_executor = _build_tool_executor()
 
-    def _tool_prompt_block(tools: list[ToolSpec]) -> str:
-        if not tools:
-            return ""
-        tools_obj = [
-            {
-                "name": t.name,
-                "description": t.description,
-                "inputSchema": t.input_schema,
-            }
-            for t in tools
-        ]
-        return (
-            "\n\nAvailable tools (JSON):\n"
-            + json.dumps(tools_obj, ensure_ascii=False)
-            + "\n\nTool calling rules:\n"
-            + "- If you need a tool, respond with STRICT JSON only (no markdown).\n"
-            + '- Output MUST be either a single object or a list of objects shaped like: {"kind":"tool-call","name":"...","arguments":{...}}.\n'
-            + "- You may call multiple tools in one response.\n"
-            + "- After tool results are provided, respond normally with your final answer.\n"
-        )
-
-    def _parts_from_model_content(content: Any) -> list[Any]:
+    def _parts_from_model_content(content: Any, *, tool_names: set[str] | None = None) -> list[Any]:
         if isinstance(content, str):
             text = content.strip()
             if text.startswith("```"):
@@ -287,10 +334,14 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     obj = json.loads(text)
                 except Exception:
                     obj = None
+                if obj is not None and tool_names:
+                    obj = _normalize_tool_call_payload(obj, tool_names=tool_names)
                 if isinstance(obj, dict):
                     return _ka2a_parts_from_model_content([obj])
                 if isinstance(obj, list):
                     return _ka2a_parts_from_model_content(obj)
+        if tool_names:
+            content = _normalize_tool_call_payload(content, tool_names=tool_names)
         return _ka2a_parts_from_model_content(content)
 
     async def _load_memory(*, context_id: str, metadata: dict[str, Any] | None) -> ContextMemory | None:
@@ -451,7 +502,7 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             except Exception:
                 tool_specs = []
         if tool_specs:
-            sys = (sys or "") + _tool_prompt_block(tool_specs)
+            sys = (sys or "") + _render_tool_prompt_block(tool_specs)
         if sys:
             lc_messages.append(SystemMessage(content=sys))
 
@@ -506,12 +557,13 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
         else:
             steps = max(0, tools_max_steps)
             messages2: list[Any] = list(lc_messages)
+            tool_names = {spec.name for spec in tool_specs}
 
             for _ in range(steps + 1):
                 resp = await llm.ainvoke(messages2)
                 messages2.append(AIMessage(content=resp.content))
 
-                parts = _parts_from_model_content(resp.content)
+                parts = _parts_from_model_content(resp.content, tool_names=tool_names)
                 tool_calls = [p for p in parts if isinstance(p, ToolCallPart)]
                 if not tool_calls:
                     response_parts = parts
