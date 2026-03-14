@@ -219,6 +219,9 @@ class KafkaDelegationBackend:
     def __init__(self) -> None:
         self._bootstrap = os.getenv("KA2A_BOOTSTRAP_SERVERS", "localhost:9092")
         self._host_agent_name = (os.getenv("KA2A_AGENT_NAME") or "host").strip()
+        self._delegator_client_id = (
+            os.getenv("KA2A_HOST_DELEGATOR_CLIENT_ID") or f"{self._host_agent_name}-delegator"
+        ).strip()
         self._request_timeout_s = _parse_optional_timeout_s(
             os.getenv("KA2A_REQUEST_TIMEOUT_S"),
             os.getenv("KA2A_GATEWAY_REQUEST_TIMEOUT_S"),
@@ -238,13 +241,13 @@ class KafkaDelegationBackend:
             transport = KafkaTransport(
                 KafkaConfig.from_env(
                     bootstrap_servers=self._bootstrap,
-                    client_id=f"ka2a-delegation-{self._host_agent_name}-{uuid4()}",
+                    client_id=f"ka2a-delegation-{self._delegator_client_id}",
                 )
             )
             client = Ka2aClient(
                 transport=transport,
                 config=Ka2aClientConfig(
-                    client_id=f"{self._host_agent_name}-delegator-{uuid4()}",
+                    client_id=self._delegator_client_id,
                     request_timeout_s=self._request_timeout_s,
                 ),
             )

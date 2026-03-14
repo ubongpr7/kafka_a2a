@@ -11,6 +11,7 @@ from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.models import AgentCard, FilePart, FileWithBytes, Ka2aModel, Message, TaskConfiguration, TextPart
 from kafka_a2a.ops import ensure_trace_metadata, metrics_enabled, metrics_snapshot
 from kafka_a2a.protocol import METHOD_TASKS_LIST, TaskListParams, TaskListResult
+from kafka_a2a.registry.directory import KafkaAgentDirectory, KafkaAgentDirectoryConfig
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
 from kafka_a2a.server.auth import JwtBearerConfig, JwtVerificationError, parse_authorization_header, verify_bearer_jwt
 from kafka_a2a.tenancy import with_principal
@@ -73,8 +74,14 @@ def create_gateway_app(config: GatewayConfig):
     )
     registry = KafkaAgentRegistry(transport=transport, sender=config.client_id or "gateway")
 
-    agent_cards: dict[str, AgentCard] = {}
-    registry_task: Any | None = None
+    directory = KafkaAgentDirectory(
+        registry=registry,
+        config=KafkaAgentDirectoryConfig(
+            group_id=f"ka2a.gateway.directory.{uuid4()}",
+            auto_offset_reset="earliest",
+            entry_ttl_s=float(os.getenv("KA2A_DIRECTORY_ENTRY_TTL_S") or "300") or None,
+        ),
+    )
 
     app = FastAPI(title="K-A2A Gateway", version="0.1.0")
     app.add_middleware(
@@ -108,39 +115,11 @@ def create_gateway_app(config: GatewayConfig):
     @app.on_event("startup")
     async def _startup() -> None:
         await client.start()
-        nonlocal registry_task
-
-        async def _watch_registry() -> None:
-            # Use a per-process group id so each gateway instance sees all cards.
-            group_id = f"ka2a.gateway.registry.{uuid4()}"
-            while True:
-                try:
-                    async for entry in registry.watch(
-                        group_id=group_id,
-                        auto_offset_reset="earliest",
-                    ):
-                        agent_cards[entry.agent_name] = entry.card
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    # If Kafka is temporarily unavailable or the topic doesn't exist yet,
-                    # keep retrying in the background.
-                    await asyncio.sleep(1.0)
-
-        registry_task = asyncio.create_task(_watch_registry())
+        await directory.start()
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
-        nonlocal registry_task
-        if registry_task is not None:
-            registry_task.cancel()
-            try:
-                await registry_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-            registry_task = None
+        await directory.stop()
         await client.stop()
 
     @app.get("/health")
@@ -156,7 +135,7 @@ def create_gateway_app(config: GatewayConfig):
     @app.get("/agents")
     async def agents(request: Request) -> Any:
         _metadata_from_request(request)
-        cards = [card.model_dump(mode="json", by_alias=True, exclude_none=True) for card in agent_cards.values()]
+        cards = [card.model_dump(mode="json", by_alias=True, exclude_none=True) for card in directory.list()]
         cards.sort(key=lambda c: c.get("name") or "")
         return JSONResponse(cards)
 

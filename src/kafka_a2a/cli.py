@@ -257,7 +257,7 @@ async def _ensure_topics(args: argparse.Namespace) -> None:
     client_ids = _split_csv(args.client_ids or os.getenv("KA2A_CLIENT_IDS"))
 
     # Common service IDs that should use stable reply topics when Kafka auto-create is disabled.
-    for var in ("KA2A_GATEWAY_CLIENT_ID", "KA2A_PROXY_CLIENT_ID", "KA2A_ROUTER_CLIENT_ID"):
+    for var in ("KA2A_GATEWAY_CLIENT_ID", "KA2A_PROXY_CLIENT_ID", "KA2A_ROUTER_CLIENT_ID", "KA2A_HOST_DELEGATOR_CLIENT_ID"):
         value = (os.getenv(var) or "").strip()
         if value:
             client_ids.append(value)
