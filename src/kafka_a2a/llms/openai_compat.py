@@ -21,6 +21,15 @@ def _endpoint(base_url: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
+def _default_base_url_for_provider(provider: str | None) -> str | None:
+    provider_lower = (provider or "").strip().lower()
+    if provider_lower in ("openai", "chatgpt", "openai_compat", "openai-compatible", "openai-compatible-api"):
+        return "https://api.openai.com"
+    if provider_lower in ("xai", "grok"):
+        return "https://api.x.ai"
+    return None
+
+
 def _to_openai_messages(messages: Iterable[Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
 
@@ -218,8 +227,9 @@ def create_chat_model(
     model = (creds.model or "").strip()
     if not model:
         raise ValueError("LLM model is required for OpenAI-compatible LLMs (set KA2A_LLM_MODEL).")
+    base_url = (creds.base_url or "").strip() or _default_base_url_for_provider(creds.provider) or ""
     return OpenAICompatChatModel(
-        base_url=creds.base_url or "",
+        base_url=base_url,
         api_key=creds.api_key,
         model=model,
         extra=creds.extra,
