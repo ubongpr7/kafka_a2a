@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
+from kafka_a2a.agent_filter import filter_agent_cards
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.models import (
     AgentCard,
@@ -195,7 +196,10 @@ def make_router_processor_from_env() -> TaskProcessor:
         best: list[AgentCard] = []
 
         while True:
-            cards_now = [c for c in state.directory.list() if c.name and c.name != agent_name]
+            cards_now = filter_agent_cards(
+                state.directory.list(),
+                exclude_names={agent_name},
+            )
             cards_now.sort(key=lambda c: c.name)
             best = cards_now or best
 

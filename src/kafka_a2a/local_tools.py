@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Union, get_args, get_origin
 from uuid import uuid4
 
+from kafka_a2a.agent_filter import filter_agent_cards
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.models import (
     AgentCard,
@@ -279,11 +280,10 @@ class KafkaDelegationBackend:
         best: list[AgentCard] = []
 
         while True:
-            cards_now = [
-                card
-                for card in self._state.directory.list()
-                if card.name and card.name != self._host_agent_name
-            ]
+            cards_now = filter_agent_cards(
+                self._state.directory.list(),
+                exclude_names={self._host_agent_name},
+            )
             cards_now.sort(key=lambda card: card.name)
             best = cards_now or best
 

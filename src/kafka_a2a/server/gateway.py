@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
+from kafka_a2a.agent_filter import filter_agent_cards
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.models import AgentCard, FilePart, FileWithBytes, Ka2aModel, Message, TaskConfiguration, TextPart
 from kafka_a2a.ops import ensure_trace_metadata, metrics_enabled, metrics_snapshot
@@ -135,7 +136,8 @@ def create_gateway_app(config: GatewayConfig):
     @app.get("/agents")
     async def agents(request: Request) -> Any:
         _metadata_from_request(request)
-        cards = [card.model_dump(mode="json", by_alias=True, exclude_none=True) for card in directory.list()]
+        visible_cards = filter_agent_cards(directory.list(), include_names={config.default_agent})
+        cards = [card.model_dump(mode="json", by_alias=True, exclude_none=True) for card in visible_cards]
         cards.sort(key=lambda c: c.get("name") or "")
         return JSONResponse(cards)
 

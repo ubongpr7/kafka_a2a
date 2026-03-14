@@ -241,6 +241,11 @@ class Ka2aAgent:
             except asyncio.CancelledError:
                 pass
             self._registry_task = None
+        if self._registry is not None:
+            try:
+                await self._registry.unpublish(agent_name=self.card.name)
+            except Exception:
+                logger.warning("failed to unpublish agent card during shutdown", exc_info=True)
         if self._consumer_task is not None:
             self._consumer_task.cancel()
             try:

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from kafka_a2a.models import AgentCard
-from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
+from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry, RegistryEntry
 
 logger = logging.getLogger("kafka_a2a.directory")
 
@@ -52,6 +52,25 @@ class KafkaAgentDirectory:
     def list(self) -> list[AgentCard]:
         return [entry.card for entry in self._entries.values()]
 
+    def _is_stale(self, *, published_at: datetime, now: datetime | None = None) -> bool:
+        if self._cfg.entry_ttl_s is None:
+            return False
+        current = now or _utc_now()
+        ttl = timedelta(seconds=self._cfg.entry_ttl_s)
+        return published_at < (current - ttl)
+
+    def _apply_registry_entry(self, entry: RegistryEntry) -> None:
+        if entry.deleted:
+            self._entries.pop(entry.agent_name, None)
+            return
+        if entry.card is None:
+            self._entries.pop(entry.agent_name, None)
+            return
+        if self._is_stale(published_at=entry.published_at):
+            self._entries.pop(entry.agent_name, None)
+            return
+        self._entries[entry.agent_name] = DirectoryEntry(card=entry.card, last_seen=entry.published_at)
+
     async def start(self) -> None:
         if self._task is not None:
             return
@@ -65,7 +84,7 @@ class KafkaAgentDirectory:
                         auto_offset_reset=self._cfg.auto_offset_reset,
                         stop_event=self._stop,
                     ):
-                        self._entries[entry.agent_name] = DirectoryEntry(card=entry.card, last_seen=_utc_now())
+                        self._apply_registry_entry(entry)
                         if self._stop.is_set():
                             break
                 except asyncio.CancelledError:
