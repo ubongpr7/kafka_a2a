@@ -134,6 +134,13 @@ def _timestamp_to_iso(value: Any) -> str | None:
     return None
 
 
+def _task_state_value(value: Any) -> str | None:
+    raw = getattr(value, "value", value)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
 def _load_utility_functions() -> dict[str, Callable[..., Dict[str, Any]]]:
     """
     Load the real host formatting/interaction tools from `utilities/mcp`.
@@ -350,10 +357,10 @@ class KafkaDelegationBackend:
                 delegated_task_id = event.id
                 status_updates.append(
                     {
-                        "state": str(event.status.state),
+                        "state": _task_state_value(event.status.state) or "submitted",
                         "timestamp": _timestamp_to_iso(getattr(event.status, "timestamp", None)),
                         "final": False,
-                        "message": _text_from_parts(event.status.message.parts if event.status.message else None) or None,
+                        "message": None,
                     }
                 )
                 continue
@@ -368,7 +375,7 @@ class KafkaDelegationBackend:
             if isinstance(event, TaskStatusUpdateEvent):
                 status_updates.append(
                     {
-                        "state": str(event.status.state),
+                        "state": _task_state_value(event.status.state) or "working",
                         "timestamp": _timestamp_to_iso(getattr(event.status, "timestamp", None)),
                         "final": bool(event.final),
                         "message": _text_from_parts(event.status.message.parts if event.status.message else None) or None,

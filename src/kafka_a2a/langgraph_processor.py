@@ -141,17 +141,18 @@ def _is_host_introspection_query(value: str) -> bool:
     if not text:
         return False
 
-    if text in {
+    if text in {"help", "thanks", "thank you"}:
+        return True
+
+    greeting_prefixes = (
         "hi",
         "hello",
         "hey",
         "good morning",
         "good afternoon",
         "good evening",
-        "help",
-        "thanks",
-        "thank you",
-    }:
+    )
+    if any(text == greeting or text.startswith(f"{greeting} ") for greeting in greeting_prefixes):
         return True
 
     phrases = (

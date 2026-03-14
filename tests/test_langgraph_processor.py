@@ -88,6 +88,7 @@ def test_normalize_tool_call_payload_leaves_interaction_payload_untouched() -> N
 def test_host_introspection_detection_preserves_domain_requests() -> None:
     assert _is_host_introspection_query("how can you help")
     assert _is_host_introspection_query("how many agents do you have?")
+    assert _is_host_introspection_query("hi there!")
     assert not _is_host_introspection_query("help me search for the product t-shirt")
 
 
