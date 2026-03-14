@@ -554,6 +554,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiokafka" },
+    { name = "pycurrency-converter" },
     { name = "pydantic" },
 ]
 
@@ -589,6 +590,7 @@ requires-dist = [
     { name = "langchain-core", marker = "extra == 'lang'", specifier = ">=0.2.0" },
     { name = "langgraph", marker = "extra == 'lang'", specifier = ">=0.2.0" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0.0" },
+    { name = "pycurrency-converter", specifier = ">=1.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'auth'", specifier = ">=2.10.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2.0" },
@@ -882,6 +884,14 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/1b/7d/92392ff7815c21062bea51aa7b87d45576f649f16458d78b7cf94b9ab2e6/pycparser-3.0.tar.gz", hash = "sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29", size = 103492, upload-time = "2026-01-21T14:26:51.89Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl", hash = "sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992", size = 48172, upload-time = "2026-01-21T14:26:50.693Z" },
+]
+
+[[package]]
+name = "pycurrency-converter"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/06/ea/35c7f762824f6a0b62d4c423d2f5da799b1ec33ce20babceb95e2ca6e84b/PyCurrency_Converter-1.0-py2.py3-none-any.whl", hash = "sha256:92ccf50df6510b3d234e16871b3db79be08fdb19b715111f00a2947b195a30e3", size = 3704, upload-time = "2016-11-24T08:12:34.019Z" },
 ]
 
 [[package]]

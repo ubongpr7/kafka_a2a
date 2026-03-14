@@ -36,7 +36,7 @@ async def test_call_without_timeout_waits_for_result() -> None:
     transport = _FakeTransport(on_send=_on_send)
     client = Ka2aClient(transport=transport, config=Ka2aClientConfig(client_id="test-client", request_timeout_s=None))
 
-    result = await client.call(agent_name="echo", method="ping", params={"ok": True})
+    result = await client.call(agent_name="host", method="ping", params={"ok": True})
 
     assert result == {"ok": True}
 
@@ -46,4 +46,4 @@ async def test_call_with_timeout_still_times_out() -> None:
     client = Ka2aClient(transport=_FakeTransport(), config=Ka2aClientConfig(client_id="test-client", request_timeout_s=0.01))
 
     with pytest.raises(asyncio.TimeoutError):
-        await client.call(agent_name="echo", method="ping", params={"ok": True})
+        await client.call(agent_name="host", method="ping", params={"ok": True})

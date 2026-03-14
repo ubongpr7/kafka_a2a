@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "agents": {
+    "product": {
+      "servers": [
+        {
+          "id": "products",
+          "serverUrl": "https://dev.agents.interaims.com/mcp",
+          "toolNamePrefix": "product.",
+          "auth": {
+            "mode": "forward_bearer"
+          },
+          "tools": ["search_products"]
+        }
+      ]
+    }
+  }
+}

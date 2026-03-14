@@ -51,7 +51,7 @@ Wire format:
 ## Quickstart (Docker Compose)
 
 This repo ships a single `docker-compose.yml` that starts:
-- Example agents (`host-agent` router, plus `echo-agent`, `weather-agent`, `sports-agent`, `finance-agent`)
+- The real Intera agents (`host-agent` and `product-agent`)
 - A gateway (`/chat`, `/upload`, `/stream`)
 - An A2A-compatible HTTP proxy (JSON-RPC POST `/` + SSE streaming + Agent Card endpoint)
 
@@ -74,7 +74,7 @@ If your Kafka cluster has **auto-topic-creation disabled**, create the required 
 
 ```bash
 # Uses KA2A_BOOTSTRAP_SERVERS from .env
-docker compose run --rm gateway ensure-topics --agents host,echo,weather,sports,finance --client-ids gateway,proxy,router
+docker compose run --rm gateway ensure-topics --agents host,product --client-ids gateway,proxy
 ```
 
 Optional: if you want to run Kafka locally for development, you can use `kafka/docker-compose.yml` and then point
@@ -160,15 +160,6 @@ curl -sS -X POST 'http://localhost:8001/' \
   -d '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","parts":[{"kind":"text","text":"hello"}]}}}' | jq
 ```
 
-### Multiple agents
-
-You can add more agent services by copying `echo-agent` and pointing it at a different AgentCard JSON file
-(`agent_cards/*.agent-card.json`). For a simple worker pool, scale a single agent service:
-
-```bash
-docker compose up -d --scale echo-agent=3
-```
-
 To make the host agent act as an orchestrator, set:
 
 ```bash
@@ -196,13 +187,13 @@ uv sync --locked --extra server --extra auth --extra dev
 3) Run an agent:
 
 ```bash
-ka2a agent --agent-name echo
+ka2a agent --agent-name host --agent-card-path ./agent_cards/host.agent-card.json
 ```
 
 4) Run the gateway:
 
 ```bash
-KA2A_DEFAULT_AGENT=echo ka2a gateway
+KA2A_DEFAULT_AGENT=host ka2a gateway
 ```
 
 ## Repo layout
@@ -277,8 +268,8 @@ Agent runtime:
 - `KA2A_AGENT_DESCRIPTION`
 - `KA2A_AGENT_URL`
 - `KA2A_AGENT_VERSION` (default `0.1.0`)
-- `KA2A_AGENT_PROCESSOR` = `echo` | `prompted-echo` | `langgraph-chat` | `router` | `pkg.module:callable` (default `echo`)
-- `KA2A_SYSTEM_PROMPT` (used by `prompted-echo`)
+- `KA2A_AGENT_PROCESSOR` = `langgraph-chat` | `router` | `pkg.module:callable` (default `langgraph-chat`)
+- `KA2A_SYSTEM_PROMPT` or `KA2A_SYSTEM_PROMPT_PATH`
 - `KA2A_AGENT_PUSH_NOTIFICATIONS` (`true|false`)
 - `KA2A_TASK_STORE` = `memory` | `redis` (default `memory`)
 - `KA2A_REDIS_URL` (required when `KA2A_TASK_STORE=redis`)
@@ -293,7 +284,7 @@ Multi-tenant isolation (optional):
 
 AgentCard override (optional):
 - `KA2A_AGENT_CARD_PATH=/path/to/agent-card.json` (mount it in Docker and the agent will merge Kafka transport info)
-  - Example cards are in `agent_cards/host.agent-card.json` and `agent_cards/echo.agent-card.json`
+  - Example cards are in `agent_cards/host.agent-card.json` and `agent_cards/product.agent-card.json`
 
 Long-session memory (optional):
 - `KA2A_CONTEXT_MEMORY_STORE` = `off` | `memory` | `redis` (default `off`)

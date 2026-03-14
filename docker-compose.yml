@@ -5,53 +5,52 @@ x-ka2a-image: &ka2a_image
   build:
     context: .
     args:
-      KA2A_UV_EXTRAS: "server,auth,lang,redis"
+      KA2A_UV_EXTRAS: "server,auth,lang,redis,mcp"
   env_file:
-    - .env
+    - ${KA2A_ENV_FILE:-.env}
 
 services:
   host-agent:
     <<: *ka2a_image
     volumes:
       - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/host_agent.txt
+      KA2A_TOOL_EXECUTOR: kafka_a2a.local_tools:build_interaction_tool_executor
     command:
       [
         "agent",
         "--agent-card-path",
         "/app/agent_cards/host.agent-card.json",
         "--processor",
-        "router",
+        "langgraph-chat",
         "--push-notifications",
       ]
 
-  echo-agent:
+  product-agent:
     <<: *ka2a_image
     volumes:
       - ./agent_cards:/app/agent_cards:ro
-    command: ["agent", "--agent-card-path", "/app/agent_cards/echo.agent-card.json", "--processor", "echo"]
-
-  weather-agent:
-    <<: *ka2a_image
-    volumes:
-      - ./agent_cards:/app/agent_cards:ro
-    command: ["agent", "--agent-card-path", "/app/agent_cards/weather.agent-card.json", "--processor", "weather"]
-
-  sports-agent:
-    <<: *ka2a_image
-    volumes:
-      - ./agent_cards:/app/agent_cards:ro
-    command: ["agent", "--agent-card-path", "/app/agent_cards/sports.agent-card.json", "--processor", "sports"]
-
-  finance-agent:
-    <<: *ka2a_image
-    volumes:
-      - ./agent_cards:/app/agent_cards:ro
-    command: ["agent", "--agent-card-path", "/app/agent_cards/finance.agent-card.json", "--processor", "finance"]
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/product_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/product.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
 
   gateway:
     <<: *ka2a_image
     depends_on:
       - host-agent
+      - product-agent
     ports:
       - "7006:7006"
     command: ["gateway", "--default-agent", "host", "--host", "0.0.0.0", "--port", "7006"]
@@ -60,6 +59,7 @@ services:
     <<: *ka2a_image
     depends_on:
       - host-agent
+      - product-agent
     ports:
       - "7007:7007"
     command: ["proxy", "--agent-name", "host", "--host", "0.0.0.0", "--port", "7007"]

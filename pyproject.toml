@@ -26,6 +26,7 @@ classifiers = [
 ]
 dependencies = [
   "aiokafka>=0.11.0",
+  "pycurrency-converter>=1.0",
   "pydantic>=2.7.0",
 ]
 

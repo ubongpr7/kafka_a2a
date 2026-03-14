@@ -25,6 +25,7 @@ from kafka_a2a.models import (
     ToolResultPart,
 )
 from kafka_a2a.processors import TaskEvent, TaskProcessor
+from kafka_a2a.prompts import resolve_system_prompt_from_env
 from kafka_a2a.settings import Ka2aSettings
 from kafka_a2a.tenancy import extract_principal
 from kafka_a2a.tools import ToolContext, ToolExecutor, ToolSpec
@@ -211,7 +212,7 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             return _import_path("kafka_a2a.llms.gemini:create_chat_model")
         return _import_path("kafka_a2a.llms.openai_compat:create_chat_model")
 
-    system_prompt = (os.getenv("KA2A_SYSTEM_PROMPT") or os.getenv("KA2A_AGENT_SYSTEM_PROMPT") or "").strip()
+    system_prompt = resolve_system_prompt_from_env()
 
     tools_enabled = _parse_bool(os.getenv("KA2A_TOOLS_ENABLED"), default=False)
     tools_source = (os.getenv("KA2A_TOOLS_SOURCE") or "").strip().lower() or "off"

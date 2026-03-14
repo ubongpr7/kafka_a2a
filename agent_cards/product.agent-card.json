@@ -1,0 +1,30 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "product",
+  "description": "Product service specialist agent for catalog search and product-related questions inside Intera Inventory.",
+  "url": "kafka://product",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "product_search",
+      "name": "Product Search",
+      "description": "Search the Product service and answer product-related questions using the product MCP tools.",
+      "tags": ["product", "catalog", "search", "sku", "barcode", "product-service"],
+      "examples": [
+        "Search for products matching 'printer ink'.",
+        "Find barcode scanners in the catalog.",
+        "Show products related to wireless keyboard.",
+        "Look up products by name, SKU, or catalog terms."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

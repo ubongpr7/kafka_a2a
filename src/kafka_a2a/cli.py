@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from kafka_a2a.models import AgentCard
-from kafka_a2a.processors import TaskProcessor, echo_processor, make_prompted_echo_processor
+from kafka_a2a.processors import TaskProcessor
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
 from kafka_a2a.runtime.agent import Ka2aAgent, Ka2aAgentConfig
 from kafka_a2a.server.a2a_http import A2AHttpProxyConfig, create_a2a_http_proxy_app
@@ -63,12 +63,7 @@ def _load_agent_card(path: str) -> AgentCard:
 
 
 def _resolve_processor(value: str | None, *, agent_name: str | None = None) -> TaskProcessor:
-    name = (value or os.getenv("KA2A_AGENT_PROCESSOR") or "echo").strip()
-    if name in ("echo", "echo_processor"):
-        return echo_processor
-    if name in ("prompted-echo", "prompted_echo", "prompted_echo_processor"):
-        system_prompt = os.getenv("KA2A_SYSTEM_PROMPT") or os.getenv("KA2A_AGENT_SYSTEM_PROMPT")
-        return make_prompted_echo_processor(system_prompt=system_prompt)
+    name = (value or os.getenv("KA2A_AGENT_PROCESSOR") or "langgraph-chat").strip()
     if name in ("langgraph-chat", "langgraph_chat", "langgraph"):
         from kafka_a2a.langgraph_processor import make_langgraph_chat_processor_from_env
 
@@ -77,18 +72,6 @@ def _resolve_processor(value: str | None, *, agent_name: str | None = None) -> T
         from kafka_a2a.router_processor import make_router_processor_from_env
 
         return make_router_processor_from_env()
-    if name in ("weather", "weather-agent", "weather_agent"):
-        from kafka_a2a.specialized_agents import make_weather_agent_processor_from_env
-
-        return make_weather_agent_processor_from_env()
-    if name in ("sports", "sports-agent", "sports_agent", "sports-journalist", "sports_journalist"):
-        from kafka_a2a.specialized_agents import make_sports_journalist_agent_processor_from_env
-
-        return make_sports_journalist_agent_processor_from_env()
-    if name in ("finance", "finance-agent", "finance_agent", "financial", "financial-analysis", "financial_analysis"):
-        from kafka_a2a.specialized_agents import make_financial_analysis_agent_processor_from_env
-
-        return make_financial_analysis_agent_processor_from_env()
 
     if ":" in name:
         module_name, attr = name.split(":", 1)
@@ -101,7 +84,7 @@ def _resolve_processor(value: str | None, *, agent_name: str | None = None) -> T
         return proc  # type: ignore[return-value]
 
     raise SystemExit(
-        "Unknown processor. Use one of: echo, prompted-echo, langgraph-chat, or an import path like 'pkg.module:callable'."
+        "Unknown processor. Use one of: langgraph-chat, router, or an import path like 'pkg.module:callable'."
     )
 
 
@@ -335,7 +318,7 @@ async def _ensure_topics(args: argparse.Namespace) -> None:
 
 def _run_gateway(args: argparse.Namespace) -> None:
     bootstrap = args.bootstrap_servers or os.getenv("KA2A_BOOTSTRAP_SERVERS", "localhost:9092")
-    default_agent = args.default_agent or os.getenv("KA2A_DEFAULT_AGENT", "echo")
+    default_agent = args.default_agent or os.getenv("KA2A_DEFAULT_AGENT", "host")
     host = args.host or os.getenv("KA2A_GATEWAY_HOST", "0.0.0.0")
     port = int(args.port or os.getenv("KA2A_GATEWAY_PORT", "8000"))
 
@@ -360,7 +343,7 @@ def _run_gateway(args: argparse.Namespace) -> None:
 
 def _run_proxy(args: argparse.Namespace) -> None:
     bootstrap = args.bootstrap_servers or os.getenv("KA2A_BOOTSTRAP_SERVERS", "localhost:9092")
-    agent_name = args.agent_name or os.getenv("KA2A_AGENT_NAME", "echo")
+    agent_name = args.agent_name or os.getenv("KA2A_AGENT_NAME", "host")
     host = args.host or os.getenv("KA2A_PROXY_HOST", "0.0.0.0")
     port = int(args.port or os.getenv("KA2A_PROXY_PORT", "8001"))
 
@@ -423,7 +406,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_agent.add_argument(
         "--processor",
-        help="echo | prompted-echo | langgraph-chat | import path (pkg.module:callable). Defaults to KA2A_AGENT_PROCESSOR or echo.",
+        help="langgraph-chat | router | import path (pkg.module:callable). Defaults to KA2A_AGENT_PROCESSOR or langgraph-chat.",
     )
     p_agent.add_argument(
         "--task-store",
