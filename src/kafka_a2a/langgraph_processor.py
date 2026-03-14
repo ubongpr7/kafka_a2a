@@ -132,6 +132,140 @@ def _normalize_tool_call_payload(value: Any, *, tool_names: set[str]) -> Any:
     return normalized
 
 
+def _normalize_user_text(value: str) -> str:
+    return " ".join((value or "").strip().lower().split())
+
+
+def _is_host_introspection_query(value: str) -> bool:
+    text = _normalize_user_text(value)
+    if not text:
+        return False
+
+    if text in {
+        "hi",
+        "hello",
+        "hey",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "help",
+        "thanks",
+        "thank you",
+    }:
+        return True
+
+    phrases = (
+        "what agents",
+        "which agents",
+        "available agents",
+        "how many agents",
+        "list agents",
+        "show agents",
+        "how can you help",
+        "what can you do",
+        "who are you",
+        "what do you do",
+        "your capabilities",
+    )
+    return any(phrase in text for phrase in phrases)
+
+
+def _coerce_agent_summaries(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return []
+    agents = value.get("agents")
+    if not isinstance(agents, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in agents:
+        if isinstance(item, dict) and isinstance(item.get("name"), str) and item.get("name"):
+            out.append(item)
+    return out
+
+
+def _score_agent_summary(summary: dict[str, Any], query: str) -> int:
+    q = _normalize_user_text(query)
+    if not q:
+        return 0
+
+    tokens = [token for token in q.split()[:12] if token]
+    score = 0
+
+    name = str(summary.get("name") or "").strip().lower()
+    if name and name in q:
+        score += 10
+
+    description = str(summary.get("description") or "").strip().lower()
+    if description:
+        score += sum(1 for token in tokens if token in description)
+
+    for skill in summary.get("skills") or []:
+        if not isinstance(skill, dict):
+            continue
+        skill_name = str(skill.get("name") or "").strip().lower()
+        if skill_name and skill_name in q:
+            score += 5
+        skill_description = str(skill.get("description") or "").strip().lower()
+        if skill_description:
+            score += sum(1 for token in tokens if token in skill_description)
+        for tag in skill.get("tags") or []:
+            if isinstance(tag, str) and tag.lower() in q:
+                score += 2
+        for example in skill.get("examples") or []:
+            if not isinstance(example, str):
+                continue
+            example_text = example.lower()
+            score += sum(1 for token in tokens if token in example_text)
+
+    return score
+
+
+def _select_host_delegation_agent(query: str, agents: list[dict[str, Any]]) -> str | None:
+    if not agents:
+        return None
+    if len(agents) == 1:
+        return str(agents[0].get("name") or "").strip() or None
+
+    scored = sorted(
+        ((summary, _score_agent_summary(summary, query)) for summary in agents),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if not scored or scored[0][1] <= 0:
+        return None
+    selected = str(scored[0][0].get("name") or "").strip()
+    return selected or None
+
+
+def _coerce_task_state(value: Any, *, default: TaskState = TaskState.working) -> TaskState:
+    raw = str(value or "").strip()
+    if not raw:
+        return default
+    try:
+        return TaskState(raw)
+    except ValueError:
+        return default
+
+
+def _text_from_parts(parts: list[Any]) -> str:
+    return "\n".join(part.text for part in parts if isinstance(part, TextPart)).strip()
+
+
+def _format_delegation_status_text(*, agent_name: str, state: TaskState, message: str | None) -> str:
+    detail = (message or "").strip()
+    if detail and detail.lower() not in {"working", state.value.lower()}:
+        return f"{agent_name} agent: {detail}"
+    if state == TaskState.submitted:
+        return f"{agent_name} agent accepted the delegated task."
+    if state == TaskState.working:
+        return f"{agent_name} agent is processing the delegated task."
+    if state == TaskState.failed:
+        return f"{agent_name} agent reported an error."
+    if state == TaskState.completed:
+        return f"{agent_name} agent completed the delegated task."
+    return f"{agent_name} agent status: {state.value}"
+
+
 def _to_model_user_content(message: Message, *, max_text_bytes: int = 8192) -> str | list[dict[str, Any]]:
     """
     Convert an incoming K-A2A `Message` into a LangChain `HumanMessage.content`.
@@ -501,6 +635,7 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 tool_specs = await tool_executor.list_tools(ctx=tool_ctx)
             except Exception:
                 tool_specs = []
+        tool_names = {spec.name for spec in tool_specs}
         if tool_specs:
             sys = (sys or "") + _render_tool_prompt_block(tool_specs)
         if sys:
@@ -532,6 +667,160 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
         response_parts: list[Any] = []
         response_text = ""
 
+        if (
+            agent_name == "host"
+            and tool_executor is not None
+            and "delegate_to_agent" in tool_names
+            and user_text_for_memory
+            and not _is_host_introspection_query(user_text_for_memory)
+        ):
+            agent_summaries: list[dict[str, Any]] = []
+            if "list_available_agents" in tool_names:
+                try:
+                    listed_agents = await tool_executor.call_tool(
+                        name="list_available_agents",
+                        arguments={},
+                        ctx=tool_ctx,
+                    )
+                    agent_summaries = _coerce_agent_summaries(listed_agents)
+                except Exception:
+                    agent_summaries = []
+
+            selected_agent = _select_host_delegation_agent(user_text_for_memory, agent_summaries)
+            if selected_agent or len(agent_summaries) == 1 or not agent_summaries:
+                if selected_agent is None and len(agent_summaries) == 1:
+                    selected_agent = str(agent_summaries[0].get("name") or "").strip() or None
+                delegating_text = (
+                    f"Delegating this request to the {selected_agent} specialist agent."
+                    if selected_agent
+                    else "Delegating this request to the appropriate specialist agent."
+                )
+                yield TaskStatus(
+                    state=TaskState.working,
+                    message=Message(
+                        role=Role.agent,
+                        parts=[TextPart(text=delegating_text)],
+                        context_id=task.context_id,
+                    ),
+                )
+
+                try:
+                    delegated = await tool_executor.call_tool(
+                        name="delegate_to_agent",
+                        arguments={
+                            "request": user_text_for_memory,
+                            **({"agent_name": selected_agent} if selected_agent else {}),
+                        },
+                        ctx=tool_ctx,
+                    )
+                except Exception as exc:
+                    response_text = str(exc).strip() or "Delegation failed."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+                delegated_obj = delegated if isinstance(delegated, dict) else {}
+                delegated_agent = str(delegated_obj.get("selected_agent") or selected_agent or "").strip() or "specialist"
+                delegated_task_id = str(delegated_obj.get("delegated_task_id") or "").strip() or None
+                status_updates = delegated_obj.get("status_updates") if isinstance(delegated_obj.get("status_updates"), list) else []
+                delegated_final_state = TaskState.completed
+                for update in reversed(status_updates):
+                    if not isinstance(update, dict) or not bool(update.get("final")):
+                        continue
+                    delegated_final_state = _coerce_task_state(update.get("state"), default=TaskState.completed)
+                    break
+
+                yield Artifact(
+                    name="delegation",
+                    parts=[
+                        DataPart(
+                            data={
+                                "selectedAgent": delegated_agent,
+                                "delegatedTaskId": delegated_task_id,
+                                "finalState": delegated_final_state.value,
+                                "statusUpdates": status_updates,
+                            }
+                        )
+                    ],
+                )
+
+                for update in status_updates:
+                    if not isinstance(update, dict) or bool(update.get("final")):
+                        continue
+                    state_value = _coerce_task_state(update.get("state"), default=TaskState.working)
+                    message_text = _format_delegation_status_text(
+                        agent_name=delegated_agent,
+                        state=state_value,
+                        message=str(update.get("message") or "").strip() or None,
+                    )
+                    yield TaskStatus(
+                        state=state_value,
+                        message=Message(
+                            role=Role.agent,
+                            parts=[TextPart(text=message_text)],
+                            context_id=task.context_id,
+                        ),
+                    )
+
+                child_artifacts = delegated_obj.get("artifacts")
+                if isinstance(child_artifacts, dict):
+                    for artifact_name, payload in child_artifacts.items():
+                        if not isinstance(artifact_name, str) or not artifact_name.strip():
+                            continue
+                        parts = _ka2a_parts_from_model_content(payload)
+                        if parts:
+                            yield Artifact(name=f"{delegated_agent}.{artifact_name}", parts=parts)
+
+                result_payload = delegated_obj.get("result_parts")
+                if isinstance(result_payload, list):
+                    response_parts = _ka2a_parts_from_model_content(result_payload)
+                response_text = str(delegated_obj.get("response_text") or "").strip()
+                if not response_parts and response_text:
+                    response_parts = [TextPart(text=response_text)]
+                if not response_text and response_parts:
+                    response_text = _text_from_parts(response_parts)
+                if not response_parts:
+                    response_parts = [TextPart(text="(no result)")]
+                    response_text = "(no result)"
+
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=delegated_final_state,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
         if tool_executor is None:
 
             async def _call_model(state: _State) -> _State:
@@ -557,7 +846,6 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
         else:
             steps = max(0, tools_max_steps)
             messages2: list[Any] = list(lc_messages)
-            tool_names = {spec.name for spec in tool_specs}
 
             for _ in range(steps + 1):
                 resp = await llm.ainvoke(messages2)

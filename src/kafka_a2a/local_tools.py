@@ -6,6 +6,7 @@ import inspect
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Protocol, Union, get_args, get_origin
 from uuid import uuid4
 
@@ -123,6 +124,14 @@ def _part_to_payload(part: Any) -> dict[str, Any]:
 
 def _text_from_parts(parts: list[Any] | None) -> str:
     return "\n".join(part.text for part in (parts or []) if isinstance(part, TextPart)).strip()
+
+
+def _timestamp_to_iso(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _load_utility_functions() -> dict[str, Callable[..., Dict[str, Any]]]:
@@ -334,10 +343,19 @@ class KafkaDelegationBackend:
         result_parts_payload: list[dict[str, Any]] | None = None
         response_text: str | None = None
         artifacts: dict[str, list[dict[str, Any]]] = {}
+        status_updates: list[dict[str, Any]] = []
 
         async for event in stream:
             if isinstance(event, Task):
                 delegated_task_id = event.id
+                status_updates.append(
+                    {
+                        "state": str(event.status.state),
+                        "timestamp": _timestamp_to_iso(getattr(event.status, "timestamp", None)),
+                        "final": False,
+                        "message": _text_from_parts(event.status.message.parts if event.status.message else None) or None,
+                    }
+                )
                 continue
             if isinstance(event, TaskArtifactUpdateEvent):
                 artifact_name = (event.artifact.name or "").strip() or "artifact"
@@ -347,9 +365,18 @@ class KafkaDelegationBackend:
                 else:
                     artifacts[artifact_name] = payload
                 continue
-            if isinstance(event, TaskStatusUpdateEvent) and event.final:
-                response_text = _text_from_parts(event.status.message.parts if event.status.message else None) or None
-                break
+            if isinstance(event, TaskStatusUpdateEvent):
+                status_updates.append(
+                    {
+                        "state": str(event.status.state),
+                        "timestamp": _timestamp_to_iso(getattr(event.status, "timestamp", None)),
+                        "final": bool(event.final),
+                        "message": _text_from_parts(event.status.message.parts if event.status.message else None) or None,
+                    }
+                )
+                if event.final:
+                    response_text = _text_from_parts(event.status.message.parts if event.status.message else None) or None
+                    break
 
         if response_text is None and result_parts_payload:
             response_text = "\n".join(
@@ -364,6 +391,7 @@ class KafkaDelegationBackend:
             "response_text": response_text or "",
             "result_parts": result_parts_payload or [],
             "artifacts": artifacts,
+            "status_updates": status_updates,
             "agent_card": _card_summary(selected),
         }
 
