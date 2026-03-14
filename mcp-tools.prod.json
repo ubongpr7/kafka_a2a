@@ -5,7 +5,7 @@
       "servers": [
         {
           "id": "products",
-          "serverUrl": "https://dev.agents.interaims.com/mcp",
+          "serverUrl": "https://product.mcp.interaims.com/mcp/",
           "toolNamePrefix": "product.",
           "auth": {
             "mode": "forward_bearer"
