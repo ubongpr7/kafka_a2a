@@ -15,12 +15,13 @@
     {
       "id": "agent_orchestration",
       "name": "Agent Orchestration",
-      "description": "Route tenant-scoped requests to specialist agents, then shape the returned data into frontend-friendly interaction flows.",
-      "tags": ["orchestration", "delegation", "interaction", "tenant-aware", "frontend"],
+      "description": "Route tenant-scoped requests to specialist product, inventory, and POS agents, then shape the returned data into frontend-friendly interaction flows.",
+      "tags": ["orchestration", "delegation", "interaction", "tenant-aware", "frontend", "product", "inventory", "pos"],
       "examples": [
         "Delegate a product search request to the product agent.",
-        "Turn delegated results into a searchable selection flow.",
-        "Prepare a structured confirmation flow before a delegated delete action."
+        "Delegate an inventory alert or stock lookup request to the inventory agent.",
+        "Delegate a live cashier or session question to the POS agent.",
+        "Turn delegated results into a searchable selection flow."
       ],
       "inputModes": ["text"],
       "outputModes": ["text"]

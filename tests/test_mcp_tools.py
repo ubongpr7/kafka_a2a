@@ -77,6 +77,64 @@ def test_multi_mcp_config_resolves_agent_specific_servers(tmp_path: Path) -> Non
     assert cfg.servers[0].tools == ["reserve_stock", "get_stock"]
 
 
+def test_multi_mcp_config_resolves_multiple_specialists_without_cross_pollution(tmp_path: Path) -> None:
+    config_path = tmp_path / "mcp-tools.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "agents": {
+                    "product": {
+                        "servers": [
+                            {
+                                "id": "products",
+                                "serverUrl": "http://products-mcp:8000/mcp",
+                                "toolNamePrefix": "product.",
+                                "tools": ["search_products"],
+                            }
+                        ]
+                    },
+                    "inventory": {
+                        "servers": [
+                            {
+                                "id": "inventory",
+                                "serverUrl": "http://inventory-mcp:8000/mcp",
+                                "toolNamePrefix": "inventory.",
+                                "tools": ["search_inventories"],
+                            }
+                        ]
+                    },
+                    "pos": {
+                        "servers": [
+                            {
+                                "id": "pos",
+                                "serverUrl": "http://pos-mcp:8000/mcp",
+                                "toolNamePrefix": "pos.",
+                                "tools": ["get_current_pos_session"],
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    product_cfg = MultiMcpToolExecutorConfig.from_env(
+        {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": "product"}
+    )
+    inventory_cfg = MultiMcpToolExecutorConfig.from_env(
+        {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": "inventory"}
+    )
+    pos_cfg = MultiMcpToolExecutorConfig.from_env(
+        {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": "pos"}
+    )
+
+    assert [server.id for server in product_cfg.servers] == ["products"]
+    assert [server.id for server in inventory_cfg.servers] == ["inventory"]
+    assert [server.id for server in pos_cfg.servers] == ["pos"]
+
+
 @pytest.mark.asyncio
 async def test_multi_mcp_executor_routes_tools_and_forwards_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
     from kafka_a2a import mcp_tools

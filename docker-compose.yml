@@ -46,11 +46,47 @@ services:
         "langgraph-chat"
       ]
 
+  inventory-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/inventory_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/inventory.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  pos-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/pos_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/pos.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
   gateway:
     <<: *ka2a_image
     depends_on:
       - host-agent
       - product-agent
+      - inventory-agent
+      - pos-agent
     ports:
       - "7006:7006"
     command: ["gateway", "--default-agent", "host", "--host", "0.0.0.0", "--port", "7006"]
@@ -60,6 +96,8 @@ services:
     depends_on:
       - host-agent
       - product-agent
+      - inventory-agent
+      - pos-agent
     ports:
       - "7007:7007"
     command: ["proxy", "--agent-name", "host", "--host", "0.0.0.0", "--port", "7007"]

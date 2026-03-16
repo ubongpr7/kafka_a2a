@@ -1,7 +1,7 @@
 {
   "protocolVersion": "0.3.0",
   "name": "product",
-  "description": "Product service specialist agent for catalog search and product-related questions inside Intera Inventory.",
+  "description": "Product service specialist agent for catalog search, variants, pricing, and product analytics inside Intera Inventory.",
   "url": "kafka://product",
   "preferredTransport": "kafka",
   "version": "0.1.0",
@@ -13,15 +13,28 @@
   "defaultOutputModes": ["text"],
   "skills": [
     {
-      "id": "product_search",
-      "name": "Product Search",
-      "description": "Search the Product service and answer product-related questions using the product MCP tools.",
+      "id": "product_catalog_lookup",
+      "name": "Product Catalog Lookup",
+      "description": "Search the Product service and answer product discovery questions using the product MCP tools.",
       "tags": ["product", "catalog", "search", "sku", "barcode", "product-service"],
       "examples": [
         "Search for products matching 'printer ink'.",
         "Find barcode scanners in the catalog.",
         "Show products related to wireless keyboard.",
         "Look up products by name, SKU, or catalog terms."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    },
+    {
+      "id": "product_pricing_and_variants",
+      "name": "Product Pricing and Variants",
+      "description": "Inspect product variants, pricing rules, price history, and product analytics.",
+      "tags": ["variants", "pricing", "analytics", "price-history", "pricing-rules", "pos-ready"],
+      "examples": [
+        "Show the variants for product Espresso.",
+        "Inspect recent price changes for a product.",
+        "Check whether a product is POS-ready and low on stock."
       ],
       "inputModes": ["text"],
       "outputModes": ["text"]

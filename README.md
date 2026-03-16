@@ -51,7 +51,7 @@ Wire format:
 ## Quickstart (Docker Compose)
 
 This repo ships a single `docker-compose.yml` that starts:
-- The real Intera agents (`host-agent` and `product-agent`)
+- The real Intera agents (`host-agent`, `product-agent`, `inventory-agent`, and `pos-agent`)
 - A gateway (`/chat`, `/upload`, `/stream`)
 - An A2A-compatible HTTP proxy (JSON-RPC POST `/` + SSE streaming + Agent Card endpoint)
 
@@ -74,7 +74,7 @@ If your Kafka cluster has **auto-topic-creation disabled**, create the required 
 
 ```bash
 # Uses KA2A_BOOTSTRAP_SERVERS from .env
-docker compose run --rm gateway ensure-topics --agents host,product --client-ids gateway,proxy
+docker compose run --rm gateway ensure-topics --agents host,product,inventory,pos --client-ids gateway,proxy
 ```
 
 Optional: if you want to run Kafka locally for development, you can use `kafka/docker-compose.yml` and then point
@@ -284,7 +284,8 @@ Multi-tenant isolation (optional):
 
 AgentCard override (optional):
 - `KA2A_AGENT_CARD_PATH=/path/to/agent-card.json` (mount it in Docker and the agent will merge Kafka transport info)
-  - Example cards are in `agent_cards/host.agent-card.json` and `agent_cards/product.agent-card.json`
+  - Example cards are in `agent_cards/host.agent-card.json`, `agent_cards/product.agent-card.json`,
+    `agent_cards/inventory.agent-card.json`, and `agent_cards/pos.agent-card.json`
 
 Long-session memory (optional):
 - `KA2A_CONTEXT_MEMORY_STORE` = `off` | `memory` | `redis` (default `off`)
@@ -429,7 +430,7 @@ KA2A_LLM_MODEL=gemini-1.5-flash
 GOOGLE_API_KEY=your-api-key
 ```
 
-Example multi-MCP setup for one agent:
+Example multi-MCP setup for specialist agents:
 
 ```bash
 KA2A_AGENT_PROCESSOR=langgraph-chat
@@ -449,27 +450,36 @@ Example `mcp-tools.example.json`:
 {
   "version": 1,
   "agents": {
-    "inventory-host": {
+    "product": {
       "servers": [
         {
           "id": "products",
-          "serverUrl": "http://product-mcp:8000/mcp",
+          "serverUrl": "http://products-mcp:8000/mcp/",
           "toolNamePrefix": "product.",
           "auth": { "mode": "forward_bearer" },
-          "tools": ["search", "get"]
-        },
+          "tools": ["search_products", "get_product_details", "search_product_variants"]
+        }
+      ]
+    },
+    "inventory": {
+      "servers": [
         {
           "id": "inventory",
-          "serverUrl": "http://inventory-mcp:8000/mcp",
+          "serverUrl": "http://inventory-mcp:8000/mcp/",
           "toolNamePrefix": "inventory.",
           "auth": { "mode": "forward_bearer" },
-          "tools": ["get_stock", "reserve_stock", "adjust_stock"]
-        },
+          "tools": ["search_inventories", "get_inventory_alerts", "search_stock_movements"]
+        }
+      ]
+    },
+    "pos": {
+      "servers": [
         {
-          "id": "utilities",
-          "serverUrl": "http://utility-mcp:8000/mcp",
-          "toolNamePrefix": "util.",
-          "auth": { "mode": "none" }
+          "id": "pos",
+          "serverUrl": "http://pos-mcp:8000/mcp/",
+          "toolNamePrefix": "pos.",
+          "auth": { "mode": "forward_bearer" },
+          "tools": ["get_current_pos_session", "search_pos_orders", "list_held_pos_orders"]
         }
       ]
     }

@@ -1,0 +1,42 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "inventory",
+  "description": "Inventory service specialist agent for stock visibility, locations, reservations, movements, and inventory alerts inside Intera Inventory.",
+  "url": "kafka://inventory",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "inventory_lookup",
+      "name": "Inventory Lookup",
+      "description": "Search inventories and inspect current stock posture, alerts, and warehouse readiness using the inventory MCP tools.",
+      "tags": ["inventory", "stock", "warehouse", "alerts", "reorder", "expiry"],
+      "examples": [
+        "Show low-stock inventories.",
+        "Check whether printer toner is running low.",
+        "Inspect the current stock posture of the main warehouse."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    },
+    {
+      "id": "stock_operations_visibility",
+      "name": "Stock Operations Visibility",
+      "description": "Inspect stock locations, reservations, and movement history for inventory operations.",
+      "tags": ["reservations", "movements", "locations", "lot", "serial", "tracking"],
+      "examples": [
+        "Find stock reservations for sales order SO-1002.",
+        "Show recent stock movements for barcode B-123.",
+        "Inspect what is stored in Rack B."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

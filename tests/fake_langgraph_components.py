@@ -71,6 +71,18 @@ class FakeToolExecutor(ToolExecutor):
                             }
                         ],
                     },
+                    {
+                        "name": "pos",
+                        "description": "POS service specialist agent for sessions, live orders, and cashier workflows.",
+                        "skills": [
+                            {
+                                "name": "POS Operations",
+                                "description": "Inspect current sessions, POS orders, and held carts.",
+                                "tags": ["pos", "session", "orders", "cashier"],
+                                "examples": ["Show held POS carts."],
+                            }
+                        ],
+                    },
                 ]
             }
         if name == "delegate_to_agent":

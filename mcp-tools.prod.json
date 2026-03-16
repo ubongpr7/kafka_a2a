@@ -10,7 +10,62 @@
           "auth": {
             "mode": "forward_bearer"
           },
-          "tools": ["search_products"]
+          "tools": [
+            "search_products",
+            "get_product_details",
+            "search_product_variants",
+            "get_product_analytics",
+            "get_product_price_history",
+            "get_product_pricing_rules"
+          ]
+        }
+      ]
+    },
+    "inventory": {
+      "servers": [
+        {
+          "id": "inventory",
+          "serverUrl": "https://inventory.mcp.interaims.com/mcp/",
+          "toolNamePrefix": "inventory.",
+          "auth": {
+            "mode": "forward_bearer"
+          },
+          "tools": [
+            "search_inventories",
+            "get_inventory_details",
+            "search_stock_items",
+            "get_inventory_item_details",
+            "get_inventory_alerts",
+            "search_stock_locations",
+            "get_stock_location_summary",
+            "search_stock_reservations",
+            "search_stock_movements",
+            "get_stock_analytics"
+          ]
+        }
+      ]
+    },
+    "pos": {
+      "servers": [
+        {
+          "id": "pos",
+          "serverUrl": "https://pos.mcp.interaims.com/mcp/",
+          "toolNamePrefix": "pos.",
+          "auth": {
+            "mode": "forward_bearer"
+          },
+          "tools": [
+            "get_current_pos_session",
+            "search_pos_orders",
+            "get_pos_order_details",
+            "get_pos_daily_summary",
+            "get_pos_configuration",
+            "search_pos_terminals",
+            "search_pos_tables",
+            "search_pos_customers",
+            "list_held_pos_orders",
+            "search_pos_discounts"
+          ]
         }
       ]
     }

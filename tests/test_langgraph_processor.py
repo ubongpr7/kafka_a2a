@@ -104,9 +104,16 @@ def test_select_host_delegation_agent_prefers_best_matching_specialist() -> None
             "description": "Inventory stock specialist.",
             "skills": [{"name": "Inventory Lookup", "description": "Check stock", "tags": ["inventory"]}],
         },
+        {
+            "name": "pos",
+            "description": "Point of sale specialist.",
+            "skills": [{"name": "POS Operations", "description": "Inspect sessions and orders", "tags": ["pos", "session"]}],
+        },
     ]
 
     assert _select_host_delegation_agent("search for a t-shirt product", agents) == "product"
+    assert _select_host_delegation_agent("check stock alerts for the warehouse", agents) == "inventory"
+    assert _select_host_delegation_agent("show my open cashier session", agents) == "pos"
 
 
 @pytest.mark.asyncio
