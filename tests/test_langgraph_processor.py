@@ -321,6 +321,64 @@ async def test_host_capability_selection_routes_to_selected_agent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_host_capability_selection_routes_onboarding_to_guided_flow_request() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Choose What You Need Help With",
+        "description": "Select the area you want help with. I can continue from your choice.",
+        "options": [
+            {"value": "onboarding", "label": "Inventory Onboarding"},
+            {"value": "product", "label": "Product Management"},
+            {"value": "inventory", "label": "Inventory Management"},
+            {"value": "pos", "label": "Point of Sale (POS)"},
+            {"value": "users", "label": "User and Workspace Management"},
+            {"value": "general", "label": "General Question"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
+    task = Task(
+        id="task-capability-onboarding",
+        context_id="ctx-capability-onboarding",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"onboarding","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="hello, what can you do for me")]),
+            Message(role=Role.agent, parts=[DataPart(data=picker_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"onboarding","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "Start a guided inventory onboarding flow. Ask the user what setup they want to complete first, "
+                    "then collect the required details step by step using structured interactions."
+                ),
+                "agent_name": "onboarding",
+            },
+        ),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "onboarding"
+
+
+@pytest.mark.asyncio
 async def test_host_direct_staff_query_routes_to_users() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="host")
     task = Task(
@@ -378,6 +436,219 @@ async def test_host_direct_setup_query_routes_to_onboarding() -> None:
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == (
         "I can guide you through stock locations, inventory categories, inventory setup, and initial product onboarding."
+    )
+
+
+@pytest.mark.asyncio
+async def test_onboarding_agent_starts_with_scope_picker() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
+    task = Task(
+        id="task-onboarding-start",
+        context_id="ctx-onboarding-start",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="help me get started with onboarding")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="help me get started with onboarding")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "create_multiple_choice",
+            {
+                "title": "Start Inventory Onboarding",
+                "description": "Choose the setup area you want to complete first. I will guide you step by step.",
+                "options": [
+                    {"value": "full_setup", "label": "Full Inventory Setup"},
+                    {"value": "stock_locations", "label": "Stock Locations"},
+                    {"value": "inventory_categories", "label": "Inventory Categories"},
+                    {"value": "inventory_setup", "label": "Inventory Setup"},
+                    {"value": "product_onboarding", "label": "Product Onboarding"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        )
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
+    assert result_artifact.parts[0].data["workflow_stage"] == "scope_picker"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_onboarding_agent_scope_selection_opens_wizard() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
+    picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Start Inventory Onboarding",
+        "description": "Choose the setup area you want to complete first. I will guide you step by step.",
+        "options": [
+            {"value": "full_setup", "label": "Full Inventory Setup"},
+            {"value": "stock_locations", "label": "Stock Locations"},
+            {"value": "inventory_categories", "label": "Inventory Categories"},
+            {"value": "inventory_setup", "label": "Inventory Setup"},
+            {"value": "product_onboarding", "label": "Product Onboarding"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+        "workflow": "inventory_onboarding",
+        "workflow_stage": "scope_picker",
+    }
+    task = Task(
+        id="task-onboarding-scope",
+        context_id="ctx-onboarding-scope",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"full_setup","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="help me get started with onboarding")]),
+            Message(role=Role.agent, parts=[DataPart(data=picker_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"full_setup","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert len(fake_langgraph_components.FAKE_TOOL_CALLS) == 1
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[0][0] == "create_wizard_flow"
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[0][1]["title"] == "Full Inventory Setup Wizard"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["interaction_type"] == "wizard_flow"
+    assert result_artifact.parts[0].data["workflow_stage"] == "wizard"
+    assert result_artifact.parts[0].data["onboarding_scope"] == "full_setup"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_onboarding_agent_wizard_completion_prompts_for_review() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
+    wizard_payload = {
+        "interaction_type": "wizard_flow",
+        "title": "Full Inventory Setup Wizard",
+        "description": "Fill in the setup details and I will prepare the onboarding action plan.",
+        "steps": [],
+        "allow_back": True,
+        "show_progress": True,
+        "workflow": "inventory_onboarding",
+        "workflow_stage": "wizard",
+        "onboarding_scope": "full_setup",
+    }
+    response_text = (
+        '{"type":"wizard_flow_response","completed":true,"all_responses":'
+        '{"step_0":{"primary_location_name":"Main Warehouse","primary_location_type":"warehouse","additional_locations":"Front Store"},'
+        '"step_1":{"category_names":"Beverages\\nSnacks\\nCleaning Supplies"},'
+        '"step_2":{"default_inventory_name":"Main Inventory","inventory_description":"Primary sellable stock ledger"},'
+        '"step_3":{"continue_to_product_onboarding":true,"initial_product_names":"Coca-Cola 50cl\\nFanta 50cl"}}}'
+    )
+    task = Task(
+        id="task-onboarding-review",
+        context_id="ctx-onboarding-review",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=response_text)]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="help me get started with onboarding")]),
+            Message(role=Role.agent, parts=[DataPart(data=wizard_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=response_text)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert len(fake_langgraph_components.FAKE_TOOL_CALLS) == 1
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[0][0] == "create_multiple_choice"
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[0][1]["title"] == "Review Onboarding Plan"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
+    assert result_artifact.parts[0].data["workflow_stage"] == "review"
+    assert result_artifact.parts[0].data["onboarding_data"]["flat"]["default_inventory_name"] == "Main Inventory"
+    assert "Main Warehouse" in result_artifact.parts[0].data["onboarding_summary"]
+
+
+@pytest.mark.asyncio
+async def test_onboarding_agent_review_confirmation_delegates_inventory_setup() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
+    review_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Review Onboarding Plan",
+        "description": "Review your onboarding plan.",
+        "options": [
+            {"value": "create_now", "label": "Create This Setup"},
+            {"value": "revise_answers", "label": "Revise My Answers"},
+            {"value": "cancel_onboarding", "label": "Cancel For Now"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+        "workflow": "inventory_onboarding",
+        "workflow_stage": "review",
+        "onboarding_scope": "full_setup",
+        "onboarding_data": {
+            "scope": "full_setup",
+            "steps": {},
+            "flat": {
+                "primary_location_name": "Main Warehouse",
+                "primary_location_type": "warehouse",
+                "category_names": "Beverages\nSnacks\nCleaning Supplies",
+                "default_inventory_name": "Main Inventory",
+                "continue_to_product_onboarding": True,
+            },
+            "raw_response": {},
+        },
+        "onboarding_summary": "Scope: Full Inventory Setup",
+    }
+    task = Task(
+        id="task-onboarding-confirm",
+        context_id="ctx-onboarding-confirm",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"create_now","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="help me get started with onboarding")]),
+            Message(role=Role.agent, parts=[DataPart(data=review_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"create_now","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert len(fake_langgraph_components.FAKE_TOOL_CALLS) == 1
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[0][0] == "delegate_to_agent"
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[0][1]["agent_name"] == "inventory"
+    assert "Collected onboarding data JSON" in fake_langgraph_components.FAKE_TOOL_CALLS[0][1]["request"]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "inventory"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == (
+        "Created 1 stock location, 3 inventory categories, and 1 inventory ledger for onboarding.\n\n"
+        "Foundation setup is ready. When you are ready, I can continue with product onboarding."
     )
 
 
@@ -527,6 +798,7 @@ async def test_specialist_tool_loop_passes_tool_specs_to_model() -> None:
         "list_available_agents",
         "delegate_to_agent",
         "create_multiple_choice",
+        "create_wizard_flow",
     }
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")

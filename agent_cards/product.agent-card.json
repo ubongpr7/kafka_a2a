@@ -1,7 +1,7 @@
 {
   "protocolVersion": "0.3.0",
   "name": "product",
-  "description": "Product service specialist agent for catalog search, variants, pricing, and product analytics inside Intera Inventory.",
+  "description": "Product service specialist agent for catalog search, onboarding creation, variants, pricing, and product analytics inside Intera Inventory.",
   "url": "kafka://product",
   "preferredTransport": "kafka",
   "version": "0.1.0",
@@ -22,6 +22,19 @@
         "Find barcode scanners in the catalog.",
         "Show products related to wireless keyboard.",
         "Look up products by name, SKU, or catalog terms."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    },
+    {
+      "id": "product_catalog_onboarding",
+      "name": "Product Catalog Onboarding",
+      "description": "Create initial products, variants, and related catalog setup items during guided onboarding or catalog seeding flows.",
+      "tags": ["product", "onboarding", "catalog", "create", "variants", "setup"],
+      "examples": [
+        "Create the first products for this business.",
+        "Seed the initial catalog during onboarding.",
+        "Add a first set of POS-ready products."
       ],
       "inputModes": ["text"],
       "outputModes": ["text"]

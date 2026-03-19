@@ -135,6 +135,21 @@ class FakeToolExecutor(ToolExecutor):
                     "required": ["title", "description", "options", "multiple", "allow_input"],
                 },
             ),
+            ToolSpec(
+                name="create_wizard_flow",
+                description="Render a multi-step onboarding wizard.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "steps": {"type": "array"},
+                        "allow_back": {"type": "boolean"},
+                        "show_progress": {"type": "boolean"},
+                    },
+                    "required": ["title", "description", "steps", "allow_back", "show_progress"],
+                },
+            ),
         ]
 
     async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
@@ -175,6 +190,66 @@ class FakeToolExecutor(ToolExecutor):
                                 "I can guide you through stock locations, inventory categories, inventory setup, "
                                 "and initial product onboarding."
                             ),
+                            "final": True,
+                        },
+                    ],
+                }
+            if agent_name == "inventory" and "Collected onboarding data JSON" in request:
+                return {
+                    "selected_agent": "inventory",
+                    "delegated_task_id": "delegated-inventory-onboarding",
+                    "response_text": "Created 1 stock location, 3 inventory categories, and 1 inventory ledger for onboarding.",
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": "Created 1 stock location, 3 inventory categories, and 1 inventory ledger for onboarding.",
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "working",
+                            "message": "creating onboarding foundation records",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Created 1 stock location, 3 inventory categories, and 1 inventory ledger for onboarding.",
+                            "final": True,
+                        },
+                    ],
+                }
+            if agent_name == "product" and "Collected onboarding data JSON" in request:
+                return {
+                    "selected_agent": "product",
+                    "delegated_task_id": "delegated-product-onboarding",
+                    "response_text": "Created 3 initial products for onboarding.",
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": "Created 3 initial products for onboarding.",
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "working",
+                            "message": "creating initial products",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Created 3 initial products for onboarding.",
                             "final": True,
                         },
                     ],
@@ -291,6 +366,15 @@ class FakeToolExecutor(ToolExecutor):
                 "options": list(arguments.get("options") or []),
                 "multiple": bool(arguments.get("multiple")),
                 "allow_input": bool(arguments.get("allow_input")),
+            }
+        if name == "create_wizard_flow":
+            return {
+                "interaction_type": "wizard_flow",
+                "title": arguments.get("title") or "Wizard",
+                "description": arguments.get("description") or "Complete the steps.",
+                "steps": list(arguments.get("steps") or []),
+                "allow_back": bool(arguments.get("allow_back")),
+                "show_progress": bool(arguments.get("show_progress")),
             }
         raise AssertionError(f"Unexpected tool call: {name}")
 

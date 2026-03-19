@@ -519,11 +519,422 @@ def _host_capability_picker_arguments(
 
 
 def _host_follow_up_request_for_agent(agent_name: str) -> str:
+    if agent_name == "onboarding":
+        return (
+            "Start a guided inventory onboarding flow. Ask the user what setup they want to complete first, "
+            "then collect the required details step by step using structured interactions."
+        )
     label = _friendly_agent_label(agent_name)
     return (
         f"The user selected {label} from the host menu. "
         "Briefly explain what kinds of tasks you can help with in this domain, "
         "using a concise user-facing summary."
+    )
+
+
+ONBOARDING_SCOPE_LABELS: dict[str, str] = {
+    "full_setup": "Full Inventory Setup",
+    "stock_locations": "Stock Locations",
+    "inventory_categories": "Inventory Categories",
+    "inventory_setup": "Inventory Setup",
+    "product_onboarding": "Product Onboarding",
+}
+
+
+def _with_interaction_metadata(payload: dict[str, Any], **metadata: Any) -> dict[str, Any]:
+    enriched = dict(payload)
+    enriched.update(metadata)
+    return enriched
+
+
+def _is_onboarding_payload(payload: dict[str, Any] | None, *, stage: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return (
+        str(payload.get("workflow") or "").strip().lower() == "inventory_onboarding"
+        and str(payload.get("workflow_stage") or "").strip().lower() == stage
+    )
+
+
+def _onboarding_scope_picker_arguments(
+    *,
+    description: str = "Choose the setup area you want to complete first. I will guide you step by step.",
+) -> dict[str, Any]:
+    return {
+        "title": "Start Inventory Onboarding",
+        "description": description,
+        "options": [
+            {"value": "full_setup", "label": "Full Inventory Setup"},
+            {"value": "stock_locations", "label": "Stock Locations"},
+            {"value": "inventory_categories", "label": "Inventory Categories"},
+            {"value": "inventory_setup", "label": "Inventory Setup"},
+            {"value": "product_onboarding", "label": "Product Onboarding"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
+
+
+def _select_options(options: list[tuple[str, str]]) -> list[dict[str, str]]:
+    return [{"value": value, "label": label} for value, label in options]
+
+
+def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
+    if scope == "stock_locations":
+        return [
+            {
+                "id": "locations",
+                "title": "Stock Locations",
+                "description": "Tell me how you want your stock locations organized.",
+                "fields": [
+                    {
+                        "name": "primary_location_name",
+                        "type": "text",
+                        "label": "Primary Location Name",
+                        "required": True,
+                        "placeholder": "Main Warehouse",
+                    },
+                    {
+                        "name": "primary_location_type",
+                        "type": "select",
+                        "label": "Primary Location Type",
+                        "required": True,
+                        "options": _select_options(
+                            [
+                                ("warehouse", "Warehouse"),
+                                ("store", "Store"),
+                                ("backroom", "Back Room"),
+                                ("fulfillment", "Fulfillment Center"),
+                                ("other", "Other"),
+                            ]
+                        ),
+                    },
+                    {
+                        "name": "additional_locations",
+                        "type": "textarea",
+                        "label": "Additional Locations",
+                        "required": False,
+                        "placeholder": "Front Store\nReturns Shelf\nOverflow Room",
+                    },
+                ],
+            }
+        ]
+    if scope == "inventory_categories":
+        return [
+            {
+                "id": "categories",
+                "title": "Inventory Categories",
+                "description": "List the categories you want available before product entry.",
+                "fields": [
+                    {
+                        "name": "category_names",
+                        "type": "textarea",
+                        "label": "Category Names",
+                        "required": True,
+                        "placeholder": "Beverages\nSnacks\nCleaning Supplies",
+                    }
+                ],
+            }
+        ]
+    if scope == "inventory_setup":
+        return [
+            {
+                "id": "inventory",
+                "title": "Inventory Setup",
+                "description": "Define the first inventory ledger you want to create.",
+                "fields": [
+                    {
+                        "name": "default_inventory_name",
+                        "type": "text",
+                        "label": "Inventory Name",
+                        "required": True,
+                        "placeholder": "Main Inventory",
+                    },
+                    {
+                        "name": "inventory_description",
+                        "type": "textarea",
+                        "label": "Inventory Description",
+                        "required": False,
+                        "placeholder": "Primary sellable stock ledger for the business.",
+                    },
+                    {
+                        "name": "related_location_name",
+                        "type": "text",
+                        "label": "Primary Location for This Inventory",
+                        "required": False,
+                        "placeholder": "Main Warehouse",
+                    },
+                    {
+                        "name": "category_name",
+                        "type": "text",
+                        "label": "Default Category",
+                        "required": False,
+                        "placeholder": "General Merchandise",
+                    },
+                ],
+            }
+        ]
+    if scope == "product_onboarding":
+        return [
+            {
+                "id": "products",
+                "title": "Initial Product Onboarding",
+                "description": "Tell me about the first products you want to seed into the catalog.",
+                "fields": [
+                    {
+                        "name": "product_names",
+                        "type": "textarea",
+                        "label": "Product Names",
+                        "required": True,
+                        "placeholder": "Coca-Cola 50cl\nFanta 50cl\nSprite 50cl",
+                    },
+                    {
+                        "name": "product_category",
+                        "type": "text",
+                        "label": "Default Product Category",
+                        "required": False,
+                        "placeholder": "Beverages",
+                    },
+                    {
+                        "name": "pos_ready",
+                        "type": "boolean",
+                        "label": "Make These Products POS-Ready",
+                        "required": False,
+                    },
+                ],
+            }
+        ]
+
+    return [
+        {
+            "id": "locations",
+            "title": "Stock Locations",
+            "description": "Set up the main places where stock will live.",
+            "fields": [
+                {
+                    "name": "primary_location_name",
+                    "type": "text",
+                    "label": "Primary Location Name",
+                    "required": True,
+                    "placeholder": "Main Warehouse",
+                },
+                {
+                    "name": "primary_location_type",
+                    "type": "select",
+                    "label": "Primary Location Type",
+                    "required": True,
+                    "options": _select_options(
+                        [
+                            ("warehouse", "Warehouse"),
+                            ("store", "Store"),
+                            ("backroom", "Back Room"),
+                            ("fulfillment", "Fulfillment Center"),
+                            ("other", "Other"),
+                        ]
+                    ),
+                },
+                {
+                    "name": "additional_locations",
+                    "type": "textarea",
+                    "label": "Additional Locations",
+                    "required": False,
+                    "placeholder": "Front Store\nReturns Shelf\nOverflow Room",
+                },
+            ],
+        },
+        {
+            "id": "categories",
+            "title": "Inventory Categories",
+            "description": "Define the category structure you want ready before product entry.",
+            "fields": [
+                {
+                    "name": "category_names",
+                    "type": "textarea",
+                    "label": "Category Names",
+                    "required": True,
+                    "placeholder": "Beverages\nSnacks\nCleaning Supplies",
+                }
+            ],
+        },
+        {
+            "id": "inventory",
+            "title": "Inventory Ledger",
+            "description": "Define the first inventory ledger to create.",
+            "fields": [
+                {
+                    "name": "default_inventory_name",
+                    "type": "text",
+                    "label": "Inventory Name",
+                    "required": True,
+                    "placeholder": "Main Inventory",
+                },
+                {
+                    "name": "inventory_description",
+                    "type": "textarea",
+                    "label": "Inventory Description",
+                    "required": False,
+                    "placeholder": "Primary sellable stock ledger for the business.",
+                },
+            ],
+        },
+        {
+            "id": "products",
+            "title": "Product Follow-Up",
+            "description": "Decide whether you want to continue into initial product onboarding after the foundation setup.",
+            "fields": [
+                {
+                    "name": "continue_to_product_onboarding",
+                    "type": "boolean",
+                    "label": "Continue to Product Onboarding After Foundation Setup",
+                    "required": False,
+                },
+                {
+                    "name": "initial_product_names",
+                    "type": "textarea",
+                    "label": "Optional Initial Product Names",
+                    "required": False,
+                    "placeholder": "Coca-Cola 50cl\nFanta 50cl",
+                },
+            ],
+        },
+    ]
+
+
+def _onboarding_wizard_arguments(scope: str) -> dict[str, Any]:
+    label = ONBOARDING_SCOPE_LABELS.get(scope, "Inventory Onboarding")
+    return {
+        "title": f"{label} Wizard",
+        "description": "Fill in the setup details and I will prepare the onboarding action plan.",
+        "steps": _onboarding_wizard_steps(scope),
+        "allow_back": True,
+        "show_progress": True,
+    }
+
+
+def _split_multiline_values(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    entries: list[str] = []
+    for raw in re.split(r"[\n,]+", value):
+        cleaned = raw.strip().strip("-").strip()
+        if cleaned:
+            entries.append(cleaned)
+    return entries
+
+
+def _normalize_onboarding_wizard_data(scope: str, response: dict[str, Any]) -> dict[str, Any]:
+    responses = response.get("all_responses") if isinstance(response.get("all_responses"), dict) else {}
+    steps = _onboarding_wizard_steps(scope)
+    step_values: dict[str, dict[str, Any]] = {}
+    flat: dict[str, Any] = {}
+
+    for index, step in enumerate(steps):
+        raw_step = responses.get(f"step_{index}")
+        if not isinstance(raw_step, dict):
+            continue
+        step_id = str(step.get("id") or f"step_{index}")
+        step_values[step_id] = raw_step
+        for key, value in raw_step.items():
+            if value in ("", None, [], {}):
+                continue
+            flat[key] = value
+
+    return {
+        "scope": scope,
+        "steps": step_values,
+        "flat": flat,
+        "raw_response": response,
+    }
+
+
+def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
+    flat = data.get("flat") if isinstance(data.get("flat"), dict) else {}
+    lines = [f"Scope: {ONBOARDING_SCOPE_LABELS.get(scope, scope.replace('_', ' ').title())}"]
+
+    primary_location = str(flat.get("primary_location_name") or "").strip()
+    primary_location_type = str(flat.get("primary_location_type") or "").strip()
+    if primary_location:
+        label = primary_location
+        if primary_location_type:
+            label = f"{label} ({primary_location_type})"
+        lines.append(f"Primary location: {label}")
+
+    additional_locations = _split_multiline_values(flat.get("additional_locations"))
+    if additional_locations:
+        lines.append("Additional locations: " + ", ".join(additional_locations))
+
+    categories = _split_multiline_values(flat.get("category_names"))
+    if categories:
+        lines.append("Categories: " + ", ".join(categories))
+
+    inventory_name = str(flat.get("default_inventory_name") or "").strip()
+    if inventory_name:
+        lines.append(f"Inventory ledger: {inventory_name}")
+
+    inventory_description = str(flat.get("inventory_description") or "").strip()
+    if inventory_description:
+        lines.append(f"Inventory note: {inventory_description}")
+
+    related_location_name = str(flat.get("related_location_name") or "").strip()
+    if related_location_name:
+        lines.append(f"Ledger location: {related_location_name}")
+
+    category_name = str(flat.get("category_name") or "").strip()
+    if category_name:
+        lines.append(f"Default category: {category_name}")
+
+    product_names = _split_multiline_values(flat.get("product_names") or flat.get("initial_product_names"))
+    if product_names:
+        lines.append("Products: " + ", ".join(product_names))
+
+    product_category = str(flat.get("product_category") or "").strip()
+    if product_category:
+        lines.append(f"Product category: {product_category}")
+
+    if isinstance(flat.get("pos_ready"), bool):
+        lines.append(f"POS ready: {'Yes' if flat['pos_ready'] else 'No'}")
+
+    if isinstance(flat.get("continue_to_product_onboarding"), bool):
+        lines.append(
+            "Continue to product onboarding: "
+            + ("Yes" if flat["continue_to_product_onboarding"] else "No")
+        )
+
+    return "\n".join(lines)
+
+
+def _onboarding_review_picker_arguments(summary: str) -> dict[str, Any]:
+    return {
+        "title": "Review Onboarding Plan",
+        "description": summary + "\n\nChoose what you want me to do next.",
+        "options": [
+            {"value": "create_now", "label": "Create This Setup"},
+            {"value": "revise_answers", "label": "Revise My Answers"},
+            {"value": "cancel_onboarding", "label": "Cancel For Now"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
+
+
+def _onboarding_target_agent(scope: str) -> str:
+    return "product" if scope == "product_onboarding" else "inventory"
+
+
+def _onboarding_creation_request(scope: str, data: dict[str, Any]) -> str:
+    serialized = json.dumps(data, ensure_ascii=False)
+    if scope == "product_onboarding":
+        return (
+            "Create the initial product onboarding setup using the available product write tools if possible. "
+            "Perform the requested product creation work rather than only describing it. "
+            "If any required detail is missing, ask one concise follow-up question.\n"
+            f"Collected onboarding data JSON:\n{serialized}"
+        )
+    return (
+        "Create the requested inventory foundation setup using the available inventory write tools if possible. "
+        "Create stock locations, inventory categories, and inventory ledgers as applicable to the collected data, "
+        "rather than only describing them. If any required detail is missing, ask one concise follow-up question.\n"
+        f"Collected onboarding data JSON:\n{serialized}"
     )
 
 
@@ -1446,6 +1857,352 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     ),
                 )
                 return
+
+        if agent_name == "onboarding" and tool_executor is not None:
+            if (
+                interaction_response is not None
+                and _is_onboarding_payload(last_interaction_payload, stage="scope_picker")
+                and "create_wizard_flow" in tool_names
+            ):
+                selected_scope = _selected_interaction_value(interaction_response) or "full_setup"
+                try:
+                    interaction_output = await tool_executor.call_tool(
+                        name="create_wizard_flow",
+                        arguments=_onboarding_wizard_arguments(selected_scope),
+                        ctx=tool_ctx,
+                    )
+                except Exception:
+                    interaction_output = None
+
+                if isinstance(interaction_output, dict):
+                    interaction_output = _with_interaction_metadata(
+                        interaction_output,
+                        workflow="inventory_onboarding",
+                        workflow_stage="wizard",
+                        onboarding_scope=selected_scope,
+                    )
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [DataPart(data=interaction_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
+
+            if (
+                interaction_response is not None
+                and _is_onboarding_payload(last_interaction_payload, stage="wizard")
+                and "create_multiple_choice" in tool_names
+            ):
+                if bool(interaction_response.get("skipped")):
+                    response_text = "Onboarding paused. When you are ready, I can continue from the setup workflow."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+                selected_scope = str(last_interaction_payload.get("onboarding_scope") or "full_setup").strip() or "full_setup"
+                onboarding_data = _normalize_onboarding_wizard_data(selected_scope, interaction_response)
+                summary = _onboarding_summary_text(selected_scope, onboarding_data)
+                try:
+                    interaction_output = await tool_executor.call_tool(
+                        name="create_multiple_choice",
+                        arguments=_onboarding_review_picker_arguments(summary),
+                        ctx=tool_ctx,
+                    )
+                except Exception:
+                    interaction_output = None
+
+                if isinstance(interaction_output, dict):
+                    interaction_output = _with_interaction_metadata(
+                        interaction_output,
+                        workflow="inventory_onboarding",
+                        workflow_stage="review",
+                        onboarding_scope=selected_scope,
+                        onboarding_data=onboarding_data,
+                        onboarding_summary=summary,
+                    )
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [DataPart(data=interaction_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
+
+            if (
+                interaction_response is not None
+                and _is_onboarding_payload(last_interaction_payload, stage="review")
+            ):
+                selected_action = _selected_interaction_value(interaction_response) or "cancel_onboarding"
+                selected_scope = str(last_interaction_payload.get("onboarding_scope") or "full_setup").strip() or "full_setup"
+                onboarding_data = (
+                    last_interaction_payload.get("onboarding_data")
+                    if isinstance(last_interaction_payload.get("onboarding_data"), dict)
+                    else {}
+                )
+
+                if selected_action == "revise_answers" and "create_wizard_flow" in tool_names:
+                    try:
+                        interaction_output = await tool_executor.call_tool(
+                            name="create_wizard_flow",
+                            arguments=_onboarding_wizard_arguments(selected_scope),
+                            ctx=tool_ctx,
+                        )
+                    except Exception:
+                        interaction_output = None
+
+                    if isinstance(interaction_output, dict):
+                        interaction_output = _with_interaction_metadata(
+                            interaction_output,
+                            workflow="inventory_onboarding",
+                            workflow_stage="wizard",
+                            onboarding_scope=selected_scope,
+                        )
+                        raw_response = (
+                            onboarding_data.get("raw_response")
+                            if isinstance(onboarding_data.get("raw_response"), dict)
+                            else {}
+                        )
+                        existing_responses = (
+                            raw_response.get("all_responses")
+                            if isinstance(raw_response.get("all_responses"), dict)
+                            else {}
+                        )
+                        if existing_responses:
+                            interaction_output["existing_responses"] = existing_responses
+                        response_text = json.dumps(interaction_output, ensure_ascii=False)
+                        response_parts = [DataPart(data=interaction_output)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
+
+                if selected_action != "create_now" or "delegate_to_agent" not in tool_names:
+                    response_text = "Onboarding canceled for now. When you are ready, I can restart the setup flow."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+                target_agent = _onboarding_target_agent(selected_scope)
+                yield TaskStatus(
+                    state=TaskState.working,
+                    message=Message(
+                        role=Role.agent,
+                        parts=[TextPart(text=f"Submitting this onboarding plan to the {target_agent} specialist agent.")],
+                        context_id=task.context_id,
+                    ),
+                )
+
+                try:
+                    delegated = await tool_executor.call_tool(
+                        name="delegate_to_agent",
+                        arguments={
+                            "request": _onboarding_creation_request(selected_scope, onboarding_data),
+                            "agent_name": target_agent,
+                        },
+                        ctx=tool_ctx,
+                    )
+                except Exception as exc:
+                    response_text = str(exc).strip() or "Onboarding submission failed."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+                delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=target_agent)
+                if delegated_response is None:
+                    response_text = "Onboarding submission did not return a usable result."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+                yield Artifact(
+                    name="delegation",
+                    parts=[
+                        DataPart(
+                            data={
+                                "selectedAgent": delegated_response["delegated_agent"],
+                                "delegatedTaskId": delegated_response["delegated_task_id"],
+                                "finalState": delegated_response["delegated_final_state"].value,
+                                "statusUpdates": delegated_response["status_updates"],
+                            }
+                        )
+                    ],
+                )
+
+                for update in delegated_response["status_updates"]:
+                    if not isinstance(update, dict) or bool(update.get("final")):
+                        continue
+                    state_value = _coerce_task_state(update.get("state"), default=TaskState.working)
+                    message_text = _format_delegation_status_text(
+                        agent_name=delegated_response["delegated_agent"],
+                        state=state_value,
+                        message=str(update.get("message") or "").strip() or None,
+                    )
+                    yield TaskStatus(
+                        state=state_value,
+                        message=Message(
+                            role=Role.agent,
+                            parts=[TextPart(text=message_text)],
+                            context_id=task.context_id,
+                        ),
+                    )
+
+                for artifact_name, payload in delegated_response["child_artifacts"].items():
+                    if not isinstance(artifact_name, str) or not artifact_name.strip():
+                        continue
+                    parts = _ka2a_parts_from_model_content(payload)
+                    if parts:
+                        yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
+
+                response_parts = delegated_response["response_parts"]
+                response_text = delegated_response["response_text"]
+                if (
+                    selected_scope == "full_setup"
+                    and isinstance(onboarding_data.get("flat"), dict)
+                    and onboarding_data["flat"].get("continue_to_product_onboarding") is True
+                    and delegated_response["delegated_final_state"] == TaskState.completed
+                ):
+                    response_text = (
+                        f"{response_text}\n\nFoundation setup is ready. When you are ready, I can continue with product onboarding."
+                    ).strip()
+                    response_parts = [TextPart(text=response_text)]
+
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=delegated_response["delegated_final_state"],
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+
+                if delegated_response["delegated_final_state"] == TaskState.input_required:
+                    return
+
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+            if "create_multiple_choice" in tool_names and user_text_for_memory:
+                try:
+                    interaction_output = await tool_executor.call_tool(
+                        name="create_multiple_choice",
+                        arguments=_onboarding_scope_picker_arguments(),
+                        ctx=tool_ctx,
+                    )
+                except Exception:
+                    interaction_output = None
+
+                if isinstance(interaction_output, dict):
+                    interaction_output = _with_interaction_metadata(
+                        interaction_output,
+                        workflow="inventory_onboarding",
+                        workflow_stage="scope_picker",
+                    )
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [DataPart(data=interaction_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
 
         if (
             agent_name == "host"

@@ -1,7 +1,7 @@
 {
   "protocolVersion": "0.3.0",
   "name": "inventory",
-  "description": "Inventory service specialist agent for stock visibility, locations, reservations, movements, and inventory alerts inside Intera Inventory.",
+  "description": "Inventory service specialist agent for stock visibility, inventory setup, locations, reservations, movements, and inventory alerts inside Intera Inventory.",
   "url": "kafka://inventory",
   "preferredTransport": "kafka",
   "version": "0.1.0",
@@ -15,12 +15,25 @@
     {
       "id": "inventory_lookup",
       "name": "Inventory Lookup",
-      "description": "Search inventories and inspect current stock posture, alerts, and warehouse readiness using the inventory MCP tools.",
+      "description": "Search inventories and inspect current stock posture, alerts, warehouse readiness, and other inventory-state questions using the inventory MCP tools.",
       "tags": ["inventory", "stock", "warehouse", "alerts", "reorder", "expiry"],
       "examples": [
         "Show low-stock inventories.",
         "Check whether printer toner is running low.",
         "Inspect the current stock posture of the main warehouse."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    },
+    {
+      "id": "inventory_setup_admin",
+      "name": "Inventory Setup Admin",
+      "description": "Create and update stock locations, inventory categories, and inventory ledgers for onboarding and workspace setup flows.",
+      "tags": ["inventory", "setup", "onboarding", "locations", "categories", "create", "warehouse"],
+      "examples": [
+        "Create the first stock locations for this company.",
+        "Set up inventory categories before product entry.",
+        "Create the main inventory ledger for onboarding."
       ],
       "inputModes": ["text"],
       "outputModes": ["text"]
