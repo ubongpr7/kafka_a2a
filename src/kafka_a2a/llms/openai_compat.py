@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.error import HTTPError
@@ -122,18 +123,37 @@ def _to_openai_messages(messages: Iterable[Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _to_openai_tools(tools: Iterable[ToolSpec] | None) -> list[dict[str, Any]]:
+def _sanitize_tool_name(name: str) -> str:
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "_", (name or "").strip())
+    sanitized = sanitized.strip("_")
+    return sanitized or "tool"
+
+
+def _to_openai_tools(tools: Iterable[ToolSpec] | None) -> tuple[list[dict[str, Any]], dict[str, str]]:
     out: list[dict[str, Any]] = []
+    name_map: dict[str, str] = {}
+    used_names: set[str] = set()
     for tool in tools or []:
         if not isinstance(tool.name, str) or not tool.name.strip():
             continue
-        function: dict[str, Any] = {"name": tool.name.strip()}
+        original_name = tool.name.strip()
+        sanitized_name = _sanitize_tool_name(original_name)
+        candidate = sanitized_name
+        suffix = 2
+        while candidate in used_names and name_map.get(candidate) != original_name:
+            candidate = f"{sanitized_name}_{suffix}"
+            suffix += 1
+
+        used_names.add(candidate)
+        name_map[candidate] = original_name
+
+        function: dict[str, Any] = {"name": candidate}
         if isinstance(tool.description, str) and tool.description.strip():
             function["description"] = tool.description.strip()
         if isinstance(tool.input_schema, dict) and tool.input_schema:
             function["parameters"] = tool.input_schema
         out.append({"type": "function", "function": function})
-    return out
+    return out, name_map
 
 
 class UpstreamHttpError(RuntimeError):
@@ -164,7 +184,7 @@ class OpenAICompatChatModel:
             "model": self.model,
             "messages": _to_openai_messages(messages),
         }
-        tools = _to_openai_tools(kwargs.get("tools"))
+        tools, tool_name_map = _to_openai_tools(kwargs.get("tools"))
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -255,6 +275,7 @@ class OpenAICompatChatModel:
                 arguments_raw = function.get("arguments")
                 if not isinstance(name, str) or not name.strip():
                     continue
+                original_name = tool_name_map.get(name.strip(), name.strip())
                 arguments: dict[str, Any]
                 if isinstance(arguments_raw, str) and arguments_raw.strip():
                     try:
@@ -268,7 +289,7 @@ class OpenAICompatChatModel:
                 arguments = parsed_arguments if isinstance(parsed_arguments, dict) else {"value": parsed_arguments}
                 part: dict[str, Any] = {
                     "kind": "tool-call",
-                    "name": name.strip(),
+                    "name": original_name,
                     "arguments": arguments,
                 }
                 if isinstance(call_id, str) and call_id.strip():

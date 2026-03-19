@@ -56,6 +56,21 @@ class FakeToolExecutor(ToolExecutor):
                     "required": ["request"],
                 },
             ),
+            ToolSpec(
+                name="create_multiple_choice",
+                description="Render a pick-one list.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "options": {"type": "array"},
+                        "multiple": {"type": "boolean"},
+                        "allow_input": {"type": "boolean"},
+                    },
+                    "required": ["title", "description", "options", "multiple", "allow_input"],
+                },
+            ),
         ]
 
     async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
@@ -162,6 +177,15 @@ class FakeToolExecutor(ToolExecutor):
                         "final": True,
                     },
                 ],
+            }
+        if name == "create_multiple_choice":
+            return {
+                "interaction_type": "multiple_choice",
+                "title": arguments.get("title") or "Choose",
+                "description": arguments.get("description") or "Choose one option.",
+                "options": list(arguments.get("options") or []),
+                "multiple": bool(arguments.get("multiple")),
+                "allow_input": bool(arguments.get("allow_input")),
             }
         raise AssertionError(f"Unexpected tool call: {name}")
 

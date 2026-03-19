@@ -82,7 +82,8 @@ def _render_tool_prompt_block(tools: list[ToolSpec]) -> str:
         + json.dumps(tools_obj, ensure_ascii=False)
         + "\n\nTool calling rules:\n"
         + "- Use tools only when they are necessary to complete the user's request.\n"
-        + "- For greetings, small talk, capability questions, or simple summaries, answer normally in plain text.\n"
+        + "- For greetings or small talk, answer normally in plain text.\n"
+        + "- If the user asks what you can do, what help is available, or wants a list of options to choose from, prefer an interaction tool such as create_multiple_choice.\n"
         + "- Use interaction/formatting tools only when the frontend needs structured UI such as a form, selection, confirmation, wizard, or table.\n"
         + "- If you need a tool, respond with STRICT JSON only (no markdown).\n"
         + '- Output MUST be either a single object or a list of objects shaped like: {"kind":"tool-call","name":"...","arguments":{...}}.\n'
@@ -243,6 +244,56 @@ def _is_host_introspection_query(value: str) -> bool:
         "your capabilities",
     )
     return any(phrase in text for phrase in phrases)
+
+
+def _is_host_capability_picker_query(value: str) -> bool:
+    text = _normalize_user_text(value)
+    if not text:
+        return False
+
+    capability_phrases = (
+        "what can you do",
+        "how can you help",
+        "what do you do",
+        "what can you help",
+        "show what you can do",
+        "list what you can do",
+        "list your capabilities",
+        "show your capabilities",
+        "what help do you have",
+    )
+    picker_phrases = (
+        "pick",
+        "choose",
+        "select",
+        "option",
+        "list",
+        "menu",
+        "tool representation",
+        "use tool",
+    )
+
+    if any(phrase in text for phrase in capability_phrases):
+        return True
+    if ("what you can do" in text or "how you can help" in text) and any(phrase in text for phrase in picker_phrases):
+        return True
+    return False
+
+
+def _host_capability_picker_arguments() -> dict[str, Any]:
+    return {
+        "title": "Choose What You Need Help With",
+        "description": "Select the area you want help with. I can continue from your choice.",
+        "options": [
+            {"value": "product", "label": "Product Management"},
+            {"value": "inventory", "label": "Inventory Management"},
+            {"value": "pos", "label": "Point of Sale (POS)"},
+            {"value": "users", "label": "User and Workspace Management"},
+            {"value": "general", "label": "General Question"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
 
 
 def _coerce_agent_summaries(value: Any) -> list[dict[str, Any]]:
@@ -814,6 +865,36 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
 
         response_parts: list[Any] = []
         response_text = ""
+
+        if (
+            agent_name == "host"
+            and tool_executor is not None
+            and "create_multiple_choice" in tool_names
+            and user_text_for_memory
+            and _is_host_capability_picker_query(user_text_for_memory)
+        ):
+            try:
+                interaction_output = await tool_executor.call_tool(
+                    name="create_multiple_choice",
+                    arguments=_host_capability_picker_arguments(),
+                    ctx=tool_ctx,
+                )
+            except Exception:
+                interaction_output = None
+
+            if isinstance(interaction_output, dict):
+                response_text = json.dumps(interaction_output, ensure_ascii=False)
+                response_parts = [DataPart(data=interaction_output)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.input_required,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                return
 
         if (
             agent_name == "host"

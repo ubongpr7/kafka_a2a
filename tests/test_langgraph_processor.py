@@ -5,6 +5,7 @@ import pytest
 from tests import fake_langgraph_components
 from kafka_a2a.langgraph_processor import (
     _interaction_payload_from_text,
+    _is_host_capability_picker_query,
     _is_host_introspection_query,
     _normalize_tool_call_payload,
     _render_tool_prompt_block,
@@ -42,7 +43,8 @@ def test_render_tool_prompt_block_discourages_tool_calls_for_plain_conversation(
         ]
     )
 
-    assert "For greetings, small talk, capability questions, or simple summaries, answer normally in plain text." in prompt
+    assert "For greetings or small talk, answer normally in plain text." in prompt
+    assert "If the user asks what you can do, what help is available, or wants a list of options to choose from, prefer an interaction tool such as create_multiple_choice." in prompt
     assert 'Never output bare tool names or pseudo-tool JSON such as {"kind":"list_available_agents"}' in prompt
 
 
@@ -129,6 +131,12 @@ def test_host_introspection_detection_preserves_domain_requests() -> None:
     assert not _is_host_introspection_query("help me search for the product t-shirt")
 
 
+def test_host_capability_picker_detection() -> None:
+    assert _is_host_capability_picker_query("what can you do for me?")
+    assert _is_host_capability_picker_query("send the list of what you can do so I can choose")
+    assert not _is_host_capability_picker_query("help me check stock levels")
+
+
 def test_select_host_delegation_agent_prefers_best_matching_specialist() -> None:
     agents = [
         {
@@ -195,6 +203,51 @@ async def test_host_auto_delegates_and_waits_for_specialist_result() -> None:
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == "Found 3 products matching t-shirt."
+
+
+@pytest.mark.asyncio
+async def test_host_capability_query_uses_multiple_choice_tool() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-capability",
+        context_id="ctx-capability",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text="what can you do for me? I need to choose from a list")],
+            ),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="what can you do for me? I need to choose from a list")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "create_multiple_choice",
+            {
+                "title": "Choose What You Need Help With",
+                "description": "Select the area you want help with. I can continue from your choice.",
+                "options": [
+                    {"value": "product", "label": "Product Management"},
+                    {"value": "inventory", "label": "Inventory Management"},
+                    {"value": "pos", "label": "Point of Sale (POS)"},
+                    {"value": "users", "label": "User and Workspace Management"},
+                    {"value": "general", "label": "General Question"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        )
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
 
 
 @pytest.mark.asyncio
@@ -265,7 +318,11 @@ async def test_specialist_tool_loop_passes_tool_specs_to_model() -> None:
     events = [event async for event in processor(task, message, None, None)]
 
     assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 1
-    assert fake_langgraph_components.FAKE_LLM_LAST_TOOLS == ["list_available_agents", "delegate_to_agent"]
+    assert set(fake_langgraph_components.FAKE_LLM_LAST_TOOLS) == {
+        "list_available_agents",
+        "delegate_to_agent",
+        "create_multiple_choice",
+    }
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == "This should not be used for delegated host requests."
