@@ -92,7 +92,7 @@ def create_gateway_app(config: GatewayConfig):
         allow_credentials=_parse_bool_env("KA2A_CORS_ALLOW_CREDENTIALS", default=False),
         allow_methods=_parse_csv_env("KA2A_CORS_ALLOW_METHODS") or ["GET", "POST", "OPTIONS"],
         allow_headers=_parse_csv_env("KA2A_CORS_ALLOW_HEADERS")
-        or ["Authorization", "Content-Type", "X-Requested-With"],
+        or ["Authorization", "Content-Type", "X-Requested-With", "X-Profile-ID", "X-Company-Code"],
     )
     class ChatRequest(Ka2aModel):
         text: str

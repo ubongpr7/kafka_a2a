@@ -285,6 +285,10 @@ def _interaction_payload_from_text(text: str) -> dict[str, Any] | None:
         obj = json.loads(raw)
     except Exception:
         return None
+    return _interaction_payload_from_obj(obj)
+
+
+def _interaction_payload_from_obj(obj: Any) -> dict[str, Any] | None:
     if isinstance(obj, dict):
         interaction_type = str(obj.get("interaction_type") or "").strip()
         typed = str(obj.get("type") or "").strip()
@@ -295,6 +299,16 @@ def _interaction_payload_from_text(text: str) -> dict[str, Any] | None:
 
 def _interaction_payload_from_parts(parts: list[Any]) -> dict[str, Any] | None:
     for part in parts:
+        if isinstance(part, DataPart):
+            payload = _interaction_payload_from_obj(part.data)
+            if payload is not None:
+                return payload
+            continue
+        if isinstance(part, ToolResultPart) and isinstance(part.output, dict):
+            payload = _interaction_payload_from_obj(part.output)
+            if payload is not None:
+                return payload
+            continue
         if not isinstance(part, TextPart):
             continue
         payload = _interaction_payload_from_text(part.text)
@@ -370,6 +384,11 @@ def _ka2a_parts_from_model_content(content: Any) -> list[Any]:
         return [TextPart(text="")]
     if isinstance(content, str):
         return [TextPart(text=content)]
+    if isinstance(content, dict):
+        interaction_payload = _interaction_payload_from_obj(content)
+        if interaction_payload is not None:
+            return [DataPart(data=interaction_payload)]
+        return [TextPart(text=json.dumps(content, ensure_ascii=False))]
     if isinstance(content, list):
         out: list[Any] = []
         for item in content:
@@ -950,7 +969,7 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 )
                 if isinstance(interaction_output, dict):
                     response_text = json.dumps(interaction_output, ensure_ascii=False)
-                    response_parts = [TextPart(text=response_text)]
+                    response_parts = [DataPart(data=interaction_output)]
                     break
                 messages2.append(
                     HumanMessage(
