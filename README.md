@@ -70,6 +70,13 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+For production, point Compose at the production env file so the agents do not
+boot from the local development `.env`:
+
+```bash
+KA2A_ENV_FILE=.env.prod docker compose up -d --build
+```
+
 If your Kafka cluster has **auto-topic-creation disabled**, create the required topics first:
 
 ```bash

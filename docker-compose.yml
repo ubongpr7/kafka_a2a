@@ -7,6 +7,8 @@ x-ka2a-image: &ka2a_image
     args:
       KA2A_UV_EXTRAS: "server,auth,lang,redis,mcp"
   env_file:
+    # Production deploys should export `KA2A_ENV_FILE=.env.prod` so the
+    # containers do not start with the local development `.env`.
     - ${KA2A_ENV_FILE:-.env}
 
 services:
