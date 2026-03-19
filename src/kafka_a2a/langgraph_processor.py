@@ -938,6 +938,433 @@ def _onboarding_creation_request(scope: str, data: dict[str, Any]) -> str:
     )
 
 
+def _normalize_operation_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
+
+
+def _normalized_schema_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+
+
+def _tool_spec_by_name(tool_specs: list[ToolSpec], name: str) -> ToolSpec | None:
+    for spec in tool_specs:
+        if spec.name == name:
+            return spec
+    return None
+
+
+def _tool_schema_properties(spec: ToolSpec | None) -> dict[str, Any]:
+    if spec is None or not isinstance(spec.input_schema, dict):
+        return {}
+    properties = spec.input_schema.get("properties")
+    return properties if isinstance(properties, dict) else {}
+
+
+def _tool_schema_required(spec: ToolSpec | None) -> list[str]:
+    if spec is None or not isinstance(spec.input_schema, dict):
+        return []
+    required = spec.input_schema.get("required")
+    if not isinstance(required, list):
+        return []
+    return [str(item).strip() for item in required if isinstance(item, str) and item.strip()]
+
+
+def _match_schema_key(spec: ToolSpec | None, candidates: list[str]) -> str | None:
+    if not candidates:
+        return None
+    properties = _tool_schema_properties(spec)
+    if not properties:
+        return candidates[0]
+
+    normalized_map = {_normalized_schema_key(key): key for key in properties}
+    for candidate in candidates:
+        if candidate in properties:
+            return candidate
+        normalized = _normalized_schema_key(candidate)
+        if normalized in normalized_map:
+            return normalized_map[normalized]
+    return None
+
+
+def _set_schema_arg(arguments: dict[str, Any], spec: ToolSpec | None, candidates: list[str], value: Any) -> None:
+    if value in (None, "", [], {}):
+        return
+    matched = _match_schema_key(spec, candidates)
+    if matched:
+        arguments[matched] = value
+
+
+def _filtered_tool_arguments(spec: ToolSpec | None, arguments: dict[str, Any]) -> dict[str, Any]:
+    properties = _tool_schema_properties(spec)
+    if not properties:
+        return {key: value for key, value in arguments.items() if value not in (None, "", [], {})}
+    return {
+        key: value
+        for key, value in arguments.items()
+        if key in properties and value not in (None, "", [], {})
+    }
+
+
+def _missing_required_arguments(spec: ToolSpec | None, arguments: dict[str, Any]) -> list[str]:
+    return [key for key in _tool_schema_required(spec) if key not in arguments]
+
+
+def _first_string(mapping: dict[str, Any], keys: list[str]) -> str | None:
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _coerce_mapping_from_tool_output(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        for key in ("structuredContent", "structured_content", "data", "result"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                return nested
+        return value
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                if isinstance(item.get("data"), dict):
+                    return item["data"]
+                if isinstance(item.get("structuredContent"), dict):
+                    return item["structuredContent"]
+                if isinstance(item.get("text"), str):
+                    raw = _extract_json_object_from_text(item["text"])
+                    if raw is not None:
+                        return raw
+    if isinstance(value, str):
+        return _extract_json_object_from_text(value)
+    return None
+
+
+def _extract_company_context(value: Any) -> dict[str, Any] | None:
+    obj = _coerce_mapping_from_tool_output(value)
+    if not isinstance(obj, dict):
+        return None
+
+    nested_candidates = [obj]
+    for key in ("company", "profile", "activeCompany", "active_company", "companyProfile", "company_profile"):
+        nested = obj.get(key)
+        if isinstance(nested, dict):
+            nested_candidates.append(nested)
+
+    for candidate in nested_candidates:
+        identifier = _first_string(candidate, ["id", "profile_id", "profileId", "company_id", "companyId"])
+        name = _first_string(candidate, ["name", "company_name", "companyName", "title"])
+        if identifier or name:
+            return {"id": identifier, "name": name}
+    return None
+
+
+def _company_context_arguments(spec: ToolSpec | None, company_context: dict[str, Any] | None) -> dict[str, Any]:
+    arguments: dict[str, Any] = {}
+    if not isinstance(company_context, dict):
+        return arguments
+    _set_schema_arg(
+        arguments,
+        spec,
+        ["company_id", "companyId", "profile_id", "profileId", "company_profile_id", "companyProfileId"],
+        company_context.get("id"),
+    )
+    _set_schema_arg(
+        arguments,
+        spec,
+        ["company_name", "companyName", "profile_name", "profileName", "workspace_name", "workspaceName"],
+        company_context.get("name"),
+    )
+    return arguments
+
+
+def _onboarding_resume_picker_arguments(workflow_state: dict[str, Any]) -> dict[str, Any]:
+    scope = str(workflow_state.get("scope") or "full_setup").strip() or "full_setup"
+    summary = str(workflow_state.get("summary") or "").strip()
+    description = (
+        f"You have an unfinished {ONBOARDING_SCOPE_LABELS.get(scope, scope.replace('_', ' ').title())} workflow."
+    )
+    if summary:
+        description = f"{description}\n\nLatest saved plan:\n{summary}"
+    description = f"{description}\n\nChoose whether to resume it or start a new onboarding flow."
+    return {
+        "title": "Resume Inventory Onboarding",
+        "description": description,
+        "options": [
+            {"value": "resume_saved", "label": "Resume Saved Onboarding"},
+            {"value": "start_over", "label": "Start Over"},
+            {"value": "cancel_saved", "label": "Cancel Saved Onboarding"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
+
+
+def _onboarding_operation_summary(
+    *,
+    created_operations: dict[str, Any],
+    failed_operations: list[dict[str, Any]],
+) -> str:
+    created_labels: list[str] = []
+    for payload in created_operations.values():
+        if isinstance(payload, dict):
+            label = str(payload.get("label") or "").strip()
+            if label:
+                created_labels.append(label)
+
+    lines: list[str] = []
+    if created_labels:
+        lines.append("Completed: " + ", ".join(created_labels))
+    if failed_operations:
+        failed_labels = [str(item.get("label") or "").strip() for item in failed_operations if str(item.get("label") or "").strip()]
+        if failed_labels:
+            lines.append("Still pending: " + ", ".join(failed_labels))
+    return "\n".join(lines)
+
+
+def _onboarding_retry_picker_arguments(
+    *,
+    summary: str,
+    created_operations: dict[str, Any],
+    failed_operations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    description = summary
+    if created_operations or failed_operations:
+        extra = _onboarding_operation_summary(
+            created_operations=created_operations,
+            failed_operations=failed_operations,
+        )
+        if extra:
+            description = f"{description}\n\n{extra}"
+    description = f"{description}\n\nSome setup steps still need attention. Choose what to do next."
+    return {
+        "title": "Resolve Onboarding Issues",
+        "description": description,
+        "options": [
+            {"value": "retry_failed", "label": "Retry Failed Steps"},
+            {"value": "revise_answers", "label": "Revise My Answers"},
+            {"value": "cancel_onboarding", "label": "Cancel For Now"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
+
+
+def _onboarding_completed_text(created_operations: dict[str, Any]) -> str:
+    counts = {
+        "stock_location": 0,
+        "inventory_category": 0,
+        "inventory": 0,
+        "product": 0,
+    }
+    for payload in created_operations.values():
+        if not isinstance(payload, dict):
+            continue
+        operation_type = str(payload.get("operation_type") or "").strip()
+        if operation_type in counts:
+            counts[operation_type] += 1
+
+    parts: list[str] = []
+    if counts["stock_location"]:
+        parts.append(f"{counts['stock_location']} stock location" + ("s" if counts["stock_location"] != 1 else ""))
+    if counts["inventory_category"]:
+        parts.append(
+            f"{counts['inventory_category']} inventory categor" + ("ies" if counts["inventory_category"] != 1 else "y")
+        )
+    if counts["inventory"]:
+        parts.append(f"{counts['inventory']} inventory ledger" + ("s" if counts["inventory"] != 1 else ""))
+    if counts["product"]:
+        parts.append(f"{counts['product']} product" + ("s" if counts["product"] != 1 else ""))
+
+    if not parts:
+        return "No onboarding records were created."
+    if len(parts) == 1:
+        return f"Created {parts[0]} for onboarding."
+    return "Created " + ", ".join(parts[:-1]) + f", and {parts[-1]} for onboarding."
+
+
+def _build_stock_location_operation(
+    *,
+    tool_specs: list[ToolSpec],
+    company_context: dict[str, Any] | None,
+    location_name: str,
+    location_type: str | None,
+    primary: bool,
+) -> dict[str, Any]:
+    tool_name = "inventory.create_stock_location"
+    spec = _tool_spec_by_name(tool_specs, tool_name)
+    arguments = _company_context_arguments(spec, company_context)
+    _set_schema_arg(arguments, spec, ["name", "location_name", "locationName", "stock_location_name", "stockLocationName"], location_name)
+    _set_schema_arg(arguments, spec, ["type", "location_type", "locationType", "stock_location_type", "stockLocationType"], location_type)
+    _set_schema_arg(arguments, spec, ["is_primary", "isPrimary", "primary"], primary)
+    return {
+        "tool_name": tool_name,
+        "label": f"stock location '{location_name}'",
+        "operation_type": "stock_location",
+        "semantic_key": f"{tool_name}:{_normalize_operation_key(location_name)}",
+        "arguments": _filtered_tool_arguments(spec, arguments),
+        "missing_required": _missing_required_arguments(spec, _filtered_tool_arguments(spec, arguments)),
+    }
+
+
+def _build_inventory_category_operation(
+    *,
+    tool_specs: list[ToolSpec],
+    company_context: dict[str, Any] | None,
+    category_name: str,
+) -> dict[str, Any]:
+    tool_name = "inventory.create_inventory_category"
+    spec = _tool_spec_by_name(tool_specs, tool_name)
+    arguments = _company_context_arguments(spec, company_context)
+    _set_schema_arg(arguments, spec, ["name", "category_name", "categoryName", "title"], category_name)
+    return {
+        "tool_name": tool_name,
+        "label": f"inventory category '{category_name}'",
+        "operation_type": "inventory_category",
+        "semantic_key": f"{tool_name}:{_normalize_operation_key(category_name)}",
+        "arguments": _filtered_tool_arguments(spec, arguments),
+        "missing_required": _missing_required_arguments(spec, _filtered_tool_arguments(spec, arguments)),
+    }
+
+
+def _build_inventory_operation(
+    *,
+    tool_specs: list[ToolSpec],
+    company_context: dict[str, Any] | None,
+    inventory_name: str,
+    inventory_description: str | None,
+    related_location_name: str | None,
+    category_name: str | None,
+) -> dict[str, Any]:
+    tool_name = "inventory.create_inventory"
+    spec = _tool_spec_by_name(tool_specs, tool_name)
+    arguments = _company_context_arguments(spec, company_context)
+    _set_schema_arg(arguments, spec, ["name", "inventory_name", "inventoryName", "title"], inventory_name)
+    _set_schema_arg(arguments, spec, ["description", "inventory_description", "inventoryDescription", "notes"], inventory_description)
+    _set_schema_arg(arguments, spec, ["location_name", "locationName", "stock_location_name", "stockLocationName", "default_location_name", "defaultLocationName"], related_location_name)
+    _set_schema_arg(arguments, spec, ["category_name", "categoryName", "inventory_category_name", "inventoryCategoryName", "default_category_name", "defaultCategoryName"], category_name)
+    return {
+        "tool_name": tool_name,
+        "label": f"inventory ledger '{inventory_name}'",
+        "operation_type": "inventory",
+        "semantic_key": f"{tool_name}:{_normalize_operation_key(inventory_name)}",
+        "arguments": _filtered_tool_arguments(spec, arguments),
+        "missing_required": _missing_required_arguments(spec, _filtered_tool_arguments(spec, arguments)),
+    }
+
+
+def _build_product_operation(
+    *,
+    tool_specs: list[ToolSpec],
+    company_context: dict[str, Any] | None,
+    product_name: str,
+    product_category: str | None,
+    pos_ready: bool | None,
+) -> dict[str, Any]:
+    tool_name = "product.create_product"
+    spec = _tool_spec_by_name(tool_specs, tool_name)
+    arguments = _company_context_arguments(spec, company_context)
+    _set_schema_arg(arguments, spec, ["name", "product_name", "productName", "title"], product_name)
+    _set_schema_arg(arguments, spec, ["category_name", "categoryName", "product_category", "productCategory", "category"], product_category)
+    _set_schema_arg(arguments, spec, ["pos_ready", "posReady", "pos_visible", "posVisible", "quick_sale", "quickSale"], pos_ready)
+    return {
+        "tool_name": tool_name,
+        "label": f"product '{product_name}'",
+        "operation_type": "product",
+        "semantic_key": f"{tool_name}:{_normalize_operation_key(product_name)}",
+        "arguments": _filtered_tool_arguments(spec, arguments),
+        "missing_required": _missing_required_arguments(spec, _filtered_tool_arguments(spec, arguments)),
+    }
+
+
+def _onboarding_plan_operations(
+    *,
+    scope: str,
+    onboarding_data: dict[str, Any],
+    tool_specs: list[ToolSpec],
+    company_context: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    flat = onboarding_data.get("flat") if isinstance(onboarding_data.get("flat"), dict) else {}
+    operations: list[dict[str, Any]] = []
+
+    if scope in {"stock_locations", "full_setup"}:
+        primary_location_name = str(flat.get("primary_location_name") or "").strip()
+        primary_location_type = str(flat.get("primary_location_type") or "").strip() or None
+        if primary_location_name:
+            operations.append(
+                _build_stock_location_operation(
+                    tool_specs=tool_specs,
+                    company_context=company_context,
+                    location_name=primary_location_name,
+                    location_type=primary_location_type,
+                    primary=True,
+                )
+            )
+        for location_name in _split_multiline_values(flat.get("additional_locations")):
+            operations.append(
+                _build_stock_location_operation(
+                    tool_specs=tool_specs,
+                    company_context=company_context,
+                    location_name=location_name,
+                    location_type=primary_location_type or "store",
+                    primary=False,
+                )
+            )
+
+    categories = _split_multiline_values(flat.get("category_names"))
+    if scope in {"inventory_categories", "full_setup"}:
+        for category_name in categories:
+            operations.append(
+                _build_inventory_category_operation(
+                    tool_specs=tool_specs,
+                    company_context=company_context,
+                    category_name=category_name,
+                )
+            )
+
+    if scope in {"inventory_setup", "full_setup"}:
+        inventory_name = str(flat.get("default_inventory_name") or "").strip()
+        if inventory_name:
+            operations.append(
+                _build_inventory_operation(
+                    tool_specs=tool_specs,
+                    company_context=company_context,
+                    inventory_name=inventory_name,
+                    inventory_description=str(flat.get("inventory_description") or "").strip() or None,
+                    related_location_name=(
+                        str(flat.get("related_location_name") or "").strip()
+                        or str(flat.get("primary_location_name") or "").strip()
+                        or None
+                    ),
+                    category_name=(
+                        str(flat.get("category_name") or "").strip()
+                        or (categories[0] if categories else None)
+                    ),
+                )
+            )
+
+    should_create_products = scope == "product_onboarding" or (
+        scope == "full_setup" and flat.get("continue_to_product_onboarding") is True
+    )
+    if should_create_products:
+        product_names = _split_multiline_values(flat.get("product_names") or flat.get("initial_product_names"))
+        product_category = str(flat.get("product_category") or "").strip() or None
+        pos_ready = flat.get("pos_ready")
+        pos_ready_value = pos_ready if isinstance(pos_ready, bool) else None
+        for product_name in product_names:
+            operations.append(
+                _build_product_operation(
+                    tool_specs=tool_specs,
+                    company_context=company_context,
+                    product_name=product_name,
+                    product_category=product_category or (categories[0] if categories else None),
+                    pos_ready=pos_ready_value,
+                )
+            )
+
+    return operations
+
+
 def _selected_interaction_value(response: dict[str, Any] | None) -> str | None:
     if not isinstance(response, dict):
         return None
@@ -1355,7 +1782,10 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
         if override:
             obj = _import_path(override)
             if callable(obj) and not hasattr(obj, "call_tool"):
-                obj = obj()
+                try:
+                    obj = obj(agent_name=agent_name)
+                except TypeError:
+                    obj = obj()
             if not hasattr(obj, "list_tools") or not hasattr(obj, "call_tool"):
                 raise ValueError("KA2A_TOOL_EXECUTOR must be a ToolExecutor or a callable returning one.")
             return obj  # type: ignore[return-value]
@@ -1401,6 +1831,27 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             await memory_store.set(context_id=context_id, principal=principal, memory=memory)
         except Exception:
             return None
+
+    async def _load_workflow_state(*, context_id: str, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+        memory = await _load_memory(context_id=context_id, metadata=metadata)
+        if memory is None or not isinstance(memory.workflow_state, dict):
+            return None
+        return memory.workflow_state
+
+    async def _save_workflow_state(
+        *,
+        context_id: str,
+        metadata: dict[str, Any] | None,
+        workflow_state: dict[str, Any] | None,
+    ) -> None:
+        existing = await _load_memory(context_id=context_id, metadata=metadata)
+        memory = ContextMemory(
+            summary=existing.summary if existing else None,
+            profile=existing.profile if existing else None,
+            workflow_state=workflow_state if isinstance(workflow_state, dict) and workflow_state else None,
+            updated_at=existing.updated_at if existing else None,
+        )
+        await _save_memory(context_id=context_id, metadata=metadata, memory=memory)
 
     def _system_prompt_with_memory(*, base: str, memory: ContextMemory | None) -> str:
         if memory is None or (not memory.summary and not memory.profile):
@@ -1499,6 +1950,7 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
         new_memory = ContextMemory(
             summary=str(summary).strip() if isinstance(summary, str) and summary.strip() else None,
             profile=profile if isinstance(profile, dict) and profile else None,
+            workflow_state=existing.workflow_state if existing and isinstance(existing.workflow_state, dict) else None,
         )
         await _save_memory(context_id=context_id, metadata=metadata, memory=new_memory)
 
@@ -1859,6 +2311,80 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 return
 
         if agent_name == "onboarding" and tool_executor is not None:
+            saved_workflow_state = await _load_workflow_state(context_id=task.context_id, metadata=metadata)
+            active_company_context: dict[str, Any] | None = None
+
+            async def _maybe_active_company_context() -> dict[str, Any] | None:
+                nonlocal active_company_context
+                if active_company_context is not None:
+                    return active_company_context
+                if saved_workflow_state and isinstance(saved_workflow_state.get("company_context"), dict):
+                    active_company_context = saved_workflow_state["company_context"]
+                    return active_company_context
+                if "users.get_active_company_profile" not in tool_names:
+                    return None
+                try:
+                    output = await tool_executor.call_tool(
+                        name="users.get_active_company_profile",
+                        arguments={},
+                        ctx=tool_ctx,
+                    )
+                except Exception:
+                    return None
+                active_company_context = _extract_company_context(output)
+                return active_company_context
+
+            if (
+                interaction_response is not None
+                and _is_onboarding_payload(last_interaction_payload, stage="resume_prompt")
+                and "create_multiple_choice" in tool_names
+            ):
+                resume_action = _selected_interaction_value(interaction_response) or "cancel_saved"
+                saved_pending = (
+                    saved_workflow_state.get("pending_interaction")
+                    if isinstance(saved_workflow_state, dict) and isinstance(saved_workflow_state.get("pending_interaction"), dict)
+                    else None
+                )
+                if resume_action == "resume_saved" and isinstance(saved_pending, dict):
+                    response_text = json.dumps(saved_pending, ensure_ascii=False)
+                    response_parts = [DataPart(data=saved_pending)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
+                if resume_action == "start_over":
+                    saved_workflow_state = None
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+                else:
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+                    response_text = "Saved onboarding was canceled. When you are ready, I can start a fresh onboarding flow."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
             if (
                 interaction_response is not None
                 and _is_onboarding_payload(last_interaction_payload, stage="scope_picker")
@@ -1881,6 +2407,21 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         workflow_stage="wizard",
                         onboarding_scope=selected_scope,
                     )
+                    workflow_state = {
+                        "workflow": "inventory_onboarding",
+                        "status": "collecting",
+                        "stage": "wizard",
+                        "scope": selected_scope,
+                        "pending_interaction": interaction_output,
+                    }
+                    company_context = await _maybe_active_company_context()
+                    if company_context:
+                        workflow_state["company_context"] = company_context
+                    await _save_workflow_state(
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        workflow_state=workflow_state,
+                    )
                     response_text = json.dumps(interaction_output, ensure_ascii=False)
                     response_parts = [DataPart(data=interaction_output)]
                     yield Artifact(name="result", parts=response_parts)
@@ -1899,8 +2440,27 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 and _is_onboarding_payload(last_interaction_payload, stage="wizard")
                 and "create_multiple_choice" in tool_names
             ):
+                selected_scope = str(last_interaction_payload.get("onboarding_scope") or "full_setup").strip() or "full_setup"
                 if bool(interaction_response.get("skipped")):
-                    response_text = "Onboarding paused. When you are ready, I can continue from the setup workflow."
+                    workflow_state = {
+                        "workflow": "inventory_onboarding",
+                        "status": "paused",
+                        "stage": "wizard",
+                        "scope": selected_scope,
+                        "pending_interaction": last_interaction_payload,
+                    }
+                    partial_responses = interaction_response.get("partial_responses")
+                    if isinstance(partial_responses, dict):
+                        workflow_state["existing_responses"] = partial_responses
+                    company_context = await _maybe_active_company_context()
+                    if company_context:
+                        workflow_state["company_context"] = company_context
+                    await _save_workflow_state(
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        workflow_state=workflow_state,
+                    )
+                    response_text = "Onboarding paused. When you are ready, I can resume the saved setup workflow."
                     response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
@@ -1922,8 +2482,10 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     )
                     return
 
-                selected_scope = str(last_interaction_payload.get("onboarding_scope") or "full_setup").strip() or "full_setup"
                 onboarding_data = _normalize_onboarding_wizard_data(selected_scope, interaction_response)
+                company_context = await _maybe_active_company_context()
+                if company_context:
+                    onboarding_data["company_context"] = company_context
                 summary = _onboarding_summary_text(selected_scope, onboarding_data)
                 try:
                     interaction_output = await tool_executor.call_tool(
@@ -1943,6 +2505,27 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         onboarding_data=onboarding_data,
                         onboarding_summary=summary,
                     )
+                    workflow_state = {
+                        "workflow": "inventory_onboarding",
+                        "status": "awaiting_review",
+                        "stage": "review",
+                        "scope": selected_scope,
+                        "summary": summary,
+                        "onboarding_data": onboarding_data,
+                        "pending_interaction": interaction_output,
+                        "created_operations": (
+                            saved_workflow_state.get("created_operations")
+                            if isinstance(saved_workflow_state, dict) and isinstance(saved_workflow_state.get("created_operations"), dict)
+                            else {}
+                        ),
+                    }
+                    if company_context:
+                        workflow_state["company_context"] = company_context
+                    await _save_workflow_state(
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        workflow_state=workflow_state,
+                    )
                     response_text = json.dumps(interaction_output, ensure_ascii=False)
                     response_parts = [DataPart(data=interaction_output)]
                     yield Artifact(name="result", parts=response_parts)
@@ -1956,9 +2539,9 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     )
                     return
 
-            if (
-                interaction_response is not None
-                and _is_onboarding_payload(last_interaction_payload, stage="review")
+            if interaction_response is not None and (
+                _is_onboarding_payload(last_interaction_payload, stage="review")
+                or _is_onboarding_payload(last_interaction_payload, stage="retry")
             ):
                 selected_action = _selected_interaction_value(interaction_response) or "cancel_onboarding"
                 selected_scope = str(last_interaction_payload.get("onboarding_scope") or "full_setup").strip() or "full_setup"
@@ -1966,6 +2549,26 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     last_interaction_payload.get("onboarding_data")
                     if isinstance(last_interaction_payload.get("onboarding_data"), dict)
                     else {}
+                )
+                onboarding_summary = str(last_interaction_payload.get("onboarding_summary") or "").strip() or _onboarding_summary_text(selected_scope, onboarding_data)
+                created_operations = (
+                    last_interaction_payload.get("created_operations")
+                    if isinstance(last_interaction_payload.get("created_operations"), dict)
+                    else (
+                        saved_workflow_state.get("created_operations")
+                        if isinstance(saved_workflow_state, dict) and isinstance(saved_workflow_state.get("created_operations"), dict)
+                        else {}
+                    )
+                )
+                failed_operations = (
+                    last_interaction_payload.get("failed_operations")
+                    if isinstance(last_interaction_payload.get("failed_operations"), list)
+                    else []
+                )
+                company_context = (
+                    last_interaction_payload.get("company_context")
+                    if isinstance(last_interaction_payload.get("company_context"), dict)
+                    else await _maybe_active_company_context()
                 )
 
                 if selected_action == "revise_answers" and "create_wizard_flow" in tool_names:
@@ -1993,10 +2596,29 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         existing_responses = (
                             raw_response.get("all_responses")
                             if isinstance(raw_response.get("all_responses"), dict)
+                            else saved_workflow_state.get("existing_responses")
+                            if isinstance(saved_workflow_state, dict) and isinstance(saved_workflow_state.get("existing_responses"), dict)
                             else {}
                         )
                         if existing_responses:
                             interaction_output["existing_responses"] = existing_responses
+                        workflow_state = {
+                            "workflow": "inventory_onboarding",
+                            "status": "collecting",
+                            "stage": "wizard",
+                            "scope": selected_scope,
+                            "summary": onboarding_summary,
+                            "onboarding_data": onboarding_data,
+                            "pending_interaction": interaction_output,
+                            "created_operations": created_operations,
+                        }
+                        if company_context:
+                            workflow_state["company_context"] = company_context
+                        await _save_workflow_state(
+                            context_id=task.context_id,
+                            metadata=metadata,
+                            workflow_state=workflow_state,
+                        )
                         response_text = json.dumps(interaction_output, ensure_ascii=False)
                         response_parts = [DataPart(data=interaction_output)]
                         yield Artifact(name="result", parts=response_parts)
@@ -2010,7 +2632,8 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         )
                         return
 
-                if selected_action != "create_now" or "delegate_to_agent" not in tool_names:
+                if selected_action == "cancel_onboarding":
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
                     response_text = "Onboarding canceled for now. When you are ready, I can restart the setup flow."
                     response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)
@@ -2033,137 +2656,239 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     )
                     return
 
-                target_agent = _onboarding_target_agent(selected_scope)
                 yield TaskStatus(
                     state=TaskState.working,
                     message=Message(
                         role=Role.agent,
-                        parts=[TextPart(text=f"Submitting this onboarding plan to the {target_agent} specialist agent.")],
+                        parts=[TextPart(text="Applying the onboarding setup plan now.")],
                         context_id=task.context_id,
                     ),
                 )
 
-                try:
-                    delegated = await tool_executor.call_tool(
-                        name="delegate_to_agent",
-                        arguments={
-                            "request": _onboarding_creation_request(selected_scope, onboarding_data),
-                            "agent_name": target_agent,
-                        },
-                        ctx=tool_ctx,
-                    )
-                except Exception as exc:
-                    response_text = str(exc).strip() or "Onboarding submission failed."
-                    response_parts = [TextPart(text=response_text)]
-                    yield Artifact(name="result", parts=response_parts)
-                    yield TaskStatus(
-                        state=TaskState.failed,
-                        message=Message(
-                            role=Role.agent,
-                            parts=response_parts,
-                            context_id=task.context_id,
-                        ),
-                    )
-                    await _maybe_update_memory(
-                        llm=llm,
-                        context_id=task.context_id,
-                        metadata=metadata,
-                        existing=mem,
-                        history=history if isinstance(history, list) else None,
-                        user_text=user_text_for_memory,
-                        assistant_text=response_text,
-                    )
-                    return
+                planned_operations = _onboarding_plan_operations(
+                    scope=selected_scope,
+                    onboarding_data=onboarding_data,
+                    tool_specs=tool_specs,
+                    company_context=company_context,
+                )
+                created_map = {
+                    key: value for key, value in created_operations.items() if isinstance(value, dict)
+                }
+                failed_items: list[dict[str, Any]] = []
+                any_tool_executed = False
 
-                delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=target_agent)
-                if delegated_response is None:
-                    response_text = "Onboarding submission did not return a usable result."
-                    response_parts = [TextPart(text=response_text)]
-                    yield Artifact(name="result", parts=response_parts)
-                    yield TaskStatus(
-                        state=TaskState.failed,
-                        message=Message(
-                            role=Role.agent,
-                            parts=response_parts,
-                            context_id=task.context_id,
-                        ),
-                    )
-                    await _maybe_update_memory(
-                        llm=llm,
-                        context_id=task.context_id,
-                        metadata=metadata,
-                        existing=mem,
-                        history=history if isinstance(history, list) else None,
-                        user_text=user_text_for_memory,
-                        assistant_text=response_text,
-                    )
-                    return
-
-                yield Artifact(
-                    name="delegation",
-                    parts=[
-                        DataPart(
-                            data={
-                                "selectedAgent": delegated_response["delegated_agent"],
-                                "delegatedTaskId": delegated_response["delegated_task_id"],
-                                "finalState": delegated_response["delegated_final_state"].value,
-                                "statusUpdates": delegated_response["status_updates"],
+                for operation in planned_operations:
+                    semantic_key = str(operation.get("semantic_key") or "").strip()
+                    if not semantic_key or semantic_key in created_map:
+                        continue
+                    tool_name = str(operation.get("tool_name") or "").strip()
+                    if tool_name not in tool_names:
+                        failed_items.append(
+                            {
+                                "label": operation.get("label"),
+                                "tool_name": tool_name,
+                                "reason": "tool_unavailable",
                             }
                         )
-                    ],
-                )
-
-                for update in delegated_response["status_updates"]:
-                    if not isinstance(update, dict) or bool(update.get("final")):
                         continue
-                    state_value = _coerce_task_state(update.get("state"), default=TaskState.working)
-                    message_text = _format_delegation_status_text(
-                        agent_name=delegated_response["delegated_agent"],
-                        state=state_value,
-                        message=str(update.get("message") or "").strip() or None,
-                    )
-                    yield TaskStatus(
-                        state=state_value,
-                        message=Message(
-                            role=Role.agent,
-                            parts=[TextPart(text=message_text)],
+                    missing_required = operation.get("missing_required")
+                    if isinstance(missing_required, list) and missing_required:
+                        failed_items.append(
+                            {
+                                "label": operation.get("label"),
+                                "tool_name": tool_name,
+                                "reason": "missing_required_arguments",
+                                "missing": list(missing_required),
+                            }
+                        )
+                        continue
+
+                    try:
+                        output = await tool_executor.call_tool(
+                            name=tool_name,
+                            arguments=operation.get("arguments") if isinstance(operation.get("arguments"), dict) else {},
+                            ctx=tool_ctx,
+                        )
+                        any_tool_executed = True
+                        created_map[semantic_key] = {
+                            "label": operation.get("label"),
+                            "tool_name": tool_name,
+                            "operation_type": operation.get("operation_type"),
+                            "arguments": operation.get("arguments"),
+                            "result": output if isinstance(output, dict) else {"value": str(output)},
+                        }
+                    except Exception as exc:
+                        failed_items.append(
+                            {
+                                "label": operation.get("label"),
+                                "tool_name": tool_name,
+                                "reason": "tool_error",
+                                "error": str(exc),
+                            }
+                        )
+
+                if not any_tool_executed and not created_map and "delegate_to_agent" in tool_names:
+                    fallback_agent = _onboarding_target_agent(selected_scope)
+                    try:
+                        delegated = await tool_executor.call_tool(
+                            name="delegate_to_agent",
+                            arguments={
+                                "request": _onboarding_creation_request(selected_scope, onboarding_data),
+                                "agent_name": fallback_agent,
+                            },
+                            ctx=tool_ctx,
+                        )
+                    except Exception as exc:
+                        failed_items.append({"label": "delegated onboarding submission", "reason": "tool_error", "error": str(exc)})
+                    else:
+                        delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=fallback_agent)
+                        if delegated_response is not None:
+                            yield Artifact(
+                                name="delegation",
+                                parts=[
+                                    DataPart(
+                                        data={
+                                            "selectedAgent": delegated_response["delegated_agent"],
+                                            "delegatedTaskId": delegated_response["delegated_task_id"],
+                                            "finalState": delegated_response["delegated_final_state"].value,
+                                            "statusUpdates": delegated_response["status_updates"],
+                                        }
+                                    )
+                                ],
+                            )
+                            for update in delegated_response["status_updates"]:
+                                if not isinstance(update, dict) or bool(update.get("final")):
+                                    continue
+                                state_value = _coerce_task_state(update.get("state"), default=TaskState.working)
+                                message_text = _format_delegation_status_text(
+                                    agent_name=delegated_response["delegated_agent"],
+                                    state=state_value,
+                                    message=str(update.get("message") or "").strip() or None,
+                                )
+                                yield TaskStatus(
+                                    state=state_value,
+                                    message=Message(
+                                        role=Role.agent,
+                                        parts=[TextPart(text=message_text)],
+                                        context_id=task.context_id,
+                                    ),
+                                )
+                            response_parts = delegated_response["response_parts"]
+                            response_text = delegated_response["response_text"]
+                            yield Artifact(name="result", parts=response_parts)
+                            yield TaskStatus(
+                                state=delegated_response["delegated_final_state"],
+                                message=Message(
+                                    role=Role.agent,
+                                    parts=response_parts,
+                                    context_id=task.context_id,
+                                ),
+                            )
+                            if delegated_response["delegated_final_state"] == TaskState.input_required:
+                                await _save_workflow_state(
+                                    context_id=task.context_id,
+                                    metadata=metadata,
+                                    workflow_state={
+                                        "workflow": "inventory_onboarding",
+                                        "status": "awaiting_input",
+                                        "stage": "delegated_follow_up",
+                                        "scope": selected_scope,
+                                        "summary": onboarding_summary,
+                                        "onboarding_data": onboarding_data,
+                                        "pending_interaction": delegated_response["response_parts"][0].data
+                                        if delegated_response["response_parts"]
+                                        and isinstance(delegated_response["response_parts"][0], DataPart)
+                                        else None,
+                                        "created_operations": created_map,
+                                    },
+                                )
+                                return
+                            await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+                            await _maybe_update_memory(
+                                llm=llm,
+                                context_id=task.context_id,
+                                metadata=metadata,
+                                existing=mem,
+                                history=history if isinstance(history, list) else None,
+                                user_text=user_text_for_memory,
+                                assistant_text=response_text,
+                            )
+                            return
+
+                if failed_items and "create_multiple_choice" in tool_names:
+                    try:
+                        interaction_output = await tool_executor.call_tool(
+                            name="create_multiple_choice",
+                            arguments=_onboarding_retry_picker_arguments(
+                                summary=onboarding_summary,
+                                created_operations=created_map,
+                                failed_operations=failed_items,
+                            ),
+                            ctx=tool_ctx,
+                        )
+                    except Exception:
+                        interaction_output = None
+
+                    if isinstance(interaction_output, dict):
+                        interaction_output = _with_interaction_metadata(
+                            interaction_output,
+                            workflow="inventory_onboarding",
+                            workflow_stage="retry",
+                            onboarding_scope=selected_scope,
+                            onboarding_data=onboarding_data,
+                            onboarding_summary=onboarding_summary,
+                            created_operations=created_map,
+                            failed_operations=failed_items,
+                        )
+                        if company_context:
+                            interaction_output["company_context"] = company_context
+                        workflow_state = {
+                            "workflow": "inventory_onboarding",
+                            "status": "partial_failure",
+                            "stage": "retry",
+                            "scope": selected_scope,
+                            "summary": onboarding_summary,
+                            "onboarding_data": onboarding_data,
+                            "pending_interaction": interaction_output,
+                            "created_operations": created_map,
+                            "failed_operations": failed_items,
+                        }
+                        if company_context:
+                            workflow_state["company_context"] = company_context
+                        await _save_workflow_state(
                             context_id=task.context_id,
-                        ),
-                    )
+                            metadata=metadata,
+                            workflow_state=workflow_state,
+                        )
+                        response_text = json.dumps(interaction_output, ensure_ascii=False)
+                        response_parts = [DataPart(data=interaction_output)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
 
-                for artifact_name, payload in delegated_response["child_artifacts"].items():
-                    if not isinstance(artifact_name, str) or not artifact_name.strip():
-                        continue
-                    parts = _ka2a_parts_from_model_content(payload)
-                    if parts:
-                        yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
-
-                response_parts = delegated_response["response_parts"]
-                response_text = delegated_response["response_text"]
-                if (
-                    selected_scope == "full_setup"
-                    and isinstance(onboarding_data.get("flat"), dict)
-                    and onboarding_data["flat"].get("continue_to_product_onboarding") is True
-                    and delegated_response["delegated_final_state"] == TaskState.completed
-                ):
-                    response_text = (
-                        f"{response_text}\n\nFoundation setup is ready. When you are ready, I can continue with product onboarding."
-                    ).strip()
-                    response_parts = [TextPart(text=response_text)]
-
+                response_text = _onboarding_completed_text(created_map)
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(
+                    name="onboarding.created_operations",
+                    parts=[DataPart(data={"operations": created_map})],
+                )
                 yield Artifact(name="result", parts=response_parts)
                 yield TaskStatus(
-                    state=delegated_response["delegated_final_state"],
+                    state=TaskState.completed,
                     message=Message(
                         role=Role.agent,
                         parts=response_parts,
                         context_id=task.context_id,
                     ),
                 )
-
-                if delegated_response["delegated_final_state"] == TaskState.input_required:
-                    return
-
+                await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
                 await _maybe_update_memory(
                     llm=llm,
                     context_id=task.context_id,
@@ -2175,11 +2900,47 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 )
                 return
 
-            if "create_multiple_choice" in tool_names and user_text_for_memory:
+            if "create_multiple_choice" in tool_names:
+                if saved_workflow_state and user_text_for_memory:
+                    normalized_text = _normalize_user_text(user_text_for_memory)
+                    if not any(phrase in normalized_text for phrase in ("start over", "restart", "new onboarding")):
+                        try:
+                            interaction_output = await tool_executor.call_tool(
+                                name="create_multiple_choice",
+                                arguments=_onboarding_resume_picker_arguments(saved_workflow_state),
+                                ctx=tool_ctx,
+                            )
+                        except Exception:
+                            interaction_output = None
+                        if isinstance(interaction_output, dict):
+                            interaction_output = _with_interaction_metadata(
+                                interaction_output,
+                                workflow="inventory_onboarding",
+                                workflow_stage="resume_prompt",
+                            )
+                            response_text = json.dumps(interaction_output, ensure_ascii=False)
+                            response_parts = [DataPart(data=interaction_output)]
+                            yield Artifact(name="result", parts=response_parts)
+                            yield TaskStatus(
+                                state=TaskState.input_required,
+                                message=Message(
+                                    role=Role.agent,
+                                    parts=response_parts,
+                                    context_id=task.context_id,
+                                ),
+                            )
+                            return
+
+                company_context = await _maybe_active_company_context()
+                description = "Choose the setup area you want to complete first. I will guide you step by step."
+                if isinstance(company_context, dict):
+                    company_name = str(company_context.get("name") or "").strip()
+                    if company_name:
+                        description = f"Current company: {company_name}\n\n{description}"
                 try:
                     interaction_output = await tool_executor.call_tool(
                         name="create_multiple_choice",
-                        arguments=_onboarding_scope_picker_arguments(),
+                        arguments=_onboarding_scope_picker_arguments(description=description),
                         ctx=tool_ctx,
                     )
                 except Exception:
@@ -2190,6 +2951,19 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         interaction_output,
                         workflow="inventory_onboarding",
                         workflow_stage="scope_picker",
+                    )
+                    workflow_state = {
+                        "workflow": "inventory_onboarding",
+                        "status": "awaiting_scope",
+                        "stage": "scope_picker",
+                        "pending_interaction": interaction_output,
+                    }
+                    if company_context:
+                        workflow_state["company_context"] = company_context
+                    await _save_workflow_state(
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        workflow_state=workflow_state,
                     )
                     response_text = json.dumps(interaction_output, ensure_ascii=False)
                     response_parts = [DataPart(data=interaction_output)]

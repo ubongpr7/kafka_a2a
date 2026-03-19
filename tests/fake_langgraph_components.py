@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from types import SimpleNamespace
 from typing import Any
 
@@ -36,8 +35,19 @@ class FakeInteractionLlm:
 
 
 class FakeToolExecutor(ToolExecutor):
+    def __init__(
+        self,
+        *,
+        agent_name: str | None = None,
+        hidden_agents: set[str] | None = None,
+        failing_tools: set[str] | None = None,
+    ) -> None:
+        self._agent_name = (agent_name or "").strip() or None
+        self._hidden_agents = set(hidden_agents or set())
+        self._failing_tools = set(failing_tools or set())
+
     def _agents(self) -> list[dict[str, Any]]:
-        return [
+        agents = [
             {
                 "name": "onboarding",
                 "description": "Workflow specialist agent for guided inventory onboarding and setup.",
@@ -99,10 +109,12 @@ class FakeToolExecutor(ToolExecutor):
                 ],
             },
         ]
+        if not self._hidden_agents:
+            return agents
+        return [agent for agent in agents if agent["name"] not in self._hidden_agents]
 
-    async def list_tools(self, *, ctx: ToolContext) -> list[ToolSpec]:
-        _ = ctx
-        return [
+    def _tool_specs(self) -> list[ToolSpec]:
+        specs = [
             ToolSpec(
                 name="list_available_agents",
                 description="List downstream specialist agents.",
@@ -151,10 +163,74 @@ class FakeToolExecutor(ToolExecutor):
                 },
             ),
         ]
+        if self._agent_name != "onboarding":
+            return specs
+        return specs + [
+            ToolSpec(
+                name="users.get_active_company_profile",
+                description="Fetch the active company profile.",
+                input_schema={"type": "object", "properties": {}, "required": []},
+            ),
+            ToolSpec(
+                name="inventory.create_stock_location",
+                description="Create a stock location.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "type": {"type": "string"},
+                        "is_primary": {"type": "boolean"},
+                    },
+                    "required": ["name"],
+                },
+            ),
+            ToolSpec(
+                name="inventory.create_inventory_category",
+                description="Create an inventory category.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                },
+            ),
+            ToolSpec(
+                name="inventory.create_inventory",
+                description="Create an inventory ledger.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "location_name": {"type": "string"},
+                        "category_name": {"type": "string"},
+                    },
+                    "required": ["name"],
+                },
+            ),
+            ToolSpec(
+                name="product.create_product",
+                description="Create a product.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "category_name": {"type": "string"},
+                        "pos_ready": {"type": "boolean"},
+                    },
+                    "required": ["name"],
+                },
+            ),
+        ]
+
+    async def list_tools(self, *, ctx: ToolContext) -> list[ToolSpec]:
+        _ = ctx
+        return self._tool_specs()
 
     async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
         _ = ctx
         FAKE_TOOL_CALLS.append((name, dict(arguments)))
+        if name in self._failing_tools:
+            raise RuntimeError(f"Simulated failure for {name}")
         if name == "list_available_agents":
             return {"agents": self._agents()}
         if name == "delegate_to_agent":
@@ -376,12 +452,43 @@ class FakeToolExecutor(ToolExecutor):
                 "allow_back": bool(arguments.get("allow_back")),
                 "show_progress": bool(arguments.get("show_progress")),
             }
+        if name == "users.get_active_company_profile":
+            return {
+                "id": "company-1",
+                "name": "Intera Demo Company",
+            }
+        if name == "inventory.create_stock_location":
+            return {
+                "id": f"stock-location-{arguments.get('name','').lower().replace(' ', '-')}",
+                "name": arguments.get("name"),
+                "type": arguments.get("type"),
+            }
+        if name == "inventory.create_inventory_category":
+            return {
+                "id": f"inventory-category-{arguments.get('name','').lower().replace(' ', '-')}",
+                "name": arguments.get("name"),
+            }
+        if name == "inventory.create_inventory":
+            return {
+                "id": f"inventory-{arguments.get('name','').lower().replace(' ', '-')}",
+                "name": arguments.get("name"),
+            }
+        if name == "product.create_product":
+            return {
+                "id": f"product-{arguments.get('name','').lower().replace(' ', '-')}",
+                "name": arguments.get("name"),
+            }
         raise AssertionError(f"Unexpected tool call: {name}")
 
 
 class FakeToolExecutorWithoutUsers(FakeToolExecutor):
-    def _agents(self) -> list[dict[str, Any]]:
-        return [agent for agent in super()._agents() if agent["name"] != "users"]
+    def __init__(self, *, agent_name: str | None = None) -> None:
+        super().__init__(agent_name=agent_name, hidden_agents={"users"})
+
+
+class FakeToolExecutorWithCategoryFailures(FakeToolExecutor):
+    def __init__(self, *, agent_name: str | None = None) -> None:
+        super().__init__(agent_name=agent_name, failing_tools={"inventory.create_inventory_category"})
 
 
 def fake_llm_factory(*args: Any, **kwargs: Any) -> Any:
@@ -394,12 +501,16 @@ def fake_interaction_llm_factory(*args: Any, **kwargs: Any) -> Any:
     return FakeInteractionLlm()
 
 
-def build_fake_tool_executor() -> ToolExecutor:
-    return FakeToolExecutor()
+def build_fake_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:
+    return FakeToolExecutor(agent_name=agent_name)
 
 
-def build_fake_tool_executor_without_users() -> ToolExecutor:
-    return FakeToolExecutorWithoutUsers()
+def build_fake_tool_executor_without_users(*, agent_name: str | None = None) -> ToolExecutor:
+    return FakeToolExecutorWithoutUsers(agent_name=agent_name)
+
+
+def build_fake_tool_executor_with_category_failures(*, agent_name: str | None = None) -> ToolExecutor:
+    return FakeToolExecutorWithCategoryFailures(agent_name=agent_name)
 
 
 def reset_fake_components() -> None:

@@ -1,6 +1,52 @@
 {
   "version": 1,
   "agents": {
+    "onboarding": {
+      "servers": [
+        {
+          "id": "users",
+          "serverUrl": "http://users-mcp:8000/mcp/",
+          "toolNamePrefix": "users.",
+          "auth": {
+            "mode": "forward_bearer"
+          },
+          "tools": [
+            "list_accessible_company_profiles",
+            "get_active_company_profile",
+            "search_company_staff"
+          ]
+        },
+        {
+          "id": "products",
+          "serverUrl": "http://products-mcp:8000/mcp/",
+          "toolNamePrefix": "product.",
+          "auth": {
+            "mode": "forward_bearer"
+          },
+          "tools": [
+            "create_product",
+            "create_product_variant",
+            "get_product_categories"
+          ]
+        },
+        {
+          "id": "inventory",
+          "serverUrl": "http://inventory-mcp:8000/mcp/",
+          "toolNamePrefix": "inventory.",
+          "auth": {
+            "mode": "forward_bearer"
+          },
+          "tools": [
+            "search_inventories",
+            "search_stock_locations",
+            "list_inventory_categories",
+            "create_inventory_category",
+            "create_inventory",
+            "create_stock_location"
+          ]
+        }
+      ]
+    },
     "users": {
       "servers": [
         {
