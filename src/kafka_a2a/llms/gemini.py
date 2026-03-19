@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 from kafka_a2a.credentials import ResolvedLlmCredentials
 from kafka_a2a.llms.chat_model import ChatResponse
 from kafka_a2a.llms.controls import RetryConfig, backoff_delay_s, llm_semaphore
+from kafka_a2a.tools import ToolSpec
 
 
 def _normalize_base_url(base_url: str | None) -> str:
@@ -121,6 +122,81 @@ def _to_gemini_contents(messages: Iterable[Any]) -> tuple[str | None, list[dict[
     return system_text, contents
 
 
+def _json_schema_to_gemini_schema(schema: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(schema, dict):
+        return None
+
+    type_map = {
+        "object": "OBJECT",
+        "string": "STRING",
+        "number": "NUMBER",
+        "integer": "INTEGER",
+        "boolean": "BOOLEAN",
+        "array": "ARRAY",
+    }
+
+    raw_type = str(schema.get("type") or "").strip().lower()
+    out: dict[str, Any] = {}
+    if raw_type in type_map:
+        out["type"] = type_map[raw_type]
+
+    description = schema.get("description")
+    if isinstance(description, str) and description.strip():
+        out["description"] = description.strip()
+
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and enum_values:
+        out["enum"] = [value for value in enum_values if isinstance(value, (str, int, float, bool))]
+
+    properties = schema.get("properties")
+    if isinstance(properties, dict) and properties:
+        converted_properties: dict[str, Any] = {}
+        for key, value in properties.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            converted = _json_schema_to_gemini_schema(value)
+            if converted:
+                converted_properties[key] = converted
+        if converted_properties:
+            out["properties"] = converted_properties
+            out.setdefault("type", "OBJECT")
+
+    required = schema.get("required")
+    if isinstance(required, list):
+        required_fields = [item for item in required if isinstance(item, str) and item.strip()]
+        if required_fields:
+            out["required"] = required_fields
+
+    items = schema.get("items")
+    if isinstance(items, dict):
+        converted_items = _json_schema_to_gemini_schema(items)
+        if converted_items:
+            out["items"] = converted_items
+            out.setdefault("type", "ARRAY")
+
+    return out or None
+
+
+def _to_gemini_function_declarations(tools: Iterable[ToolSpec] | None) -> list[dict[str, Any]]:
+    declarations: list[dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool.name, str) or not tool.name.strip():
+            continue
+        declaration: dict[str, Any] = {"name": tool.name.strip()}
+        if isinstance(tool.description, str) and tool.description.strip():
+            declaration["description"] = tool.description.strip()
+
+        parameters = _json_schema_to_gemini_schema(tool.input_schema if isinstance(tool.input_schema, dict) else None)
+        # Gemini rejects OBJECT parameters with empty properties for no-arg tools.
+        if isinstance(parameters, dict):
+            props = parameters.get("properties")
+            if parameters.get("type") != "OBJECT" or (isinstance(props, dict) and props):
+                declaration["parameters"] = parameters
+
+        declarations.append(declaration)
+    return declarations
+
+
 class UpstreamHttpError(RuntimeError):
     def __init__(self, *, status: int, body: str, headers: dict[str, str] | None = None) -> None:
         super().__init__(f"HTTP {status}")
@@ -143,7 +219,7 @@ class GeminiChatModel:
     timeout_s: float = 60.0
     extra: dict[str, Any] | None = None
 
-    async def ainvoke(self, messages: Iterable[Any], **_: Any) -> ChatResponse:
+    async def ainvoke(self, messages: Iterable[Any], **kwargs: Any) -> ChatResponse:
         system_text, contents = _to_gemini_contents(messages)
         if not contents:
             contents = [{"role": "user", "parts": [{"text": ""}]}]
@@ -151,6 +227,15 @@ class GeminiChatModel:
         payload: dict[str, Any] = {"contents": contents}
         if system_text:
             payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+
+        function_declarations = _to_gemini_function_declarations(kwargs.get("tools"))
+        if function_declarations:
+            payload["tools"] = [{"functionDeclarations": function_declarations}]
+            payload["toolConfig"] = {
+                "functionCallingConfig": {
+                    "mode": "AUTO",
+                }
+            }
 
         # Allow passing Gemini request options via creds.extra (e.g. generationConfig).
         if self.extra:

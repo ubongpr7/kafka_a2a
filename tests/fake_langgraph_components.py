@@ -8,21 +8,28 @@ from kafka_a2a.tools import ToolContext, ToolExecutor, ToolSpec
 
 FAKE_LLM_CALL_COUNT = 0
 FAKE_TOOL_CALLS: list[tuple[str, dict[str, Any]]] = []
+FAKE_LLM_LAST_TOOLS: list[str] = []
 
 
 class FakeLlm:
-    async def ainvoke(self, messages: list[Any]) -> Any:
+    async def ainvoke(self, messages: list[Any], **kwargs: Any) -> Any:
         global FAKE_LLM_CALL_COUNT
+        global FAKE_LLM_LAST_TOOLS
         _ = messages
         FAKE_LLM_CALL_COUNT += 1
+        tools = kwargs.get("tools")
+        FAKE_LLM_LAST_TOOLS = [tool.name for tool in tools] if isinstance(tools, list) else []
         return SimpleNamespace(content="This should not be used for delegated host requests.")
 
 
 class FakeInteractionLlm:
-    async def ainvoke(self, messages: list[Any]) -> Any:
+    async def ainvoke(self, messages: list[Any], **kwargs: Any) -> Any:
         global FAKE_LLM_CALL_COUNT
+        global FAKE_LLM_LAST_TOOLS
         _ = messages
+        tools = kwargs.get("tools")
         FAKE_LLM_CALL_COUNT += 1
+        FAKE_LLM_LAST_TOOLS = [tool.name for tool in tools] if isinstance(tools, list) else []
         return SimpleNamespace(
             content='{"interaction_type":"dynamic_form","title":"Need more detail","description":"Pick an inventory.","fields":[{"name":"inventory","label":"Inventory","type":"text","required":true}]}'
         )
@@ -175,5 +182,7 @@ def build_fake_tool_executor() -> ToolExecutor:
 
 def reset_fake_components() -> None:
     global FAKE_LLM_CALL_COUNT
+    global FAKE_LLM_LAST_TOOLS
     FAKE_LLM_CALL_COUNT = 0
+    FAKE_LLM_LAST_TOOLS = []
     FAKE_TOOL_CALLS.clear()

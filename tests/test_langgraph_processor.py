@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.fake_langgraph_components import FAKE_LLM_CALL_COUNT, FAKE_TOOL_CALLS, reset_fake_components
+from tests import fake_langgraph_components
 from kafka_a2a.langgraph_processor import (
     _is_host_introspection_query,
     _normalize_tool_call_payload,
@@ -17,7 +17,7 @@ from kafka_a2a.tools import ToolSpec
 
 @pytest.fixture(autouse=True)
 def _reset_test_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    reset_fake_components()
+    fake_langgraph_components.reset_fake_components()
 
     monkeypatch.setenv("KA2A_LLM_CREDENTIALS_SOURCE", "env")
     monkeypatch.setenv("KA2A_LLM_PROVIDER", "openai_compat")
@@ -131,8 +131,8 @@ async def test_host_auto_delegates_and_waits_for_specialist_result() -> None:
 
     events = [event async for event in processor(task, message, None, None)]
 
-    assert FAKE_LLM_CALL_COUNT == 0
-    assert FAKE_TOOL_CALLS == [
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
         ("list_available_agents", {}),
         ("delegate_to_agent", {"request": "help me search for the product t-shirt", "agent_name": "product"}),
     ]
@@ -210,3 +210,25 @@ async def test_specialist_interaction_payload_yields_input_required(monkeypatch:
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_specialist_tool_loop_passes_tool_specs_to_model() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="product")
+    task = Task(
+        id="task-4",
+        context_id="ctx-4",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="summarize your available tooling")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="summarize your available tooling")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 1
+    assert fake_langgraph_components.FAKE_LLM_LAST_TOOLS == ["list_available_agents", "delegate_to_agent"]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == "This should not be used for delegated host requests."

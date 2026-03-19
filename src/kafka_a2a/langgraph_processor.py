@@ -922,7 +922,7 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             messages2: list[Any] = list(lc_messages)
 
             for _ in range(steps + 1):
-                resp = await llm.ainvoke(messages2)
+                resp = await llm.ainvoke(messages2, tools=tool_specs)
                 messages2.append(AIMessage(content=resp.content))
 
                 parts = _parts_from_model_content(resp.content, tool_names=tool_names)
