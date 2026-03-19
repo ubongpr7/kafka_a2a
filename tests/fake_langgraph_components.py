@@ -486,6 +486,11 @@ class FakeToolExecutorWithoutUsers(FakeToolExecutor):
         super().__init__(agent_name=agent_name, hidden_agents={"users"})
 
 
+class FakeToolExecutorWithoutUsersOrOnboarding(FakeToolExecutor):
+    def __init__(self, *, agent_name: str | None = None) -> None:
+        super().__init__(agent_name=agent_name, hidden_agents={"users", "onboarding"})
+
+
 class FakeToolExecutorWithCategoryFailures(FakeToolExecutor):
     def __init__(self, *, agent_name: str | None = None) -> None:
         super().__init__(agent_name=agent_name, failing_tools={"inventory.create_inventory_category"})
@@ -507,6 +512,10 @@ def build_fake_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:
 
 def build_fake_tool_executor_without_users(*, agent_name: str | None = None) -> ToolExecutor:
     return FakeToolExecutorWithoutUsers(agent_name=agent_name)
+
+
+def build_fake_tool_executor_without_users_or_onboarding(*, agent_name: str | None = None) -> ToolExecutor:
+    return FakeToolExecutorWithoutUsersOrOnboarding(agent_name=agent_name)
 
 
 def build_fake_tool_executor_with_category_failures(*, agent_name: str | None = None) -> ToolExecutor:

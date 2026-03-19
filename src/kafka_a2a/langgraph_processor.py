@@ -208,7 +208,19 @@ def _normalize_tool_call_payload(value: Any, *, tool_names: set[str]) -> Any:
 
 
 def _normalize_user_text(value: str) -> str:
-    return " ".join((value or "").strip().lower().split())
+    text = " ".join((value or "").strip().lower().split())
+    if not text:
+        return ""
+    substitutions = (
+        (r"\bu\b", "you"),
+        (r"\bur\b", "your"),
+        (r"\bon[\s-]+boarding\b", "onboarding"),
+        (r"\bon[\s-]+board\b", "onboarding"),
+        (r"\bonoarding\b", "onboarding"),
+    )
+    for pattern, replacement in substitutions:
+        text = re.sub(pattern, replacement, text)
+    return " ".join(text.split())
 
 
 QUERY_TOKEN_ALLOWLIST: set[str] = {"pos", "sku", "api", "ui"}
@@ -474,6 +486,27 @@ def _is_host_capability_picker_query(value: str) -> bool:
     return False
 
 
+def _is_host_availability_query(value: str) -> bool:
+    text = _normalize_user_text(value)
+    if not text:
+        return False
+    phrases = (
+        "is the",
+        "is onboarding",
+        "active",
+        "available",
+        "not active",
+        "not available",
+        "why is it not",
+        "why isn't",
+        "why is onboarding",
+        "error",
+        "error message",
+        "what is wrong",
+    )
+    return any(phrase in text for phrase in phrases)
+
+
 def _is_host_capability_picker_payload(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -529,6 +562,23 @@ def _host_follow_up_request_for_agent(agent_name: str) -> str:
         f"The user selected {label} from the host menu. "
         "Briefly explain what kinds of tasks you can help with in this domain, "
         "using a concise user-facing summary."
+    )
+
+
+def _host_unavailable_agent_text(*, agent_name: str, available_names: set[str]) -> str:
+    label = _friendly_agent_label(agent_name)
+    if available_names:
+        available_labels = ", ".join(_friendly_agent_label(name) for name in sorted(available_names))
+        return (
+            f"{label} is not active in the current agent directory. "
+            f"The host currently sees these available areas: {available_labels}. "
+            "There is no specialist error message to show here because the host did not delegate this request. "
+            "This looks like an availability or deployment issue, not a downstream task failure."
+        )
+    return (
+        f"{label} is not active in the current agent directory. "
+        "The host cannot currently see any downstream specialist agents. "
+        "There is no specialist error message to show here because delegation never started."
     )
 
 
@@ -2989,6 +3039,32 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             inferred_agent = _infer_domain_agent_name(user_text_for_memory)
             available_names = _available_agent_names(agent_summaries)
             if inferred_agent and available_names and inferred_agent not in available_names:
+                if _is_host_availability_query(user_text_for_memory):
+                    response_text = _host_unavailable_agent_text(
+                        agent_name=inferred_agent,
+                        available_names=available_names,
+                    )
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
                 if "create_multiple_choice" in tool_names:
                     try:
                         interaction_output = await tool_executor.call_tool(

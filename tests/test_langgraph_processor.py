@@ -128,11 +128,13 @@ def test_host_introspection_detection_preserves_domain_requests() -> None:
     assert _is_host_introspection_query("how can you help")
     assert _is_host_introspection_query("how many agents do you have?")
     assert _is_host_introspection_query("hi there!")
+    assert _is_host_introspection_query("what can u do for me")
     assert not _is_host_introspection_query("help me search for the product t-shirt")
 
 
 def test_host_capability_picker_detection() -> None:
     assert _is_host_capability_picker_query("what can you do for me?")
+    assert _is_host_capability_picker_query("what can u do for me")
     assert _is_host_capability_picker_query("send the list of what you can do so I can choose")
     assert not _is_host_capability_picker_query("help me check stock levels")
 
@@ -861,6 +863,118 @@ async def test_host_unavailable_selected_agent_reprompts_instead_of_misrouting(
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_host_free_text_onboarding_reply_after_picker_reprompts_when_onboarding_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "KA2A_TOOL_EXECUTOR",
+        "tests.fake_langgraph_components:build_fake_tool_executor_without_users_or_onboarding",
+    )
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Choose What You Need Help With",
+        "description": "Select the area you want help with. I can continue from your choice.",
+        "options": [
+            {"value": "product", "label": "Product Management"},
+            {"value": "inventory", "label": "Inventory Management"},
+            {"value": "pos", "label": "Point of Sale (POS)"},
+            {"value": "general", "label": "General Question"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
+    task = Task(
+        id="task-capability-free-text-onboarding",
+        context_id="ctx-capability-free-text-onboarding",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="i want to do inventory onoarding")]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="what can you do?")]),
+            Message(role=Role.agent, parts=[DataPart(data=picker_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="i want to do inventory onoarding")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        (
+            "create_multiple_choice",
+            {
+                "title": "Choose What You Need Help With",
+                "description": (
+                    "Inventory Onboarding is not currently available. "
+                    "Choose one of the areas that is available right now."
+                ),
+                "options": [
+                    {"value": "product", "label": "Product Management"},
+                    {"value": "inventory", "label": "Inventory Management"},
+                    {"value": "pos", "label": "Point of Sale (POS)"},
+                    {"value": "general", "label": "General Question"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_host_answers_unavailable_agent_diagnostics_without_misrouting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "KA2A_TOOL_EXECUTOR",
+        "tests.fake_langgraph_components:build_fake_tool_executor_without_users_or_onboarding",
+    )
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-capability-unavailable-diagnostics",
+        context_id="ctx-capability-unavailable-diagnostics",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text="why is the onboarding agent not active and can I see the error message")],
+            ),
+        ),
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text="why is the onboarding agent not active and can I see the error message")],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == (
+        "Inventory Onboarding is not active in the current agent directory. "
+        "The host currently sees these available areas: Inventory Management, Point of Sale (POS), Product Management. "
+        "There is no specialist error message to show here because the host did not delegate this request. "
+        "This looks like an availability or deployment issue, not a downstream task failure."
+    )
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.completed
 
 
 @pytest.mark.asyncio
