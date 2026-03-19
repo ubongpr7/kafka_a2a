@@ -438,8 +438,14 @@ def _is_host_introspection_query(value: str) -> bool:
 
     phrases = (
         "what agents",
+        "what agents do you have",
         "which agents",
         "available agents",
+        "registered agents",
+        "agents that you have",
+        "agents are registered",
+        "currently registered",
+        "currently active agents",
         "how many agents",
         "list agents",
         "show agents",
@@ -529,6 +535,12 @@ def _available_agent_names(agent_summaries: list[dict[str, Any]] | None) -> set[
     }
 
 
+def _agent_listing_names(agent_listing: dict[str, list[dict[str, Any]]] | None, key: str) -> set[str]:
+    if not isinstance(agent_listing, dict):
+        return set()
+    return _available_agent_names(agent_listing.get(key))
+
+
 def _host_capability_picker_arguments(
     agent_summaries: list[dict[str, Any]] | None = None,
     *,
@@ -565,8 +577,29 @@ def _host_follow_up_request_for_agent(agent_name: str) -> str:
     )
 
 
-def _host_unavailable_agent_text(*, agent_name: str, available_names: set[str]) -> str:
+def _host_unavailable_agent_text(
+    *,
+    agent_name: str,
+    available_names: set[str],
+    registered_names: set[str] | None = None,
+) -> str:
     label = _friendly_agent_label(agent_name)
+    registered = set(registered_names or set())
+    if agent_name in registered and agent_name not in available_names:
+        if available_names:
+            available_labels = ", ".join(_friendly_agent_label(name) for name in sorted(available_names))
+            return (
+                f"{label} is registered in the current agent directory, but it is not currently exposed to the host "
+                f"for routing. The host currently routes to these available areas: {available_labels}. "
+                "There is no specialist error message to show here because the host did not delegate this request. "
+                "This looks like a host or gateway configuration issue, such as the downstream allowlist, not a "
+                "downstream task failure."
+            )
+        return (
+            f"{label} is registered in the current agent directory, but it is not currently exposed to the host "
+            "for routing. There is no specialist error message to show here because delegation never started. "
+            "This looks like a host or gateway configuration issue, such as the downstream allowlist."
+        )
     if available_names:
         available_labels = ", ".join(_friendly_agent_label(name) for name in sorted(available_names))
         return (
@@ -1445,10 +1478,10 @@ def _infer_domain_agent_name(query: str) -> str | None:
     return scored[0][0]
 
 
-def _coerce_agent_summaries(value: Any) -> list[dict[str, Any]]:
+def _coerce_agent_summaries(value: Any, *, key: str = "agents") -> list[dict[str, Any]]:
     if not isinstance(value, dict):
         return []
-    agents = value.get("agents")
+    agents = value.get(key)
     if not isinstance(agents, list):
         return []
     out: list[dict[str, Any]] = []
@@ -1456,6 +1489,22 @@ def _coerce_agent_summaries(value: Any) -> list[dict[str, Any]]:
         if isinstance(item, dict) and isinstance(item.get("name"), str) and item.get("name"):
             out.append(item)
     return out
+
+
+def _coerce_agent_listing(value: Any) -> dict[str, list[dict[str, Any]]]:
+    visible_agents = _coerce_agent_summaries(value, key="agents")
+    registered_agents = _coerce_agent_summaries(value, key="registered_agents")
+    hidden_agents = _coerce_agent_summaries(value, key="hidden_agents")
+    if not registered_agents and visible_agents:
+        registered_agents = list(visible_agents)
+    if not hidden_agents and registered_agents:
+        visible_names = _available_agent_names(visible_agents)
+        hidden_agents = [item for item in registered_agents if str(item.get("name") or "") not in visible_names]
+    return {
+        "agents": visible_agents,
+        "registered_agents": registered_agents,
+        "hidden_agents": hidden_agents,
+    }
 
 
 def _score_agent_summary(summary: dict[str, Any], query: str) -> int:
@@ -2091,28 +2140,78 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
         response_parts: list[Any] = []
         response_text = ""
         response_state_override: TaskState | None = None
-        host_agent_summaries: list[dict[str, Any]] | None = None
+        host_agent_listing: dict[str, list[dict[str, Any]]] | None = None
 
-        async def _load_host_agent_summaries() -> list[dict[str, Any]]:
-            nonlocal host_agent_summaries
-            if host_agent_summaries is not None:
-                return host_agent_summaries
+        async def _load_host_agent_listing() -> dict[str, list[dict[str, Any]]]:
+            nonlocal host_agent_listing
+            if host_agent_listing is not None:
+                return host_agent_listing
             if agent_name != "host" or tool_executor is None or "list_available_agents" not in tool_names:
-                host_agent_summaries = []
-                return host_agent_summaries
+                host_agent_listing = {"agents": [], "registered_agents": [], "hidden_agents": []}
+                return host_agent_listing
             try:
                 listed_agents = await tool_executor.call_tool(
                     name="list_available_agents",
                     arguments={},
                     ctx=tool_ctx,
                 )
-                host_agent_summaries = _coerce_agent_summaries(listed_agents)
+                host_agent_listing = _coerce_agent_listing(listed_agents)
             except Exception:
-                host_agent_summaries = []
-            return host_agent_summaries
+                host_agent_listing = {"agents": [], "registered_agents": [], "hidden_agents": []}
+            return host_agent_listing
 
         last_interaction_payload = _last_agent_interaction_payload(task)
         interaction_response = _interaction_response_from_text(user_text_for_memory)
+
+        if (
+            agent_name == "host"
+            and tool_executor is not None
+            and "list_available_agents" in tool_names
+            and user_text_for_memory
+            and _is_host_introspection_query(user_text_for_memory)
+            and not _is_host_capability_picker_query(user_text_for_memory)
+        ):
+            agent_listing = await _load_host_agent_listing()
+            available_names = sorted(_agent_listing_names(agent_listing, "agents"))
+            registered_names = sorted(_agent_listing_names(agent_listing, "registered_agents"))
+            if registered_names:
+                labels = ", ".join(_friendly_agent_label(name) for name in registered_names)
+                if available_names != registered_names:
+                    visible_labels = ", ".join(_friendly_agent_label(name) for name in available_names)
+                    if visible_labels:
+                        response_text = (
+                            f"Currently registered specialist agents: {labels}. "
+                            f"The host is currently configured to route to: {visible_labels}."
+                        )
+                    else:
+                        response_text = (
+                            f"Currently registered specialist agents: {labels}. "
+                            "None of them are currently exposed to the host for routing."
+                        )
+                else:
+                    response_text = f"Currently registered specialist agents: {labels}."
+            else:
+                response_text = "No downstream specialist agents are currently visible in the agent directory."
+            response_parts = [TextPart(text=response_text)]
+            yield Artifact(name="result", parts=response_parts)
+            yield TaskStatus(
+                state=TaskState.completed,
+                message=Message(
+                    role=Role.agent,
+                    parts=response_parts,
+                    context_id=task.context_id,
+                ),
+            )
+            await _maybe_update_memory(
+                llm=llm,
+                context_id=task.context_id,
+                metadata=metadata,
+                existing=mem,
+                history=history if isinstance(history, list) else None,
+                user_text=user_text_for_memory,
+                assistant_text=response_text,
+            )
+            return
 
         if (
             agent_name == "host"
@@ -2145,7 +2244,7 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 )
                 return
 
-            agent_summaries = await _load_host_agent_summaries()
+            agent_summaries = (await _load_host_agent_listing()).get("agents")
             available_names = _available_agent_names(agent_summaries)
             if available_names and selected_value not in available_names:
                 if "create_multiple_choice" in tool_names:
@@ -2336,7 +2435,7 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             and user_text_for_memory
             and _is_host_capability_picker_query(user_text_for_memory)
         ):
-            agent_summaries = await _load_host_agent_summaries()
+            agent_summaries = (await _load_host_agent_listing()).get("agents")
             try:
                 interaction_output = await tool_executor.call_tool(
                     name="create_multiple_choice",
@@ -3035,14 +3134,17 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             and user_text_for_memory
             and not _is_host_introspection_query(user_text_for_memory)
         ):
-            agent_summaries = await _load_host_agent_summaries()
+            agent_listing = await _load_host_agent_listing()
+            agent_summaries = agent_listing.get("agents")
             inferred_agent = _infer_domain_agent_name(user_text_for_memory)
             available_names = _available_agent_names(agent_summaries)
-            if inferred_agent and available_names and inferred_agent not in available_names:
+            registered_names = _agent_listing_names(agent_listing, "registered_agents")
+            if inferred_agent and inferred_agent not in available_names and (available_names or registered_names):
                 if _is_host_availability_query(user_text_for_memory):
                     response_text = _host_unavailable_agent_text(
                         agent_name=inferred_agent,
                         available_names=available_names,
+                        registered_names=registered_names,
                     )
                     response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)

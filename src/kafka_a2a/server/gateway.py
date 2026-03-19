@@ -138,10 +138,12 @@ def create_gateway_app(config: GatewayConfig):
             return JSONResponse(metrics_snapshot())
 
     @app.get("/agents")
-    async def agents(request: Request) -> Any:
+    async def agents(request: Request, visible_only: bool = Query(False, alias="visibleOnly")) -> Any:
         _metadata_from_request(request)
-        visible_cards = filter_agent_cards(directory.list(), include_names={config.default_agent})
-        cards = [card.model_dump(mode="json", by_alias=True, exclude_none=True) for card in visible_cards]
+        cards_now = directory.list()
+        if visible_only:
+            cards_now = filter_agent_cards(cards_now, include_names={config.default_agent})
+        cards = [card.model_dump(mode="json", by_alias=True, exclude_none=True) for card in cards_now]
         cards.sort(key=lambda c: c.get("name") or "")
         return JSONResponse(cards)
 

@@ -348,7 +348,7 @@ class KafkaDelegationBackend:
             self._state.directory = directory
             self._state.started = True
 
-    async def _list_downstream_cards(self) -> list[AgentCard]:
+    async def _list_registered_cards(self) -> list[AgentCard]:
         await self._ensure_started()
         assert self._state.directory is not None
 
@@ -359,10 +359,11 @@ class KafkaDelegationBackend:
         best: list[AgentCard] = []
 
         while True:
-            cards_now = filter_agent_cards(
-                self._state.directory.list(),
-                exclude_names={self._host_agent_name},
-            )
+            cards_now = [
+                card
+                for card in self._state.directory.list()
+                if (card.name or "").strip() and card.name != self._host_agent_name
+            ]
             cards_now.sort(key=lambda card: card.name)
             best = cards_now or best
 
@@ -378,9 +379,25 @@ class KafkaDelegationBackend:
 
             await asyncio.sleep(0.05)
 
+    def _visible_downstream_cards(self, cards: list[AgentCard]) -> list[AgentCard]:
+        visible_cards = filter_agent_cards(cards)
+        visible_cards.sort(key=lambda card: card.name)
+        return visible_cards
+
+    async def _list_downstream_cards(self) -> list[AgentCard]:
+        registered_cards = await self._list_registered_cards()
+        return self._visible_downstream_cards(registered_cards)
+
     async def list_agents(self) -> dict[str, Any]:
-        cards = await self._list_downstream_cards()
-        return {"agents": [_card_summary(card) for card in cards]}
+        registered_cards = await self._list_registered_cards()
+        visible_cards = self._visible_downstream_cards(registered_cards)
+        visible_names = {card.name for card in visible_cards}
+        hidden_cards = [card for card in registered_cards if card.name not in visible_names]
+        return {
+            "agents": [_card_summary(card) for card in visible_cards],
+            "registered_agents": [_card_summary(card) for card in registered_cards],
+            "hidden_agents": [_card_summary(card) for card in hidden_cards],
+        }
 
     def _select_agent(self, *, cards: list[AgentCard], request: str, agent_name: str | None) -> AgentCard:
         if agent_name:
@@ -401,8 +418,9 @@ class KafkaDelegationBackend:
         return selected
 
     async def delegate(self, *, request: str, agent_name: str | None, ctx: ToolContext) -> dict[str, Any]:
-        cards = await self._list_downstream_cards()
-        selected = self._select_agent(cards=cards, request=request, agent_name=agent_name)
+        registered_cards = await self._list_registered_cards()
+        visible_cards = self._visible_downstream_cards(registered_cards)
+        selected = self._select_agent(cards=visible_cards, request=request, agent_name=agent_name)
 
         assert self._state.client is not None
         stream = await self._state.client.stream_message(

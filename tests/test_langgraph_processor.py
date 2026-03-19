@@ -129,6 +129,7 @@ def test_host_introspection_detection_preserves_domain_requests() -> None:
     assert _is_host_introspection_query("how many agents do you have?")
     assert _is_host_introspection_query("hi there!")
     assert _is_host_introspection_query("what can u do for me")
+    assert _is_host_introspection_query("tell me the agents that you have currently that are register")
     assert not _is_host_introspection_query("help me search for the product t-shirt")
 
 
@@ -438,6 +439,78 @@ async def test_host_direct_setup_query_routes_to_onboarding() -> None:
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == (
         "I can guide you through stock locations, inventory categories, inventory setup, and initial product onboarding."
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_registered_agents_query_stays_with_host() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-host-agents-list",
+        context_id="ctx-host-agents-list",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text="tell me the agents that you have currently that are register")],
+            ),
+        ),
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text="tell me the agents that you have currently that are register")],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == (
+        "Currently registered specialist agents: Inventory Management, Inventory Onboarding, "
+        "Point of Sale (POS), Product Management, User and Workspace Management."
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_registered_agents_query_reports_hidden_agents_when_not_host_visible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "KA2A_TOOL_EXECUTOR",
+        "tests.fake_langgraph_components:build_fake_tool_executor_without_users_or_onboarding",
+    )
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-host-agents-list-hidden",
+        context_id="ctx-host-agents-list-hidden",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text="tell me the agents that you have currently that are register")],
+            ),
+        ),
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text="tell me the agents that you have currently that are register")],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == (
+        "Currently registered specialist agents: Inventory Management, Inventory Onboarding, "
+        "Point of Sale (POS), Product Management, User and Workspace Management. "
+        "The host is currently configured to route to: Inventory Management, Point of Sale (POS), Product Management."
     )
 
 
@@ -967,10 +1040,12 @@ async def test_host_answers_unavailable_agent_diagnostics_without_misrouting(
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == (
-        "Inventory Onboarding is not active in the current agent directory. "
-        "The host currently sees these available areas: Inventory Management, Point of Sale (POS), Product Management. "
+        "Inventory Onboarding is registered in the current agent directory, but it is not currently exposed to the host "
+        "for routing. The host currently routes to these available areas: Inventory Management, Point of Sale (POS), "
+        "Product Management. "
         "There is no specialist error message to show here because the host did not delegate this request. "
-        "This looks like an availability or deployment issue, not a downstream task failure."
+        "This looks like a host or gateway configuration issue, such as the downstream allowlist, not a downstream "
+        "task failure."
     )
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]

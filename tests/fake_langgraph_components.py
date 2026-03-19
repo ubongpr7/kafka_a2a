@@ -47,6 +47,12 @@ class FakeToolExecutor(ToolExecutor):
         self._failing_tools = set(failing_tools or set())
 
     def _agents(self) -> list[dict[str, Any]]:
+        agents = self._registered_agents()
+        if not self._hidden_agents:
+            return agents
+        return [agent for agent in agents if agent["name"] not in self._hidden_agents]
+
+    def _registered_agents(self) -> list[dict[str, Any]]:
         agents = [
             {
                 "name": "onboarding",
@@ -109,9 +115,7 @@ class FakeToolExecutor(ToolExecutor):
                 ],
             },
         ]
-        if not self._hidden_agents:
-            return agents
-        return [agent for agent in agents if agent["name"] not in self._hidden_agents]
+        return agents
 
     def _tool_specs(self) -> list[ToolSpec]:
         specs = [
@@ -232,7 +236,16 @@ class FakeToolExecutor(ToolExecutor):
         if name in self._failing_tools:
             raise RuntimeError(f"Simulated failure for {name}")
         if name == "list_available_agents":
-            return {"agents": self._agents()}
+            visible_agents = self._agents()
+            registered_agents = self._registered_agents()
+            visible_names = {agent["name"] for agent in visible_agents}
+            return {
+                "agents": visible_agents,
+                "registered_agents": registered_agents,
+                "hidden_agents": [
+                    agent for agent in registered_agents if agent["name"] not in visible_names
+                ],
+            }
         if name == "delegate_to_agent":
             request = str(arguments.get("request") or "")
             agent_name = str(arguments.get("agent_name") or "product")
