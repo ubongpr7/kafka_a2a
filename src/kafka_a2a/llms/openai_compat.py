@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 from kafka_a2a.credentials import ResolvedLlmCredentials
 from kafka_a2a.llms.chat_model import ChatResponse
 from kafka_a2a.llms.controls import RetryConfig, backoff_delay_s, llm_semaphore
+from kafka_a2a.tools import ToolSpec
 
 
 def _endpoint(base_url: str) -> str:
@@ -121,6 +122,20 @@ def _to_openai_messages(messages: Iterable[Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _to_openai_tools(tools: Iterable[ToolSpec] | None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool.name, str) or not tool.name.strip():
+            continue
+        function: dict[str, Any] = {"name": tool.name.strip()}
+        if isinstance(tool.description, str) and tool.description.strip():
+            function["description"] = tool.description.strip()
+        if isinstance(tool.input_schema, dict) and tool.input_schema:
+            function["parameters"] = tool.input_schema
+        out.append({"type": "function", "function": function})
+    return out
+
+
 class UpstreamHttpError(RuntimeError):
     def __init__(self, *, status: int, body: str, headers: dict[str, str] | None = None) -> None:
         super().__init__(f"HTTP {status}")
@@ -143,12 +158,16 @@ class OpenAICompatChatModel:
     timeout_s: float = 60.0
     extra: dict[str, Any] | None = None
 
-    async def ainvoke(self, messages: Iterable[Any], **_: Any) -> ChatResponse:
+    async def ainvoke(self, messages: Iterable[Any], **kwargs: Any) -> ChatResponse:
         url = _endpoint(self.base_url)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": _to_openai_messages(messages),
         }
+        tools = _to_openai_tools(kwargs.get("tools"))
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         if self.extra:
             payload.update(self.extra)
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -206,10 +225,62 @@ class OpenAICompatChatModel:
 
         data = json.loads(raw.decode("utf-8"))
         try:
-            content = data["choices"][0]["message"]["content"]
+            message = data["choices"][0]["message"]
         except Exception as exc:
             raise RuntimeError(f"Unexpected OpenAI-compatible response: {data}") from exc
-        return ChatResponse(content=str(content), raw=data)
+
+        out_parts: list[dict[str, Any]] = []
+
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            out_parts.append({"kind": "text", "text": content})
+        elif isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type in ("text", "output_text"):
+                    text_value = item.get("text")
+                    if isinstance(text_value, str) and text_value:
+                        out_parts.append({"kind": "text", "text": text_value})
+
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = tool_call.get("id")
+                function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+                name = function.get("name")
+                arguments_raw = function.get("arguments")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                arguments: dict[str, Any]
+                if isinstance(arguments_raw, str) and arguments_raw.strip():
+                    try:
+                        parsed_arguments = json.loads(arguments_raw)
+                    except Exception:
+                        parsed_arguments = {"value": arguments_raw}
+                elif isinstance(arguments_raw, dict):
+                    parsed_arguments = arguments_raw
+                else:
+                    parsed_arguments = {}
+                arguments = parsed_arguments if isinstance(parsed_arguments, dict) else {"value": parsed_arguments}
+                part: dict[str, Any] = {
+                    "kind": "tool-call",
+                    "name": name.strip(),
+                    "arguments": arguments,
+                }
+                if isinstance(call_id, str) and call_id.strip():
+                    part["tool_call_id"] = call_id.strip()
+                out_parts.append(part)
+
+        non_text = any((p.get("kind") or "").lower() != "text" for p in out_parts)
+        if non_text:
+            return ChatResponse(content=out_parts, raw=data)
+
+        text_out = "".join([str(p.get("text") or "") for p in out_parts]).strip()
+        return ChatResponse(content=text_out, raw=data)
 
 
 def create_chat_model(

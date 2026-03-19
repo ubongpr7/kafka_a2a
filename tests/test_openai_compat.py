@@ -1,5 +1,10 @@
+import json
+
+import pytest
+
 from kafka_a2a.credentials import ResolvedLlmCredentials
-from kafka_a2a.llms.openai_compat import create_chat_model
+from kafka_a2a.llms.openai_compat import OpenAICompatChatModel, create_chat_model
+from kafka_a2a.tools import ToolSpec
 
 
 def test_create_chat_model_defaults_openai_base_url_for_chatgpt_provider() -> None:
@@ -26,3 +31,103 @@ def test_create_chat_model_defaults_xai_base_url_for_grok_provider() -> None:
     )
 
     assert model.base_url == "https://api.x.ai"
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_ainvoke_sends_and_parses_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_payload: dict[str, object] = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_123",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "create_multiple_choice",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "question": "Pick one",
+                                                    "choices": ["Products", "Inventory"],
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def _fake_urlopen(req, timeout=0):  # noqa: ANN001
+        _ = timeout
+        captured_payload.update(json.loads(req.data.decode("utf-8")))
+        return _FakeResponse()
+
+    monkeypatch.setattr("kafka_a2a.llms.openai_compat.urlopen", _fake_urlopen)
+
+    model = OpenAICompatChatModel(
+        base_url="https://api.openai.com",
+        api_key="test-key",
+        model="gpt-4.1-mini",
+    )
+    response = await model.ainvoke(
+        [{"role": "user", "content": "use a tool"}],
+        tools=[
+            ToolSpec(
+                name="create_multiple_choice",
+                description="Render a pick-one list.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "choices": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["question", "choices"],
+                },
+            )
+        ],
+    )
+
+    assert captured_payload["tool_choice"] == "auto"
+    assert captured_payload["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "create_multiple_choice",
+                "description": "Render a pick-one list.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "choices": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["question", "choices"],
+                },
+            },
+        }
+    ]
+    assert response.content == [
+        {
+            "kind": "tool-call",
+            "name": "create_multiple_choice",
+            "arguments": {
+                "question": "Pick one",
+                "choices": ["Products", "Inventory"],
+            },
+            "tool_call_id": "call_123",
+        }
+    ]
