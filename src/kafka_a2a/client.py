@@ -22,6 +22,8 @@ from kafka_a2a.protocol import (
     METHOD_MESSAGE_SEND,
     METHOD_MESSAGE_STREAM,
     METHOD_TASKS_CANCEL,
+    METHOD_TASKS_CONTINUE,
+    METHOD_TASKS_CONTINUE_STREAM,
     METHOD_TASKS_GET,
     METHOD_TASKS_LIST,
     METHOD_TASKS_PUSH_NOTIFICATION_CONFIG_DELETE,
@@ -36,6 +38,7 @@ from kafka_a2a.protocol import (
     MessageSendParams,
     RpcRequest,
     RpcResponse,
+    TaskContinueParams,
     TaskIdParams,
     TaskListParams,
     TaskQueryParams,
@@ -250,6 +253,24 @@ class Ka2aClient:
         result = await self.call(agent_name=agent_name, method=METHOD_TASKS_CANCEL, params=params)
         return Task.model_validate(result)
 
+    async def continue_task(
+        self,
+        *,
+        agent_name: str,
+        task_id: str,
+        message: Message,
+        configuration: TaskConfiguration | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Task:
+        params = TaskContinueParams(
+            id=task_id,
+            message=message,
+            configuration=configuration,
+            metadata=metadata,
+        ).model_dump(by_alias=True, exclude_none=True)
+        result = await self.call(agent_name=agent_name, method=METHOD_TASKS_CONTINUE, params=params)
+        return Task.model_validate(result)
+
     async def set_task_push_notification_config(
         self,
         *,
@@ -380,6 +401,60 @@ class Ka2aClient:
         params = TaskQueryParams(id=task_id, metadata=metadata).model_dump(by_alias=True, exclude_none=True)
         method = METHOD_TASKS_RESUBSCRIBE if resubscribe else METHOD_TASKS_SUBSCRIBE
         req = RpcRequest(id=request_id, method=method, params=params)
+        env = KafkaEnvelope(
+            type=EnvelopeType.request,
+            correlation_id=request_id,
+            sender=self.client_id,
+            recipient=agent_name,
+            reply_to=self.reply_topic,
+            payload=req.model_dump(by_alias=True, exclude_none=True),
+        )
+        await self._transport.send(topic=self._topics.agent_requests(agent_name), envelope=env)
+
+        timeout = self._cfg.request_timeout_s
+        resp = await _await_with_optional_timeout(fut, timeout)
+        if resp.error is not None:
+            self._streams.pop(request_id, None)
+            raise A2AError(code=resp.error.code, message=resp.error.message, data=resp.error.data)
+
+        queue = self._streams[request_id]
+
+        async def _iter() -> AsyncIterator[StreamResult]:
+            try:
+                while True:
+                    item = await queue.get()
+                    if item.error is not None:
+                        raise A2AError(code=item.error.code, message=item.error.message, data=item.error.data)
+                    result = _parse_stream_result(item.result)
+                    yield result
+                    if _is_stream_done(result):
+                        break
+            finally:
+                self._streams.pop(request_id, None)
+
+        return _iter()
+
+    async def continue_task_stream(
+        self,
+        *,
+        agent_name: str,
+        task_id: str,
+        message: Message,
+        configuration: TaskConfiguration | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AsyncIterator[StreamResult]:
+        request_id = str(uuid4())
+        self._streams[request_id] = asyncio.Queue()
+        fut: asyncio.Future[RpcResponse] = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = fut
+
+        params = TaskContinueParams(
+            id=task_id,
+            message=message,
+            configuration=configuration,
+            metadata=metadata,
+        ).model_dump(by_alias=True, exclude_none=True)
+        req = RpcRequest(id=request_id, method=METHOD_TASKS_CONTINUE_STREAM, params=params)
         env = KafkaEnvelope(
             type=EnvelopeType.request,
             correlation_id=request_id,

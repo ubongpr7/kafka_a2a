@@ -18,6 +18,16 @@ class FakeLlm:
         return SimpleNamespace(content="This should not be used for delegated host requests.")
 
 
+class FakeInteractionLlm:
+    async def ainvoke(self, messages: list[Any]) -> Any:
+        global FAKE_LLM_CALL_COUNT
+        _ = messages
+        FAKE_LLM_CALL_COUNT += 1
+        return SimpleNamespace(
+            content='{"interaction_type":"dynamic_form","title":"Need more detail","description":"Pick an inventory.","fields":[{"name":"inventory","label":"Inventory","type":"text","required":true}]}'
+        )
+
+
 class FakeToolExecutor(ToolExecutor):
     async def list_tools(self, *, ctx: ToolContext) -> list[ToolSpec]:
         _ = ctx
@@ -86,6 +96,32 @@ class FakeToolExecutor(ToolExecutor):
                 ]
             }
         if name == "delegate_to_agent":
+            request = str(arguments.get("request") or "")
+            if "ambiguous" in request.lower():
+                return {
+                    "selected_agent": arguments.get("agent_name") or "product",
+                    "delegated_task_id": "delegated-2",
+                    "response_text": '{"interaction_type":"multiple_choice","title":"Which inventory?","description":"Choose the inventory to continue.","options":[{"id":"main","label":"Main store"},{"id":"warehouse","label":"Warehouse"}]}',
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": '{"interaction_type":"multiple_choice","title":"Which inventory?","description":"Choose the inventory to continue.","options":[{"id":"main","label":"Main store"},{"id":"warehouse","label":"Warehouse"}]}',
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "input-required",
+                            "message": "Which inventory should I use?",
+                            "final": True,
+                        },
+                    ],
+                }
             return {
                 "selected_agent": arguments.get("agent_name") or "product",
                 "delegated_task_id": "delegated-1",
@@ -126,6 +162,11 @@ class FakeToolExecutor(ToolExecutor):
 def fake_llm_factory(*args: Any, **kwargs: Any) -> Any:
     _ = args, kwargs
     return FakeLlm()
+
+
+def fake_interaction_llm_factory(*args: Any, **kwargs: Any) -> Any:
+    _ = args, kwargs
+    return FakeInteractionLlm()
 
 
 def build_fake_tool_executor() -> ToolExecutor:

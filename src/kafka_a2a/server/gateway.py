@@ -100,6 +100,10 @@ def create_gateway_app(config: GatewayConfig):
         context_id: str | None = None
         history_length: int | None = None
 
+    class TaskContinueRequest(Ka2aModel):
+        text: str
+        history_length: int | None = None
+
     def _metadata_from_request(request: Request) -> dict[str, Any] | None:
         metadata: dict[str, Any] | None = None
         if config.jwt is not None:
@@ -277,6 +281,62 @@ def create_gateway_app(config: GatewayConfig):
         try:
             events = await client.stream_message(
                 agent_name=body.agent_name or config.default_agent,
+                message=msg,
+                configuration=configuration,
+                metadata=metadata,
+            )
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="Agent did not respond in time") from exc
+
+        async def _event_source():
+            async for ev in events:
+                payload: Any = ev
+                if hasattr(ev, "model_dump"):
+                    payload = ev.model_dump(mode="json", by_alias=True, exclude_none=True)
+                yield f"data: {json.dumps(payload)}\n\n"
+
+        return StreamingResponse(_event_source(), media_type="text/event-stream")
+
+    @app.post("/tasks/{task_id}/continue")
+    async def continue_task(
+        request: Request,
+        task_id: str,
+        body: TaskContinueRequest,
+        agent_name: str | None = None,
+    ) -> Any:
+        metadata = _metadata_from_request(request)
+        msg = Message(role="user", parts=[TextPart(text=body.text)])
+        configuration = (
+            TaskConfiguration(history_length=body.history_length) if body.history_length is not None else None
+        )
+        try:
+            task = await client.continue_task(
+                agent_name=agent_name or config.default_agent,
+                task_id=task_id,
+                message=msg,
+                configuration=configuration,
+                metadata=metadata,
+            )
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="Agent did not respond in time") from exc
+        return JSONResponse(task.model_dump(mode="json", by_alias=True, exclude_none=True))
+
+    @app.post("/tasks/{task_id}/continue/stream")
+    async def continue_task_stream(
+        request: Request,
+        task_id: str,
+        body: TaskContinueRequest,
+        agent_name: str | None = None,
+    ):
+        metadata = _metadata_from_request(request)
+        msg = Message(role="user", parts=[TextPart(text=body.text)])
+        configuration = (
+            TaskConfiguration(history_length=body.history_length) if body.history_length is not None else None
+        )
+        try:
+            events = await client.continue_task_stream(
+                agent_name=agent_name or config.default_agent,
+                task_id=task_id,
                 message=msg,
                 configuration=configuration,
                 metadata=metadata,

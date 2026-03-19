@@ -51,7 +51,7 @@ Wire format:
 ## Quickstart (Docker Compose)
 
 This repo ships a single `docker-compose.yml` that starts:
-- The real Intera agents (`host-agent`, `product-agent`, `inventory-agent`, and `pos-agent`)
+- The real Intera agents (`host-agent`, `users-agent`, `product-agent`, `inventory-agent`, and `pos-agent`)
 - A gateway (`/chat`, `/upload`, `/stream`)
 - An A2A-compatible HTTP proxy (JSON-RPC POST `/` + SSE streaming + Agent Card endpoint)
 
@@ -74,7 +74,7 @@ If your Kafka cluster has **auto-topic-creation disabled**, create the required 
 
 ```bash
 # Uses KA2A_BOOTSTRAP_SERVERS from .env
-docker compose run --rm gateway ensure-topics --agents host,product,inventory,pos --client-ids gateway,proxy
+docker compose run --rm gateway ensure-topics --agents host,users,product,inventory,pos --client-ids gateway,proxy
 ```
 
 Optional: if you want to run Kafka locally for development, you can use `kafka/docker-compose.yml` and then point
@@ -457,7 +457,15 @@ Example `mcp-tools.example.json`:
           "serverUrl": "http://products-mcp:8000/mcp/",
           "toolNamePrefix": "product.",
           "auth": { "mode": "forward_bearer" },
-          "tools": ["search_products", "get_product_details", "search_product_variants"]
+          "tools": [
+            "search_products",
+            "get_product_details",
+            "search_product_variants",
+            "get_product_variant_details",
+            "get_product_dashboard_stats",
+            "toggle_product_quick_sale",
+            "toggle_variant_pos_visible"
+          ]
         }
       ]
     },
@@ -468,7 +476,14 @@ Example `mcp-tools.example.json`:
           "serverUrl": "http://inventory-mcp:8000/mcp/",
           "toolNamePrefix": "inventory.",
           "auth": { "mode": "forward_bearer" },
-          "tools": ["search_inventories", "get_inventory_alerts", "search_stock_movements"]
+          "tools": [
+            "search_inventories",
+            "get_inventory_alerts",
+            "search_purchase_orders",
+            "receive_purchase_order_items",
+            "transfer_location_stock",
+            "create_stock_reservation"
+          ]
         }
       ]
     },
@@ -479,7 +494,14 @@ Example `mcp-tools.example.json`:
           "serverUrl": "http://pos-mcp:8000/mcp/",
           "toolNamePrefix": "pos.",
           "auth": { "mode": "forward_bearer" },
-          "tools": ["get_current_pos_session", "search_pos_orders", "list_held_pos_orders"]
+          "tools": [
+            "get_current_pos_session",
+            "search_pos_orders",
+            "get_or_create_pos_draft_order",
+            "add_item_to_pos_order",
+            "process_pos_payment",
+            "list_held_pos_orders"
+          ]
         }
       ]
     }

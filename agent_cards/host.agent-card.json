@@ -1,7 +1,7 @@
 {
   "protocolVersion": "0.3.0",
   "name": "host",
-  "description": "Host orchestration agent for Intera Inventory that delegates domain work to specialist agents and formats safe frontend responses.",
+  "description": "Host orchestration agent for Intera Inventory that delegates domain work to specialist product, inventory, POS, and user/workspace agents and formats safe frontend responses.",
   "url": "kafka://host",
   "preferredTransport": "kafka",
   "version": "0.1.0",
@@ -15,12 +15,13 @@
     {
       "id": "agent_orchestration",
       "name": "Agent Orchestration",
-      "description": "Route tenant-scoped requests to specialist product, inventory, and POS agents, then shape the returned data into frontend-friendly interaction flows.",
-      "tags": ["orchestration", "delegation", "interaction", "tenant-aware", "frontend", "product", "inventory", "pos"],
+      "description": "Route tenant-scoped requests to specialist product, inventory, POS, and user/workspace agents, then shape the returned data into frontend-friendly interaction flows.",
+      "tags": ["orchestration", "delegation", "interaction", "tenant-aware", "frontend", "product", "inventory", "pos", "users", "workspace"],
       "examples": [
         "Delegate a product search request to the product agent.",
         "Delegate an inventory alert or stock lookup request to the inventory agent.",
         "Delegate a live cashier or session question to the POS agent.",
+        "Delegate a workspace invitation or staff lookup request to the users agent.",
         "Turn delegated results into a searchable selection flow."
       ],
       "inputModes": ["text"],

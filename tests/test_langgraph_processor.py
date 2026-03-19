@@ -158,3 +158,55 @@ async def test_host_auto_delegates_and_waits_for_specialist_result() -> None:
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == "Found 3 products matching t-shirt."
+
+
+@pytest.mark.asyncio
+async def test_host_propagates_input_required_from_specialist() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-2",
+        context_id="ctx-2",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="ambiguous product stock question")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="ambiguous product stock question")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    delegation_payload = delegation_artifact.parts[0].data
+    assert delegation_payload["selectedAgent"] == "product"
+    assert delegation_payload["finalState"] == "input-required"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert "interaction_type" in _text_from_parts(result_artifact.parts)
+
+
+@pytest.mark.asyncio
+async def test_specialist_interaction_payload_yields_input_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KA2A_TOOLS_ENABLED", "false")
+    monkeypatch.setenv("KA2A_LLM_FACTORY", "tests.fake_langgraph_components:fake_interaction_llm_factory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="product")
+    task = Task(
+        id="task-3",
+        context_id="ctx-3",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="help me pick inventory")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="help me pick inventory")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert "interaction_type" in _text_from_parts(result_artifact.parts)
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required

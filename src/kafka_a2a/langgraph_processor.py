@@ -262,9 +262,45 @@ def _format_delegation_status_text(*, agent_name: str, state: TaskState, message
         return f"{agent_name} agent is processing the delegated task."
     if state == TaskState.failed:
         return f"{agent_name} agent reported an error."
+    if state == TaskState.input_required:
+        return f"{agent_name} agent needs more information from you."
+    if state == TaskState.auth_required:
+        return f"{agent_name} agent requires authentication before it can continue."
     if state == TaskState.completed:
         return f"{agent_name} agent completed the delegated task."
     return f"{agent_name} agent status: {state.value}"
+
+
+def _interaction_payload_from_text(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = raw.strip("`").strip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+    if not (raw.startswith("{") or raw.startswith("[")):
+        return None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    if isinstance(obj, dict):
+        interaction_type = str(obj.get("interaction_type") or "").strip()
+        typed = str(obj.get("type") or "").strip()
+        if interaction_type or typed.startswith("AGENT_"):
+            return obj
+    return None
+
+
+def _interaction_payload_from_parts(parts: list[Any]) -> dict[str, Any] | None:
+    for part in parts:
+        if not isinstance(part, TextPart):
+            continue
+        payload = _interaction_payload_from_text(part.text)
+        if payload is not None:
+            return payload
+    return None
 
 
 def _to_model_user_content(message: Message, *, max_text_bytes: int = 8192) -> str | list[dict[str, Any]]:
@@ -663,7 +699,25 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 if role == "system":
                     lc_messages.append(SystemMessage(content=content))
 
-        lc_messages.append(HumanMessage(content=user_content))
+        history_contains_current_message = False
+        if task.history:
+            for msg in task.history:
+                if not isinstance(msg, Message):
+                    continue
+                content = _to_model_user_content(msg)
+                if msg.role == Role.user:
+                    lc_messages.append(HumanMessage(content=content))
+                elif msg.role == Role.agent:
+                    if isinstance(content, str) and content.strip().lower() in {"working", "completed"}:
+                        if msg.message_id == message.message_id:
+                            history_contains_current_message = True
+                        continue
+                    lc_messages.append(AIMessage(content=content))
+                if msg.message_id == message.message_id:
+                    history_contains_current_message = True
+
+        if not history_contains_current_message:
+            lc_messages.append(HumanMessage(content=user_content))
 
         response_parts: list[Any] = []
         response_text = ""
@@ -882,6 +936,22 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         )
 
                 yield Artifact(name="tool_results", parts=tool_results)
+                interaction_output = next(
+                    (
+                        result.output
+                        for result in tool_results
+                        if not result.is_error and isinstance(result.output, dict)
+                        and (
+                            str(result.output.get("interaction_type") or "").strip()
+                            or str(result.output.get("type") or "").strip().startswith("AGENT_")
+                        )
+                    ),
+                    None,
+                )
+                if isinstance(interaction_output, dict):
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [TextPart(text=response_text)]
+                    break
                 messages2.append(
                     HumanMessage(
                         content=[p.model_dump(by_alias=True, exclude_none=True) for p in tool_results]
@@ -896,7 +966,12 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
         yield artifact
 
         agent_msg = Message(role=Role.agent, parts=response_parts or [TextPart(text=response_text)])
-        yield TaskStatus(state=TaskState.completed, message=agent_msg)
+        interaction_payload = _interaction_payload_from_parts(response_parts or [TextPart(text=response_text)])
+        final_state = TaskState.input_required if interaction_payload is not None else TaskState.completed
+        yield TaskStatus(state=final_state, message=agent_msg)
+
+        if final_state == TaskState.input_required:
+            return
 
         await _maybe_update_memory(
             llm=llm,

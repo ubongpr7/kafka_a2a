@@ -1,0 +1,42 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "users",
+  "description": "User service specialist agent for workspace membership, staff, invitations, company profiles, roles, and groups inside Intera Inventory.",
+  "url": "kafka://users",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "workspace_membership_visibility",
+      "name": "Workspace Membership Visibility",
+      "description": "Inspect accessible companies, the active company profile, company staff, invitations, and membership state using the user-service MCP tools.",
+      "tags": ["users", "workspace", "company", "staff", "memberships", "invitations"],
+      "examples": [
+        "Show my accessible company profiles.",
+        "List pending staff invitations for the active company.",
+        "Find a staff member in the current company."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    },
+    {
+      "id": "workspace_access_admin",
+      "name": "Workspace Access Admin",
+      "description": "Inspect roles, groups, and permission posture for staff and company access workflows.",
+      "tags": ["roles", "groups", "permissions", "access-control", "staff-management"],
+      "examples": [
+        "Show roles for the active company.",
+        "Summarize this staff member's permissions.",
+        "List groups in the workspace."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

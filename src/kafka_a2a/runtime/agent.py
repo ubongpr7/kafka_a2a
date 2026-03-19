@@ -38,6 +38,8 @@ from kafka_a2a.protocol import (
     METHOD_MESSAGE_SEND,
     METHOD_MESSAGE_STREAM,
     METHOD_TASKS_CANCEL,
+    METHOD_TASKS_CONTINUE,
+    METHOD_TASKS_CONTINUE_STREAM,
     METHOD_TASKS_GET,
     METHOD_TASKS_LIST,
     METHOD_TASKS_PUSH_NOTIFICATION_CONFIG_DELETE,
@@ -50,6 +52,7 @@ from kafka_a2a.protocol import (
     RpcError,
     RpcRequest,
     RpcResponse,
+    TaskContinueParams,
     TaskIdParams,
     TaskListParams,
     TaskListResult,
@@ -451,6 +454,72 @@ class Ka2aAgent:
             cancel_event = await self._store.append_status(task_id=p.id, status=status)
             self._enqueue_push(task_id=p.id, event=cancel_event)
             updated = await self._store.get_task(p.id)
+            assert updated is not None
+            return updated.model_dump(by_alias=True, exclude_none=True)
+
+        if method in (METHOD_TASKS_CONTINUE, METHOD_TASKS_CONTINUE_STREAM):
+            p = TaskContinueParams.model_validate(params)
+            task = await self._store.get_task(p.id)
+            if task is None:
+                raise A2AError(A2AErrorCode.TASK_NOT_FOUND, "Task not found", {"id": p.id})
+            if self._cfg.tenant_isolation:
+                principal = self._require_principal(p.metadata or {})
+                self._enforce_task_access(task, principal)
+            if task.status.state not in (TaskState.input_required, TaskState.auth_required):
+                raise A2AError(
+                    A2AErrorCode.INVALID_PARAMS,
+                    "Task is not waiting for user input",
+                    {"id": p.id, "state": task.status.state.value},
+                )
+            proc = self._processing.get(p.id)
+            if proc is not None and not proc.done():
+                raise A2AError(A2AErrorCode.INVALID_PARAMS, "Task is already processing", {"id": p.id})
+
+            request_metadata = p.metadata or {}
+            if self._cfg.tenant_isolation:
+                principal = self._require_principal(request_metadata)
+                request_metadata = with_principal(
+                    request_metadata, principal, key=self._cfg.principal_metadata_key
+                )
+
+            user_message = p.message
+            user_message.task_id = task.id
+            user_message.context_id = task.context_id
+            if not user_message.reference_task_ids:
+                user_message.reference_task_ids = [task.id]
+
+            resumed_event = await self._store.append_status(
+                task_id=task.id,
+                status=TaskStatus(
+                    state=TaskState.submitted,
+                    message=user_message,
+                ),
+            )
+            self._enqueue_push(task_id=task.id, event=resumed_event)
+
+            if method == METHOD_TASKS_CONTINUE_STREAM:
+                if not env.reply_to:
+                    raise A2AError(A2AErrorCode.INVALID_PARAMS, "replyTo is required for streaming")
+                await self._begin_stream(
+                    request_id=req.id,
+                    reply_to=env.reply_to,
+                    task_id=task.id,
+                    replay_history=False,
+                    include_task=False,
+                )
+
+            processor_metadata = await self._processor_metadata_for_request(
+                task=task,
+                configuration=p.configuration,
+                request_metadata=request_metadata or None,
+            )
+            self._start_processing(
+                task=task,
+                message=user_message,
+                configuration=p.configuration,
+                metadata=processor_metadata,
+            )
+            updated = await self._store.get_task(task.id)
             assert updated is not None
             return updated.model_dump(by_alias=True, exclude_none=True)
 

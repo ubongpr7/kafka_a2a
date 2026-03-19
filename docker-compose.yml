@@ -63,6 +63,23 @@ services:
         "langgraph-chat"
       ]
 
+  users-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/users_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/users.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
   pos-agent:
     <<: *ka2a_image
     volumes:
@@ -84,6 +101,7 @@ services:
     <<: *ka2a_image
     depends_on:
       - host-agent
+      - users-agent
       - product-agent
       - inventory-agent
       - pos-agent
@@ -95,6 +113,7 @@ services:
     <<: *ka2a_image
     depends_on:
       - host-agent
+      - users-agent
       - product-agent
       - inventory-agent
       - pos-agent

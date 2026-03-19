@@ -12,6 +12,8 @@ from kafka_a2a.protocol import (
     METHOD_MESSAGE_SEND,
     METHOD_MESSAGE_STREAM,
     METHOD_TASKS_CANCEL,
+    METHOD_TASKS_CONTINUE,
+    METHOD_TASKS_CONTINUE_STREAM,
     METHOD_TASKS_GET,
     METHOD_TASKS_PUSH_NOTIFICATION_CONFIG_DELETE,
     METHOD_TASKS_PUSH_NOTIFICATION_CONFIG_GET,
@@ -19,6 +21,7 @@ from kafka_a2a.protocol import (
     METHOD_TASKS_PUSH_NOTIFICATION_CONFIG_SET,
     METHOD_TASKS_RESUBSCRIBE,
     MessageSendParams,
+    TaskContinueParams,
     TaskIdParams,
     TaskQueryParams,
 )
@@ -155,7 +158,7 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
             out = with_principal(md or {}, principal) if principal else md
             return ensure_trace_metadata(out, headers=request.headers)
 
-        if method in (METHOD_MESSAGE_STREAM, METHOD_TASKS_RESUBSCRIBE):
+        if method in (METHOD_MESSAGE_STREAM, METHOD_TASKS_RESUBSCRIBE, METHOD_TASKS_CONTINUE_STREAM):
 
             async def _event_source() -> AsyncIterator[str]:
                 try:
@@ -163,6 +166,15 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                         p = MessageSendParams.model_validate(params)
                         events = await client.stream_message(
                             agent_name=config.agent_name,
+                            message=p.message,
+                            configuration=p.configuration,
+                            metadata=_metadata(p.metadata),
+                        )
+                    elif method == METHOD_TASKS_CONTINUE_STREAM:
+                        p = TaskContinueParams.model_validate(params)
+                        events = await client.continue_task_stream(
+                            agent_name=config.agent_name,
+                            task_id=p.id,
                             message=p.message,
                             configuration=p.configuration,
                             metadata=_metadata(p.metadata),
@@ -228,6 +240,19 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                 task = await client.cancel_task(
                     agent_name=config.agent_name,
                     task_id=p.id,
+                    metadata=_metadata(p.metadata),
+                )
+                return JSONResponse(
+                    _jsonrpc_success(request_id, task.model_dump(mode="json", by_alias=True, exclude_none=True))
+                )
+
+            if method == METHOD_TASKS_CONTINUE:
+                p = TaskContinueParams.model_validate(params)
+                task = await client.continue_task(
+                    agent_name=config.agent_name,
+                    task_id=p.id,
+                    message=p.message,
+                    configuration=p.configuration,
                     metadata=_metadata(p.metadata),
                 )
                 return JSONResponse(

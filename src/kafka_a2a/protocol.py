@@ -38,6 +38,8 @@ METHOD_MESSAGE_STREAM = "message/stream"
 METHOD_TASKS_GET = "tasks/get"
 METHOD_TASKS_LIST = "tasks/list"
 METHOD_TASKS_CANCEL = "tasks/cancel"
+METHOD_TASKS_CONTINUE = "tasks/continue"
+METHOD_TASKS_CONTINUE_STREAM = "tasks/continueStream"
 # NOTE: `tasks/subscribe` is not in the A2A v0.3.0 JSON-RPC surface. Kept as a
 # transport extension alias for early K-A2A experimentation.
 METHOD_TASKS_SUBSCRIBE = "tasks/subscribe"
@@ -147,6 +149,13 @@ class TaskListResult(Ka2aProtocolModel):
 
 class TaskCancelResult(Task):
     pass
+
+
+class TaskContinueParams(Ka2aProtocolModel):
+    id: str
+    message: Message
+    configuration: TaskConfiguration | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class TaskSubscribeParams(TaskQueryParams):
