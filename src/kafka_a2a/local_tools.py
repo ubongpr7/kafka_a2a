@@ -35,6 +35,55 @@ UTILITY_MODULES: tuple[str, ...] = (
     "kafka_a2a.utilities.mcp.helper_tools",
 )
 
+QUERY_TOKEN_ALLOWLIST: set[str] = {"pos", "sku", "api", "ui"}
+
+QUERY_TOKEN_STOPWORDS: set[str] = {
+    "a",
+    "about",
+    "an",
+    "and",
+    "are",
+    "be",
+    "can",
+    "cant",
+    "could",
+    "do",
+    "for",
+    "from",
+    "get",
+    "have",
+    "hello",
+    "help",
+    "hey",
+    "hi",
+    "how",
+    "i",
+    "if",
+    "in",
+    "is",
+    "it",
+    "let",
+    "like",
+    "me",
+    "my",
+    "need",
+    "of",
+    "on",
+    "or",
+    "please",
+    "show",
+    "tell",
+    "the",
+    "to",
+    "u",
+    "us",
+    "we",
+    "what",
+    "with",
+    "you",
+    "your",
+}
+
 
 def _parse_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None:
@@ -80,12 +129,26 @@ def _card_summary(card: AgentCard) -> dict[str, Any]:
     }
 
 
+def _query_tokens(value: str, *, max_tokens: int = 12) -> list[str]:
+    tokens: list[str] = []
+    for token in (value or "").strip().lower().split():
+        token = "".join(ch for ch in token if ch.isalnum() or ch in {"_", "-"})
+        if not token or token in QUERY_TOKEN_STOPWORDS:
+            continue
+        if len(token) < 3 and token not in QUERY_TOKEN_ALLOWLIST:
+            continue
+        tokens.append(token)
+        if len(tokens) >= max_tokens:
+            break
+    return tokens
+
+
 def _score_card(card: AgentCard, query: str) -> int:
     q = (query or "").strip().lower()
     if not q:
         return 0
 
-    tokens = [token for token in q.split()[:12] if token]
+    tokens = _query_tokens(q)
     score = 0
 
     if card.name.lower() in q:
@@ -332,7 +395,9 @@ class KafkaDelegationBackend:
             return cards[0]
 
         scored = sorted(((card, _score_card(card, request)) for card in cards), key=lambda item: item[1], reverse=True)
-        selected, _ = scored[0]
+        selected, score = scored[0]
+        if score <= 0:
+            raise RuntimeError("Could not determine an appropriate specialist agent for this request.")
         return selected
 
     async def delegate(self, *, request: str, agent_name: str | None, ctx: ToolContext) -> dict[str, Any]:

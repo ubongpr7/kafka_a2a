@@ -1,6 +1,7 @@
 import pytest
 
-from kafka_a2a.local_tools import LocalInteractionToolExecutor
+from kafka_a2a.local_tools import KafkaDelegationBackend, LocalInteractionToolExecutor, _score_card
+from kafka_a2a.models import AgentCard, AgentSkill
 from kafka_a2a.tenancy import Principal
 from kafka_a2a.tools import ToolContext
 
@@ -102,3 +103,33 @@ async def test_local_interaction_tool_executor_accepts_legacy_delegate_aliases()
     assert result["selected_agent"] == "users"
     assert backend.calls[0][0] == "How many staff members do we have in total?"
     assert backend.calls[0][1] == "users"
+
+
+def test_score_card_ignores_noisy_short_tokens() -> None:
+    card = AgentCard(
+        name="product",
+        description="Product specialist for catalog search and pricing.",
+        url="kafka://product",
+        version="0.1.0",
+        skills=[
+            AgentSkill(
+                id="product_catalog_lookup",
+                name="Product Catalog Lookup",
+                description="Search products by name, SKU, or barcode.",
+                tags=["product", "catalog", "search"],
+            )
+        ],
+    )
+
+    assert _score_card(card, "u cant tell me aboiut my staff") == 0
+
+
+def test_kafka_delegation_backend_rejects_zero_confidence_selection() -> None:
+    backend = KafkaDelegationBackend()
+    cards = [
+        AgentCard(name="product", description="Product specialist", url="kafka://product", version="0.1.0"),
+        AgentCard(name="pos", description="POS specialist", url="kafka://pos", version="0.1.0"),
+    ]
+
+    with pytest.raises(RuntimeError, match="appropriate specialist agent"):
+        backend._select_agent(cards=cards, request="u cant tell me aboiut my staff", agent_name=None)

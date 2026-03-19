@@ -13,7 +13,7 @@ from kafka_a2a.langgraph_processor import (
     _text_from_parts,
     make_langgraph_chat_processor_from_env,
 )
-from kafka_a2a.models import Artifact, Message, Role, Task, TaskState, TaskStatus, TextPart
+from kafka_a2a.models import Artifact, DataPart, Message, Role, Task, TaskState, TaskStatus, TextPart
 from kafka_a2a.tools import ToolSpec
 
 
@@ -225,6 +225,7 @@ async def test_host_capability_query_uses_multiple_choice_tool() -> None:
 
     assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
     assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
         (
             "create_multiple_choice",
             {
@@ -241,6 +242,167 @@ async def test_host_capability_query_uses_multiple_choice_tool() -> None:
                 "allow_input": True,
             },
         )
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_host_capability_selection_routes_to_selected_agent() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Choose What You Need Help With",
+        "description": "Select the area you want help with. I can continue from your choice.",
+        "options": [
+            {"value": "product", "label": "Product Management"},
+            {"value": "inventory", "label": "Inventory Management"},
+            {"value": "pos", "label": "Point of Sale (POS)"},
+            {"value": "users", "label": "User and Workspace Management"},
+            {"value": "general", "label": "General Question"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
+    task = Task(
+        id="task-capability-response",
+        context_id="ctx-capability-response",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"users","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="hello, what can you do for me")]),
+            Message(role=Role.agent, parts=[DataPart(data=picker_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"users","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        (
+            "delegate_to_agent",
+            {
+                "request": "The user selected User and Workspace Management from the host menu. Briefly explain what kinds of tasks you can help with in this domain, using a concise user-facing summary.",
+                "agent_name": "users",
+            },
+        ),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    delegation_payload = delegation_artifact.parts[0].data
+    assert delegation_payload["selectedAgent"] == "users"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == (
+        "I can help with staff lookup, invitations, roles, groups, permissions, and workspace access."
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_direct_staff_query_routes_to_users() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-staff-count",
+        context_id="ctx-staff-count",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="how many staff do i have")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="how many staff do i have")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        ("delegate_to_agent", {"request": "how many staff do i have", "agent_name": "users"}),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "users"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == "You have 12 staff members in the current workspace."
+
+
+@pytest.mark.asyncio
+async def test_host_unavailable_selected_agent_reprompts_instead_of_misrouting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_TOOL_EXECUTOR", "tests.fake_langgraph_components:build_fake_tool_executor_without_users")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Choose What You Need Help With",
+        "description": "Select the area you want help with. I can continue from your choice.",
+        "options": [
+            {"value": "product", "label": "Product Management"},
+            {"value": "inventory", "label": "Inventory Management"},
+            {"value": "pos", "label": "Point of Sale (POS)"},
+            {"value": "users", "label": "User and Workspace Management"},
+            {"value": "general", "label": "General Question"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
+    task = Task(
+        id="task-capability-missing-users",
+        context_id="ctx-capability-missing-users",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"users","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="hello, what can you do for me")]),
+            Message(role=Role.agent, parts=[DataPart(data=picker_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"users","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        (
+            "create_multiple_choice",
+            {
+                "title": "Choose What You Need Help With",
+                "description": (
+                    "User and Workspace Management is not currently available. "
+                    "Choose one of the areas that is available right now."
+                ),
+                "options": [
+                    {"value": "product", "label": "Product Management"},
+                    {"value": "inventory", "label": "Inventory Management"},
+                    {"value": "pos", "label": "Point of Sale (POS)"},
+                    {"value": "general", "label": "General Question"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        ),
     ]
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
