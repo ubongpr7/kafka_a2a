@@ -31,6 +31,24 @@ services:
         "--push-notifications",
       ]
 
+  onboarding-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/onboarding_agent.txt
+      KA2A_TOOL_EXECUTOR: kafka_a2a.local_tools:build_interaction_tool_executor
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/onboarding.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
   product-agent:
     <<: *ka2a_image
     volumes:
@@ -103,6 +121,7 @@ services:
     <<: *ka2a_image
     depends_on:
       - host-agent
+      - onboarding-agent
       - users-agent
       - product-agent
       - inventory-agent
@@ -115,6 +134,7 @@ services:
     <<: *ka2a_image
     depends_on:
       - host-agent
+      - onboarding-agent
       - users-agent
       - product-agent
       - inventory-agent

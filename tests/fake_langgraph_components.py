@@ -39,6 +39,18 @@ class FakeToolExecutor(ToolExecutor):
     def _agents(self) -> list[dict[str, Any]]:
         return [
             {
+                "name": "onboarding",
+                "description": "Workflow specialist agent for guided inventory onboarding and setup.",
+                "skills": [
+                    {
+                        "name": "Inventory Environment Onboarding",
+                        "description": "Guide stock-location, category, inventory, and initial product setup.",
+                        "tags": ["onboarding", "setup", "inventory", "stock-locations", "categories"],
+                        "examples": ["Help me set up my inventory workspace from scratch."],
+                    }
+                ],
+            },
+            {
                 "name": "product",
                 "description": "Product service specialist agent for catalog search.",
                 "skills": [
@@ -133,6 +145,40 @@ class FakeToolExecutor(ToolExecutor):
         if name == "delegate_to_agent":
             request = str(arguments.get("request") or "")
             agent_name = str(arguments.get("agent_name") or "product")
+            if agent_name == "onboarding":
+                return {
+                    "selected_agent": "onboarding",
+                    "delegated_task_id": "delegated-onboarding-summary",
+                    "response_text": (
+                        "I can guide you through stock locations, inventory categories, inventory setup, "
+                        "and initial product onboarding."
+                    ),
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": (
+                                "I can guide you through stock locations, inventory categories, inventory setup, "
+                                "and initial product onboarding."
+                            ),
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": (
+                                "I can guide you through stock locations, inventory categories, inventory setup, "
+                                "and initial product onboarding."
+                            ),
+                            "final": True,
+                        },
+                    ],
+                }
             if agent_name == "users":
                 if "how many staff" in request.lower():
                     return {

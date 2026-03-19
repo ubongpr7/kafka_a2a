@@ -275,6 +275,7 @@ def _query_tokens(value: str, *, max_tokens: int = 12) -> list[str]:
 
 
 HOST_AGENT_LABELS: dict[str, str] = {
+    "onboarding": "Inventory Onboarding",
     "product": "Product Management",
     "inventory": "Inventory Management",
     "pos": "Point of Sale (POS)",
@@ -283,6 +284,22 @@ HOST_AGENT_LABELS: dict[str, str] = {
 
 
 HOST_DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "onboarding": (
+        "onboarding",
+        "onboard",
+        "inventory onboarding",
+        "guided setup",
+        "initial setup",
+        "first-time setup",
+        "first time setup",
+        "get started",
+        "setup my inventory",
+        "set up my inventory",
+        "configure my inventory",
+        "setup stock locations",
+        "set up stock locations",
+        "product onboarding",
+    ),
     "product": (
         "product",
         "products",
@@ -488,7 +505,7 @@ def _host_capability_picker_arguments(
     available_names = _available_agent_names(agent_summaries)
     options = [
         {"value": name, "label": _friendly_agent_label(name)}
-        for name in ("product", "inventory", "pos", "users")
+        for name in ("onboarding", "product", "inventory", "pos", "users")
         if not available_names or name in available_names
     ]
     options.append({"value": "general", "label": "General Question"})

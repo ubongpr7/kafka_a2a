@@ -140,6 +140,11 @@ def test_host_capability_picker_detection() -> None:
 def test_select_host_delegation_agent_prefers_best_matching_specialist() -> None:
     agents = [
         {
+            "name": "onboarding",
+            "description": "Onboarding workflow specialist.",
+            "skills": [{"name": "Inventory Onboarding", "description": "Guide setup", "tags": ["onboarding", "setup"]}],
+        },
+        {
             "name": "product",
             "description": "Product catalog specialist.",
             "skills": [{"name": "Product Search", "description": "Search products", "tags": ["product"]}],
@@ -156,6 +161,7 @@ def test_select_host_delegation_agent_prefers_best_matching_specialist() -> None
         },
     ]
 
+    assert _select_host_delegation_agent("help me set up my inventory workspace from scratch", agents) == "onboarding"
     assert _select_host_delegation_agent("search for a t-shirt product", agents) == "product"
     assert _select_host_delegation_agent("check stock alerts for the warehouse", agents) == "inventory"
     assert _select_host_delegation_agent("show my open cashier session", agents) == "pos"
@@ -232,6 +238,7 @@ async def test_host_capability_query_uses_multiple_choice_tool() -> None:
                 "title": "Choose What You Need Help With",
                 "description": "Select the area you want help with. I can continue from your choice.",
                 "options": [
+                    {"value": "onboarding", "label": "Inventory Onboarding"},
                     {"value": "product", "label": "Product Management"},
                     {"value": "inventory", "label": "Inventory Management"},
                     {"value": "pos", "label": "Point of Sale (POS)"},
@@ -259,6 +266,7 @@ async def test_host_capability_selection_routes_to_selected_agent() -> None:
         "title": "Choose What You Need Help With",
         "description": "Select the area you want help with. I can continue from your choice.",
         "options": [
+            {"value": "onboarding", "label": "Inventory Onboarding"},
             {"value": "product", "label": "Product Management"},
             {"value": "inventory", "label": "Inventory Management"},
             {"value": "pos", "label": "Point of Sale (POS)"},
@@ -341,6 +349,39 @@ async def test_host_direct_staff_query_routes_to_users() -> None:
 
 
 @pytest.mark.asyncio
+async def test_host_direct_setup_query_routes_to_onboarding() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-onboarding",
+        context_id="ctx-onboarding",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="help me set up my inventory workspace from scratch")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="help me set up my inventory workspace from scratch")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        (
+            "delegate_to_agent",
+            {"request": "help me set up my inventory workspace from scratch", "agent_name": "onboarding"},
+        ),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "onboarding"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == (
+        "I can guide you through stock locations, inventory categories, inventory setup, and initial product onboarding."
+    )
+
+
+@pytest.mark.asyncio
 async def test_host_unavailable_selected_agent_reprompts_instead_of_misrouting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -352,6 +393,7 @@ async def test_host_unavailable_selected_agent_reprompts_instead_of_misrouting(
         "title": "Choose What You Need Help With",
         "description": "Select the area you want help with. I can continue from your choice.",
         "options": [
+            {"value": "onboarding", "label": "Inventory Onboarding"},
             {"value": "product", "label": "Product Management"},
             {"value": "inventory", "label": "Inventory Management"},
             {"value": "pos", "label": "Point of Sale (POS)"},
@@ -394,6 +436,7 @@ async def test_host_unavailable_selected_agent_reprompts_instead_of_misrouting(
                     "Choose one of the areas that is available right now."
                 ),
                 "options": [
+                    {"value": "onboarding", "label": "Inventory Onboarding"},
                     {"value": "product", "label": "Product Management"},
                     {"value": "inventory", "label": "Inventory Management"},
                     {"value": "pos", "label": "Point of Sale (POS)"},
