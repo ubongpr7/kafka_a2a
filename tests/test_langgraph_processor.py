@@ -4,6 +4,7 @@ import pytest
 
 from tests import fake_langgraph_components
 from kafka_a2a.langgraph_processor import (
+    _interaction_payload_from_text,
     _is_host_introspection_query,
     _normalize_tool_call_payload,
     _render_tool_prompt_block,
@@ -83,6 +84,42 @@ def test_normalize_tool_call_payload_leaves_interaction_payload_untouched() -> N
     normalized = _normalize_tool_call_payload(payload, tool_names={"create_dynamic_form"})
 
     assert normalized == payload
+
+
+def test_normalize_tool_call_payload_supports_legacy_tool_code_wrapper() -> None:
+    payload = {
+        "tool_code": "print(delegate_to_agent(agent_name='users', user_query='How many staff members do we have in total?'))"
+    }
+
+    normalized = _normalize_tool_call_payload(payload, tool_names={"delegate_to_agent"})
+
+    assert normalized == {
+        "kind": "tool-call",
+        "name": "delegate_to_agent",
+        "arguments": {
+            "agent_name": "users",
+            "user_query": "How many staff members do we have in total?",
+        },
+    }
+
+
+def test_interaction_payload_from_text_detects_legacy_tool_code_in_json_code_block() -> None:
+    text = """
+Certainly! Please choose one:
+
+```json
+{
+  "tool_code": "print(create_multiple_choice(title='Make a selection', description='Pick an area.', options=[{'value':'users','label':'Users'}], multiple=False, allow_input=False))"
+}
+```
+""".strip()
+
+    payload = _interaction_payload_from_text(text)
+
+    assert payload == {
+        "interaction_type": "legacy_tool_code",
+        "tool_code": "print(create_multiple_choice(title='Make a selection', description='Pick an area.', options=[{'value':'users','label':'Users'}], multiple=False, allow_input=False))",
+    }
 
 
 def test_host_introspection_detection_preserves_domain_requests() -> None:

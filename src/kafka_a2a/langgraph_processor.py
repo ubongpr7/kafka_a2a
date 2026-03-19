@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import json
 import importlib
 import os
+import re
 from collections.abc import AsyncIterator, Callable
 from typing import Any, TypedDict
 
@@ -85,9 +87,75 @@ def _render_tool_prompt_block(tools: list[ToolSpec]) -> str:
         + "- If you need a tool, respond with STRICT JSON only (no markdown).\n"
         + '- Output MUST be either a single object or a list of objects shaped like: {"kind":"tool-call","name":"...","arguments":{...}}.\n'
         + '- Never output bare tool names or pseudo-tool JSON such as {"kind":"list_available_agents"} or {"kind":"create_dynamic_form"}.\n'
+        + '- Never output legacy wrappers such as {"tool_code":"..."} or print(create_multiple_choice(...)) or print(delegate_to_agent(...)).\n'
         + "- You may call multiple tools in one response.\n"
         + "- After tool results are provided, respond normally with your final answer unless the tool itself is a deliberate frontend interaction payload.\n"
     )
+
+
+def _extract_json_candidate_from_text(text: str) -> str | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    code_block_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, flags=re.IGNORECASE)
+    if code_block_match:
+        candidate = code_block_match.group(1).strip()
+        if candidate:
+            return candidate
+
+    if raw.startswith("{") or raw.startswith("["):
+        return raw
+    return None
+
+
+def _legacy_tool_call_from_code(tool_code: str, *, tool_names: set[str]) -> dict[str, Any] | None:
+    source = (tool_code or "").strip()
+    if not source:
+        return None
+
+    try:
+        module = ast.parse(source, mode="exec")
+    except Exception:
+        return None
+
+    if len(module.body) != 1 or not isinstance(module.body[0], ast.Expr):
+        return None
+
+    expr = module.body[0].value
+    if not isinstance(expr, ast.Call):
+        return None
+
+    call = expr
+    if isinstance(expr.func, ast.Name) and expr.func.id == "print" and expr.args:
+        inner = expr.args[0]
+        if isinstance(inner, ast.Call):
+            call = inner
+
+    if isinstance(call.func, ast.Name):
+        name = call.func.id
+    elif isinstance(call.func, ast.Attribute):
+        name = call.func.attr
+    else:
+        return None
+
+    if name not in tool_names:
+        return None
+
+    arguments: dict[str, Any] = {}
+    for keyword in call.keywords:
+        if not keyword.arg:
+            continue
+        try:
+            arguments[keyword.arg] = ast.literal_eval(keyword.value)
+        except Exception:
+            return None
+
+    return {
+        "kind": "tool-call",
+        "name": name,
+        "arguments": arguments,
+    }
 
 
 def _normalize_tool_call_payload(value: Any, *, tool_names: set[str]) -> Any:
@@ -97,6 +165,12 @@ def _normalize_tool_call_payload(value: Any, *, tool_names: set[str]) -> Any:
         return [_normalize_tool_call_payload(item, tool_names=tool_names) for item in value]
     if not isinstance(value, dict):
         return value
+
+    legacy_tool_code = value.get("tool_code")
+    if isinstance(legacy_tool_code, str) and legacy_tool_code.strip():
+        legacy_tool = _legacy_tool_call_from_code(legacy_tool_code, tool_names=tool_names)
+        if legacy_tool is not None:
+            return legacy_tool
 
     kind = str(value.get("kind") or "").strip()
     name = str(value.get("name") or "").strip()
@@ -272,14 +346,8 @@ def _format_delegation_status_text(*, agent_name: str, state: TaskState, message
 
 
 def _interaction_payload_from_text(text: str) -> dict[str, Any] | None:
-    raw = (text or "").strip()
+    raw = _extract_json_candidate_from_text(text)
     if not raw:
-        return None
-    if raw.startswith("```"):
-        raw = raw.strip("`").strip()
-        if raw.lower().startswith("json"):
-            raw = raw[4:].strip()
-    if not (raw.startswith("{") or raw.startswith("[")):
         return None
     try:
         obj = json.loads(raw)
@@ -294,6 +362,14 @@ def _interaction_payload_from_obj(obj: Any) -> dict[str, Any] | None:
         typed = str(obj.get("type") or "").strip()
         if interaction_type or typed.startswith("AGENT_"):
             return obj
+        legacy_tool_code = obj.get("tool_code")
+        if isinstance(legacy_tool_code, str) and legacy_tool_code.strip():
+            # Mark legacy wrapped interaction responses as interactive so the task pauses
+            # instead of being completed and turned into a fresh unrelated follow-up turn.
+            return {
+                "interaction_type": "legacy_tool_code",
+                "tool_code": legacy_tool_code.strip(),
+            }
     return None
 
 
@@ -516,10 +592,8 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
 
     def _parts_from_model_content(content: Any, *, tool_names: set[str] | None = None) -> list[Any]:
         if isinstance(content, str):
-            text = content.strip()
-            if text.startswith("```"):
-                text = text.strip("`").strip()
-            if text.startswith("{") or text.startswith("["):
+            text = _extract_json_candidate_from_text(content)
+            if text is not None:
                 try:
                     obj = json.loads(text)
                 except Exception:

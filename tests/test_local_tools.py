@@ -83,3 +83,22 @@ async def test_local_interaction_tool_executor_delegates_to_specialist_agent() -
     assert backend.calls[0][0] == "Find products matching printer ink"
     assert backend.calls[0][1] == "product"
     assert backend.calls[0][2].principal is principal
+
+
+@pytest.mark.asyncio
+async def test_local_interaction_tool_executor_accepts_legacy_delegate_aliases() -> None:
+    backend = _FakeDelegationBackend()
+    executor = LocalInteractionToolExecutor(delegation_backend=backend)
+
+    result = await executor.call_tool(
+        name="delegate_to_agent",
+        arguments={
+            "user_query": "How many staff members do we have in total?",
+            "agent": "users",
+        },
+        ctx=ToolContext(),
+    )
+
+    assert result["selected_agent"] == "users"
+    assert backend.calls[0][0] == "How many staff members do we have in total?"
+    assert backend.calls[0][1] == "users"

@@ -459,8 +459,14 @@ class LocalInteractionToolExecutor(ToolExecutor):
             return await self._delegation.list_agents()
 
         if name == "delegate_to_agent":
-            request = str(payload.get("request") or "").strip()
-            agent_name = str(payload.get("agent_name") or "").strip() or None
+            request = str(
+                payload.get("request")
+                or payload.get("user_query")
+                or payload.get("query")
+                or payload.get("prompt")
+                or ""
+            ).strip()
+            agent_name = str(payload.get("agent_name") or payload.get("agent") or "").strip() or None
             if not request:
                 raise ValueError("Missing required argument 'request' for local tool 'delegate_to_agent'.")
             return await self._delegation.delegate(request=request, agent_name=agent_name, ctx=ctx)
