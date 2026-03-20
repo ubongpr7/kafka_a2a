@@ -284,7 +284,14 @@ def _function_tool_spec(name: str, fn: Callable[..., Dict[str, Any]]) -> ToolSpe
 class DelegationBackend(Protocol):
     async def list_agents(self) -> dict[str, Any]: ...
 
-    async def delegate(self, *, request: str, agent_name: str | None, ctx: ToolContext) -> dict[str, Any]: ...
+    async def delegate(
+        self,
+        *,
+        request: str,
+        agent_name: str | None,
+        delegated_task_id: str | None = None,
+        ctx: ToolContext,
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(slots=True)
@@ -417,17 +424,32 @@ class KafkaDelegationBackend:
             raise RuntimeError("Could not determine an appropriate specialist agent for this request.")
         return selected
 
-    async def delegate(self, *, request: str, agent_name: str | None, ctx: ToolContext) -> dict[str, Any]:
+    async def delegate(
+        self,
+        *,
+        request: str,
+        agent_name: str | None,
+        delegated_task_id: str | None = None,
+        ctx: ToolContext,
+    ) -> dict[str, Any]:
         registered_cards = await self._list_registered_cards()
         visible_cards = self._visible_downstream_cards(registered_cards)
         selected = self._select_agent(cards=visible_cards, request=request, agent_name=agent_name)
 
         assert self._state.client is not None
-        stream = await self._state.client.stream_message(
-            agent_name=selected.name,
-            message=Message(role=Role.user, parts=[TextPart(text=request)]),
-            metadata=ctx.metadata,
-        )
+        if delegated_task_id:
+            stream = await self._state.client.continue_task_stream(
+                agent_name=selected.name,
+                task_id=delegated_task_id,
+                message=Message(role=Role.user, parts=[TextPart(text=request)]),
+                metadata=ctx.metadata,
+            )
+        else:
+            stream = await self._state.client.stream_message(
+                agent_name=selected.name,
+                message=Message(role=Role.user, parts=[TextPart(text=request)]),
+                metadata=ctx.metadata,
+            )
 
         delegated_task_id: str | None = None
         result_parts_payload: list[dict[str, Any]] | None = None
@@ -511,6 +533,7 @@ DELEGATION_TOOL_SPECS: dict[str, ToolSpec] = {
             "properties": {
                 "request": {"type": "string"},
                 "agent_name": {"type": "string"},
+                "delegated_task_id": {"type": "string"},
             },
             "required": ["request"],
             "additionalProperties": False,
@@ -550,9 +573,15 @@ class LocalInteractionToolExecutor(ToolExecutor):
                 or ""
             ).strip()
             agent_name = str(payload.get("agent_name") or payload.get("agent") or "").strip() or None
+            delegated_task_id = str(payload.get("delegated_task_id") or payload.get("task_id") or "").strip() or None
             if not request:
                 raise ValueError("Missing required argument 'request' for local tool 'delegate_to_agent'.")
-            return await self._delegation.delegate(request=request, agent_name=agent_name, ctx=ctx)
+            return await self._delegation.delegate(
+                request=request,
+                agent_name=agent_name,
+                delegated_task_id=delegated_task_id,
+                ctx=ctx,
+            )
 
         fn = self._functions.get(name)
         if fn is None:

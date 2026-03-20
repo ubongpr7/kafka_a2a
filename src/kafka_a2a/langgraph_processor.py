@@ -1593,11 +1593,19 @@ def _coerce_delegated_response(
     response_text = str(delegated_obj.get("response_text") or "").strip()
     if not response_parts and response_text:
         response_parts = [TextPart(text=response_text)]
+    response_parts = _augment_delegated_response_parts(
+        response_parts,
+        delegated_agent=delegated_agent,
+        delegated_task_id=delegated_task_id,
+        fallback_text=response_text,
+    )
     if not response_text and response_parts:
         response_text = _text_from_parts(response_parts)
     if not response_parts:
         response_parts = [TextPart(text="(no result)")]
         response_text = "(no result)"
+    if _interaction_payload_from_parts(response_parts) is not None and delegated_final_state == TaskState.completed:
+        delegated_final_state = TaskState.input_required
     if not status_updates and _interaction_payload_from_parts(response_parts) is not None:
         delegated_final_state = TaskState.input_required
 
@@ -1691,6 +1699,132 @@ def _interaction_payload_from_parts(parts: list[Any]) -> dict[str, Any] | None:
         if payload is not None:
             return payload
     return None
+
+
+def _annotate_delegated_interaction_payload(
+    payload: dict[str, Any],
+    *,
+    delegated_agent: str,
+    delegated_task_id: str | None,
+) -> dict[str, Any]:
+    enriched = dict(payload)
+    enriched["delegated_agent"] = delegated_agent
+    if delegated_task_id:
+        enriched["delegated_task_id"] = delegated_task_id
+    enriched["delegated_via_host"] = True
+    return enriched
+
+
+def _onboarding_scope_value_from_label(label: str) -> str:
+    lowered = re.sub(r"\s+", " ", label.strip().lower())
+    if "full" in lowered and "setup" in lowered:
+        return "full_setup"
+    if "stock" in lowered and "location" in lowered:
+        return "stock_locations"
+    if "categor" in lowered:
+        return "inventory_categories"
+    if "ledger" in lowered or ("inventory" in lowered and "setup" in lowered):
+        return "inventory_setup"
+    if "product" in lowered:
+        return "product_onboarding"
+    slug = re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")
+    return slug or "option"
+
+
+def _fallback_onboarding_interaction_payload(
+    text: str,
+    *,
+    delegated_agent: str,
+    delegated_task_id: str | None,
+) -> dict[str, Any] | None:
+    if delegated_agent != "onboarding":
+        return None
+    if "choose from the following options" not in text.lower():
+        return None
+    option_labels = [
+        match.group(1).strip()
+        for match in re.finditer(r"(?m)^\s*\d+[.)]\s+(.+?)\s*$", text)
+        if match.group(1).strip()
+    ]
+    if len(option_labels) < 2:
+        return None
+    payload = _with_interaction_metadata(
+        {
+            "interaction_type": "multiple_choice",
+            **_onboarding_scope_picker_arguments(),
+        },
+        workflow="inventory_onboarding",
+        workflow_stage="scope_picker",
+    )
+    payload["options"] = [
+        {"value": _onboarding_scope_value_from_label(label), "label": label}
+        for label in option_labels
+    ]
+    return _annotate_delegated_interaction_payload(
+        payload,
+        delegated_agent=delegated_agent,
+        delegated_task_id=delegated_task_id,
+    )
+
+
+def _augment_delegated_response_parts(
+    parts: list[Any],
+    *,
+    delegated_agent: str,
+    delegated_task_id: str | None,
+    fallback_text: str,
+) -> list[Any]:
+    if not parts and not fallback_text:
+        return parts
+
+    augmented: list[Any] = []
+    interaction_found = False
+    for part in parts:
+        payload: dict[str, Any] | None = None
+        if isinstance(part, DataPart):
+            payload = _interaction_payload_from_obj(part.data)
+        elif isinstance(part, TextPart):
+            payload = _interaction_payload_from_text(part.text)
+        if payload is None:
+            augmented.append(part)
+            continue
+        augmented.append(
+            DataPart(
+                data=_annotate_delegated_interaction_payload(
+                    payload,
+                    delegated_agent=delegated_agent,
+                    delegated_task_id=delegated_task_id,
+                )
+            )
+        )
+        interaction_found = True
+
+    if interaction_found:
+        return augmented
+
+    fallback_payload = _fallback_onboarding_interaction_payload(
+        fallback_text,
+        delegated_agent=delegated_agent,
+        delegated_task_id=delegated_task_id,
+    )
+    if fallback_payload is not None:
+        return [DataPart(data=fallback_payload)]
+    return augmented or parts
+
+
+def _delegated_interaction_context(payload: dict[str, Any] | None) -> dict[str, str | None] | None:
+    if not isinstance(payload, dict):
+        return None
+    delegated_agent = str(payload.get("delegated_agent") or "").strip()
+    if not delegated_agent:
+        return None
+    if _interaction_payload_from_obj(payload) is None:
+        return None
+    delegated_task_id = str(payload.get("delegated_task_id") or "").strip() or None
+    return {
+        "agent_name": delegated_agent,
+        "delegated_task_id": delegated_task_id,
+    }
 
 
 def _to_model_user_content(message: Message, *, max_text_bytes: int = 8192) -> str | list[dict[str, Any]]:
@@ -2343,6 +2477,149 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 return
 
             delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=selected_value)
+            if delegated_response is None:
+                response_text = "Delegation did not return a usable result."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+            yield Artifact(
+                name="delegation",
+                parts=[
+                    DataPart(
+                        data={
+                            "selectedAgent": delegated_response["delegated_agent"],
+                            "delegatedTaskId": delegated_response["delegated_task_id"],
+                            "finalState": delegated_response["delegated_final_state"].value,
+                            "statusUpdates": delegated_response["status_updates"],
+                        }
+                    )
+                ],
+            )
+
+            for update in delegated_response["status_updates"]:
+                if not isinstance(update, dict) or bool(update.get("final")):
+                    continue
+                state_value = _coerce_task_state(update.get("state"), default=TaskState.working)
+                message_text = _format_delegation_status_text(
+                    agent_name=delegated_response["delegated_agent"],
+                    state=state_value,
+                    message=str(update.get("message") or "").strip() or None,
+                )
+                yield TaskStatus(
+                    state=state_value,
+                    message=Message(
+                        role=Role.agent,
+                        parts=[TextPart(text=message_text)],
+                        context_id=task.context_id,
+                    ),
+                )
+
+            for artifact_name, payload in delegated_response["child_artifacts"].items():
+                if not isinstance(artifact_name, str) or not artifact_name.strip():
+                    continue
+                parts = _ka2a_parts_from_model_content(payload)
+                if parts:
+                    yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
+
+            response_parts = delegated_response["response_parts"]
+            response_text = delegated_response["response_text"]
+            yield Artifact(name="result", parts=response_parts)
+            yield TaskStatus(
+                state=delegated_response["delegated_final_state"],
+                message=Message(
+                    role=Role.agent,
+                    parts=response_parts,
+                    context_id=task.context_id,
+                ),
+            )
+
+            await _maybe_update_memory(
+                llm=llm,
+                context_id=task.context_id,
+                metadata=metadata,
+                existing=mem,
+                history=history if isinstance(history, list) else None,
+                user_text=user_text_for_memory,
+                assistant_text=response_text,
+            )
+            return
+
+        delegated_interaction = _delegated_interaction_context(last_interaction_payload)
+        if (
+            agent_name == "host"
+            and tool_executor is not None
+            and "delegate_to_agent" in tool_names
+            and interaction_response is not None
+            and delegated_interaction is not None
+        ):
+            delegated_agent_name = str(delegated_interaction.get("agent_name") or "").strip()
+            delegated_task_id = str(delegated_interaction.get("delegated_task_id") or "").strip() or None
+
+            yield TaskStatus(
+                state=TaskState.working,
+                message=Message(
+                    role=Role.agent,
+                    parts=[
+                        TextPart(
+                            text=f"Passing your response back to the {_friendly_agent_label(delegated_agent_name)} specialist."
+                        )
+                    ],
+                    context_id=task.context_id,
+                ),
+            )
+
+            try:
+                delegated = await tool_executor.call_tool(
+                    name="delegate_to_agent",
+                    arguments={
+                        "request": user_text_for_memory,
+                        "agent_name": delegated_agent_name,
+                        **({"delegated_task_id": delegated_task_id} if delegated_task_id else {}),
+                    },
+                    ctx=tool_ctx,
+                )
+            except Exception as exc:
+                response_text = str(exc).strip() or "Delegation failed."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+            delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=delegated_agent_name)
             if delegated_response is None:
                 response_text = "Delegation did not return a usable result."
                 response_parts = [TextPart(text=response_text)]

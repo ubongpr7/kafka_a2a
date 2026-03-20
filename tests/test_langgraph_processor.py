@@ -379,6 +379,13 @@ async def test_host_capability_selection_routes_onboarding_to_guided_flow_reques
 
     delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
     assert delegation_artifact.parts[0].data["selectedAgent"] == "onboarding"
+    assert delegation_artifact.parts[0].data["finalState"] == "input-required"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
+    assert result_artifact.parts[0].data["workflow_stage"] == "scope_picker"
+    assert result_artifact.parts[0].data["delegated_agent"] == "onboarding"
+    assert result_artifact.parts[0].data["delegated_task_id"] == "delegated-onboarding-scope"
 
 
 @pytest.mark.asyncio
@@ -435,11 +442,82 @@ async def test_host_direct_setup_query_routes_to_onboarding() -> None:
 
     delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
     assert delegation_artifact.parts[0].data["selectedAgent"] == "onboarding"
+    assert delegation_artifact.parts[0].data["finalState"] == "input-required"
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
-    assert _text_from_parts(result_artifact.parts) == (
-        "I can guide you through stock locations, inventory categories, inventory setup, and initial product onboarding."
+    assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
+    assert result_artifact.parts[0].data["workflow_stage"] == "scope_picker"
+    assert result_artifact.parts[0].data["delegated_agent"] == "onboarding"
+    assert result_artifact.parts[0].data["delegated_task_id"] == "delegated-onboarding-scope"
+
+
+@pytest.mark.asyncio
+async def test_host_continues_delegated_onboarding_interaction_with_same_task() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+
+    first_task = Task(
+        id="task-onboarding-follow-up-start",
+        context_id="ctx-onboarding-follow-up",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="help me set up my inventory workspace from scratch")]),
+        ),
     )
+    first_message = Message(role=Role.user, parts=[TextPart(text="help me set up my inventory workspace from scratch")])
+
+    first_events = [event async for event in processor(first_task, first_message, None, None)]
+    first_payload = next(
+        event.parts[0].data for event in first_events if isinstance(event, Artifact) and event.name == "result"
+    )
+
+    fake_langgraph_components.reset_fake_components()
+
+    second_task = Task(
+        id="task-onboarding-follow-up-continue",
+        context_id="ctx-onboarding-follow-up",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"full_setup","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="help me set up my inventory workspace from scratch")]),
+            Message(role=Role.agent, parts=[DataPart(data=first_payload)]),
+        ],
+    )
+    second_message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"full_setup","additional_input":null}')],
+    )
+
+    second_events = [event async for event in processor(second_task, second_message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "delegate_to_agent",
+            {
+                "request": '{"type":"multiple_choice_response","selected":"full_setup","additional_input":null}',
+                "agent_name": "onboarding",
+                "delegated_task_id": "delegated-onboarding-scope",
+            },
+        ),
+    ]
+
+    delegation_artifact = next(event for event in second_events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "onboarding"
+    assert delegation_artifact.parts[0].data["delegatedTaskId"] == "delegated-onboarding-wizard"
+    assert delegation_artifact.parts[0].data["finalState"] == "input-required"
+
+    result_artifact = next(event for event in second_events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["interaction_type"] == "wizard_flow"
+    assert result_artifact.parts[0].data["workflow_stage"] == "wizard"
+    assert result_artifact.parts[0].data["delegated_agent"] == "onboarding"
+    assert result_artifact.parts[0].data["delegated_task_id"] == "delegated-onboarding-wizard"
+
+    status_events = [event for event in second_events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
 
 
 @pytest.mark.asyncio
@@ -1076,7 +1154,9 @@ async def test_host_propagates_input_required_from_specialist() -> None:
     assert delegation_payload["finalState"] == "input-required"
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
-    assert "interaction_type" in _text_from_parts(result_artifact.parts)
+    assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
+    assert result_artifact.parts[0].data["delegated_agent"] == "product"
+    assert result_artifact.parts[0].data["delegated_task_id"] == "delegated-2"
 
 
 @pytest.mark.asyncio

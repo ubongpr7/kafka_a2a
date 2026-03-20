@@ -8,7 +8,7 @@ from kafka_a2a.tools import ToolContext
 
 class _FakeDelegationBackend:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str | None, ToolContext]] = []
+        self.calls: list[tuple[str, str | None, str | None, ToolContext]] = []
 
     async def list_agents(self) -> dict[str, object]:
         return {
@@ -21,8 +21,15 @@ class _FakeDelegationBackend:
             ]
         }
 
-    async def delegate(self, *, request: str, agent_name: str | None, ctx: ToolContext) -> dict[str, object]:
-        self.calls.append((request, agent_name, ctx))
+    async def delegate(
+        self,
+        *,
+        request: str,
+        agent_name: str | None,
+        delegated_task_id: str | None = None,
+        ctx: ToolContext,
+    ) -> dict[str, object]:
+        self.calls.append((request, agent_name, delegated_task_id, ctx))
         return {
             "selected_agent": agent_name or "product",
             "response_text": "delegated",
@@ -83,7 +90,8 @@ async def test_local_interaction_tool_executor_delegates_to_specialist_agent() -
     assert result["selected_agent"] == "product"
     assert backend.calls[0][0] == "Find products matching printer ink"
     assert backend.calls[0][1] == "product"
-    assert backend.calls[0][2].principal is principal
+    assert backend.calls[0][2] is None
+    assert backend.calls[0][3].principal is principal
 
 
 @pytest.mark.asyncio
@@ -103,6 +111,27 @@ async def test_local_interaction_tool_executor_accepts_legacy_delegate_aliases()
     assert result["selected_agent"] == "users"
     assert backend.calls[0][0] == "How many staff members do we have in total?"
     assert backend.calls[0][1] == "users"
+    assert backend.calls[0][2] is None
+
+
+@pytest.mark.asyncio
+async def test_local_interaction_tool_executor_passes_delegated_task_id_for_follow_up() -> None:
+    backend = _FakeDelegationBackend()
+    executor = LocalInteractionToolExecutor(delegation_backend=backend)
+
+    await executor.call_tool(
+        name="delegate_to_agent",
+        arguments={
+            "request": '{"type":"multiple_choice_response","selected":"stock_locations"}',
+            "agent_name": "onboarding",
+            "delegated_task_id": "delegated-onboarding-scope",
+        },
+        ctx=ToolContext(),
+    )
+
+    assert backend.calls[0][0] == '{"type":"multiple_choice_response","selected":"stock_locations"}'
+    assert backend.calls[0][1] == "onboarding"
+    assert backend.calls[0][2] == "delegated-onboarding-scope"
 
 
 def test_score_card_ignores_noisy_short_tokens() -> None:

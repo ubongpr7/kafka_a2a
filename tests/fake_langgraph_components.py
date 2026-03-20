@@ -132,6 +132,7 @@ class FakeToolExecutor(ToolExecutor):
                     "properties": {
                         "request": {"type": "string"},
                         "agent_name": {"type": "string"},
+                        "delegated_task_id": {"type": "string"},
                     },
                     "required": ["request"],
                 },
@@ -249,21 +250,69 @@ class FakeToolExecutor(ToolExecutor):
         if name == "delegate_to_agent":
             request = str(arguments.get("request") or "")
             agent_name = str(arguments.get("agent_name") or "product")
+            delegated_task_id = str(arguments.get("delegated_task_id") or "")
             if agent_name == "onboarding":
+                if delegated_task_id == "delegated-onboarding-scope":
+                    return {
+                        "selected_agent": "onboarding",
+                        "delegated_task_id": "delegated-onboarding-wizard",
+                        "response_text": "",
+                        "result_parts": [
+                            {
+                                "kind": "data",
+                                "data": {
+                                    "interaction_type": "wizard_flow",
+                                    "title": "Full Inventory Setup Wizard",
+                                    "description": "Fill in the setup details and I will prepare the onboarding action plan.",
+                                    "steps": [
+                                        {"id": "step_0", "title": "Stock Locations"},
+                                        {"id": "step_1", "title": "Inventory Categories"},
+                                    ],
+                                    "allow_back": True,
+                                    "show_progress": True,
+                                    "workflow": "inventory_onboarding",
+                                    "workflow_stage": "wizard",
+                                    "onboarding_scope": "full_setup",
+                                },
+                            }
+                        ],
+                        "artifacts": {},
+                        "status_updates": [
+                            {
+                                "state": "submitted",
+                                "message": "delegated task continued",
+                                "final": False,
+                            },
+                            {
+                                "state": "input-required",
+                                "message": "Fill in the onboarding details to continue.",
+                                "final": True,
+                            },
+                        ],
+                    }
                 return {
                     "selected_agent": "onboarding",
-                    "delegated_task_id": "delegated-onboarding-summary",
-                    "response_text": (
-                        "I can guide you through stock locations, inventory categories, inventory setup, "
-                        "and initial product onboarding."
-                    ),
+                    "delegated_task_id": "delegated-onboarding-scope",
+                    "response_text": "",
                     "result_parts": [
                         {
-                            "kind": "text",
-                            "text": (
-                                "I can guide you through stock locations, inventory categories, inventory setup, "
-                                "and initial product onboarding."
-                            ),
+                            "kind": "data",
+                            "data": {
+                                "interaction_type": "multiple_choice",
+                                "title": "Start Inventory Onboarding",
+                                "description": "Choose the setup area you want to complete first. I will guide you step by step.",
+                                "options": [
+                                    {"value": "full_setup", "label": "Full Inventory Setup"},
+                                    {"value": "stock_locations", "label": "Stock Locations"},
+                                    {"value": "inventory_categories", "label": "Inventory Categories"},
+                                    {"value": "inventory_setup", "label": "Inventory Setup"},
+                                    {"value": "product_onboarding", "label": "Product Onboarding"},
+                                ],
+                                "multiple": False,
+                                "allow_input": True,
+                                "workflow": "inventory_onboarding",
+                                "workflow_stage": "scope_picker",
+                            },
                         }
                     ],
                     "artifacts": {},
@@ -274,11 +323,8 @@ class FakeToolExecutor(ToolExecutor):
                             "final": False,
                         },
                         {
-                            "state": "completed",
-                            "message": (
-                                "I can guide you through stock locations, inventory categories, inventory setup, "
-                                "and initial product onboarding."
-                            ),
+                            "state": "input-required",
+                            "message": "Choose the setup area you want to complete first.",
                             "final": True,
                         },
                     ],

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -11,6 +12,9 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kafka_a2a.tools import ToolContext, ToolExecutor, ToolSpec
+
+
+logger = logging.getLogger("kafka_a2a.mcp_tools")
 
 
 def _require_mcp() -> Any:
@@ -484,14 +488,25 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
 
 
 class CompositeToolExecutor(ToolExecutor):
-    def __init__(self, *, executors: list[ToolExecutor] | None = None) -> None:
+    def __init__(self, *, executors: list[ToolExecutor] | None = None, skip_unavailable: bool = False) -> None:
         self._executors = [executor for executor in (executors or []) if executor is not None]
+        self._skip_unavailable = bool(skip_unavailable)
 
     async def _resolve_routes(self, *, ctx: ToolContext) -> tuple[list[ToolSpec], dict[str, ToolExecutor]]:
         tools: list[ToolSpec] = []
         routes: dict[str, ToolExecutor] = {}
         for executor in self._executors:
-            current = await executor.list_tools(ctx=ctx)
+            try:
+                current = await executor.list_tools(ctx=ctx)
+            except Exception:
+                if not self._skip_unavailable:
+                    raise
+                logger.warning(
+                    "tool executor failed during list_tools; skipping executor",
+                    extra={"executor_type": executor.__class__.__name__},
+                    exc_info=True,
+                )
+                continue
             for item in current:
                 if item.name in routes:
                     raise RuntimeError(f"Duplicate tool name exposed by multiple executors: {item.name}")
@@ -542,7 +557,7 @@ class MultiMcpToolExecutor(ToolExecutor):
             )
         if extra_executor is not None:
             executors.append(extra_executor)
-        self._composite = CompositeToolExecutor(executors=executors)
+        self._composite = CompositeToolExecutor(executors=executors, skip_unavailable=True)
 
     @classmethod
     def from_env(

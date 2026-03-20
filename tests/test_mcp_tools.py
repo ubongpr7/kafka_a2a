@@ -301,3 +301,20 @@ async def test_composite_executor_rejects_duplicate_tool_names() -> None:
 
     with pytest.raises(RuntimeError, match="Duplicate tool name"):
         await executor.list_tools(ctx=ToolContext())
+
+
+@pytest.mark.asyncio
+async def test_composite_executor_can_skip_unavailable_executor_and_keep_local_tools() -> None:
+    class _FailingExecutor(ToolExecutor):
+        async def list_tools(self, *, ctx: ToolContext) -> list[ToolSpec]:
+            _ = ctx
+            raise RuntimeError("upstream MCP unavailable")
+
+        async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
+            _ = name, arguments, ctx
+            raise AssertionError("call_tool should not be used for the failing executor")
+
+    executor = CompositeToolExecutor(executors=[_FailingExecutor(), _LocalExecutor()], skip_unavailable=True)
+
+    tools = await executor.list_tools(ctx=ToolContext())
+    assert [tool.name for tool in tools] == ["local.transform"]
