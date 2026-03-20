@@ -1222,6 +1222,31 @@ def _onboarding_operation_summary(
         failed_labels = [str(item.get("label") or "").strip() for item in failed_operations if str(item.get("label") or "").strip()]
         if failed_labels:
             lines.append("Still pending: " + ", ".join(failed_labels))
+        discovery_messages: list[str] = []
+        seen_discovery_messages: set[str] = set()
+        for item in failed_operations:
+            discovery_failures = item.get("discovery_failures")
+            if not isinstance(discovery_failures, list):
+                continue
+            for failure in discovery_failures:
+                if not isinstance(failure, dict):
+                    continue
+                executor_label = str(
+                    failure.get("executor_label")
+                    or failure.get("server_id")
+                    or failure.get("executor_type")
+                    or "tool executor"
+                ).strip()
+                error_text = str(failure.get("error") or "").strip()
+                if not error_text:
+                    continue
+                message = f"{executor_label}: {error_text}"
+                if message in seen_discovery_messages:
+                    continue
+                seen_discovery_messages.add(message)
+                discovery_messages.append(message)
+        if discovery_messages:
+            lines.append("Discovery issues: " + "; ".join(discovery_messages[:3]))
     return "\n".join(lines)
 
 
@@ -1284,6 +1309,44 @@ def _onboarding_completed_text(created_operations: dict[str, Any]) -> str:
     if len(parts) == 1:
         return f"Created {parts[0]} for onboarding."
     return "Created " + ", ".join(parts[:-1]) + f", and {parts[-1]} for onboarding."
+
+
+def _tool_discovery_failures_for_name(tool_executor: ToolExecutor | None, tool_name: str) -> list[dict[str, Any]]:
+    if tool_executor is None:
+        return []
+    failures_getter = getattr(tool_executor, "list_tool_failures", None)
+    if not callable(failures_getter):
+        return []
+    try:
+        failures = failures_getter()
+    except Exception:
+        return []
+    if not isinstance(failures, list):
+        return []
+
+    relevant: list[dict[str, Any]] = []
+    bare_tool_name = tool_name.split(".", 1)[-1]
+    for failure in failures:
+        if not isinstance(failure, dict):
+            continue
+        prefix = str(failure.get("tool_name_prefix") or "").strip()
+        allowed_tools = failure.get("allowed_tools")
+        allowed_tool_names = {
+            str(item).strip()
+            for item in allowed_tools
+            if isinstance(allowed_tools, list) and str(item).strip()
+        }
+        if prefix and tool_name.startswith(prefix):
+            relevant.append(dict(failure))
+            continue
+        if allowed_tool_names and (tool_name in allowed_tool_names or bare_tool_name in allowed_tool_names):
+            relevant.append(dict(failure))
+
+    if relevant:
+        return relevant
+    if len(failures) == 1 and isinstance(failures[0], dict):
+        return [dict(failures[0])]
+    return []
 
 
 def _build_stock_location_operation(
@@ -3150,11 +3213,13 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         continue
                     tool_name = str(operation.get("tool_name") or "").strip()
                     if tool_name not in tool_names:
+                        discovery_failures = _tool_discovery_failures_for_name(tool_executor, tool_name)
                         failed_items.append(
                             {
                                 "label": operation.get("label"),
                                 "tool_name": tool_name,
                                 "reason": "tool_unavailable",
+                                **({"discovery_failures": discovery_failures} if discovery_failures else {}),
                             }
                         )
                         continue

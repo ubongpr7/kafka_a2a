@@ -393,6 +393,16 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
         self._tools_cache_s = float(tools_cache_s)
         self._cache: dict[tuple[tuple[str, str], ...], tuple[float, list[_ConfiguredToolSpec]]] = {}
 
+    def debug_metadata(self) -> dict[str, Any]:
+        return {
+            "executor_label": f"mcp:{self._cfg.id}",
+            "executor_type": self.__class__.__name__,
+            "server_id": self._cfg.id,
+            "server_url": self._cfg.server_url,
+            "tool_name_prefix": self._cfg.tool_name_prefix,
+            "allowed_tools": list(self._cfg.tools or []),
+        }
+
     def _resolve_auth_token(self, *, ctx: ToolContext) -> str | None:
         auth = self._cfg.auth
         if auth.mode == "none":
@@ -491,19 +501,48 @@ class CompositeToolExecutor(ToolExecutor):
     def __init__(self, *, executors: list[ToolExecutor] | None = None, skip_unavailable: bool = False) -> None:
         self._executors = [executor for executor in (executors or []) if executor is not None]
         self._skip_unavailable = bool(skip_unavailable)
+        self._last_list_tool_failures: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _executor_debug_metadata(executor: ToolExecutor) -> dict[str, Any]:
+        metadata_getter = getattr(executor, "debug_metadata", None)
+        if callable(metadata_getter):
+            try:
+                metadata = metadata_getter()
+            except Exception:
+                metadata = None
+            if isinstance(metadata, dict):
+                return {
+                    "executor_label": str(metadata.get("executor_label") or executor.__class__.__name__),
+                    "executor_type": str(metadata.get("executor_type") or executor.__class__.__name__),
+                    **metadata,
+                }
+        return {
+            "executor_label": executor.__class__.__name__,
+            "executor_type": executor.__class__.__name__,
+        }
+
+    def list_tool_failures(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self._last_list_tool_failures]
 
     async def _resolve_routes(self, *, ctx: ToolContext) -> tuple[list[ToolSpec], dict[str, ToolExecutor]]:
         tools: list[ToolSpec] = []
         routes: dict[str, ToolExecutor] = {}
+        failures: list[dict[str, Any]] = []
         for executor in self._executors:
             try:
                 current = await executor.list_tools(ctx=ctx)
-            except Exception:
+            except Exception as exc:
                 if not self._skip_unavailable:
                     raise
+                failure = {
+                    **self._executor_debug_metadata(executor),
+                    "error": str(exc),
+                }
+                failures.append(failure)
                 logger.warning(
                     "tool executor failed during list_tools; skipping executor",
-                    extra={"executor_type": executor.__class__.__name__},
+                    extra=failure,
                     exc_info=True,
                 )
                 continue
@@ -512,6 +551,7 @@ class CompositeToolExecutor(ToolExecutor):
                     raise RuntimeError(f"Duplicate tool name exposed by multiple executors: {item.name}")
                 routes[item.name] = executor
                 tools.append(item)
+        self._last_list_tool_failures = failures
         return tools, routes
 
     async def list_tools(self, *, ctx: ToolContext) -> list[ToolSpec]:
@@ -579,3 +619,6 @@ class MultiMcpToolExecutor(ToolExecutor):
 
     async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
         return await self._composite.call_tool(name=name, arguments=arguments or {}, ctx=ctx)
+
+    def list_tool_failures(self) -> list[dict[str, Any]]:
+        return self._composite.list_tool_failures()

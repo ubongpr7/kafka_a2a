@@ -318,3 +318,7 @@ async def test_composite_executor_can_skip_unavailable_executor_and_keep_local_t
 
     tools = await executor.list_tools(ctx=ToolContext())
     assert [tool.name for tool in tools] == ["local.transform"]
+    failures = executor.list_tool_failures()
+    assert len(failures) == 1
+    assert failures[0]["executor_label"] == "_FailingExecutor"
+    assert failures[0]["error"] == "upstream MCP unavailable"
