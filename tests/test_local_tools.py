@@ -162,3 +162,26 @@ def test_kafka_delegation_backend_rejects_zero_confidence_selection() -> None:
 
     with pytest.raises(RuntimeError, match="appropriate specialist agent"):
         backend._select_agent(cards=cards, request="u cant tell me aboiut my staff", agent_name=None)
+
+
+def test_kafka_delegation_backend_accepts_human_friendly_agent_aliases() -> None:
+    backend = KafkaDelegationBackend()
+    cards = [
+        AgentCard(
+            name="product_discovery",
+            description="Focused product specialist",
+            url="kafka://product_discovery",
+            version="0.1.0",
+            skills=[
+                AgentSkill(
+                    id="product_catalog_lookup",
+                    name="Product Discovery",
+                    description="Search the catalog and inspect dashboard stats.",
+                )
+            ],
+        )
+    ]
+
+    selected = backend._select_agent(cards=cards, request="show product counts", agent_name="Product Discovery")
+
+    assert selected.name == "product_discovery"

@@ -143,6 +143,27 @@ def _query_tokens(value: str, *, max_tokens: int = 12) -> list[str]:
     return tokens
 
 
+def _normalize_agent_lookup(value: str | None) -> str:
+    return "".join(ch for ch in str(value or "").strip().lower() if ch.isalnum())
+
+
+def _card_matches_requested_agent(card: AgentCard, requested: str | None) -> bool:
+    normalized = _normalize_agent_lookup(requested)
+    if not normalized:
+        return False
+
+    if _normalize_agent_lookup(card.name) == normalized:
+        return True
+
+    for skill in card.skills or []:
+        if _normalize_agent_lookup(skill.id) == normalized:
+            return True
+        if _normalize_agent_lookup(skill.name) == normalized:
+            return True
+
+    return False
+
+
 def _score_card(card: AgentCard, query: str) -> int:
     q = (query or "").strip().lower()
     if not q:
@@ -409,7 +430,7 @@ class KafkaDelegationBackend:
     def _select_agent(self, *, cards: list[AgentCard], request: str, agent_name: str | None) -> AgentCard:
         if agent_name:
             for card in cards:
-                if card.name == agent_name:
+                if card.name == agent_name or _card_matches_requested_agent(card, agent_name):
                     return card
             raise RuntimeError(f"Requested agent '{agent_name}' is not registered.")
 

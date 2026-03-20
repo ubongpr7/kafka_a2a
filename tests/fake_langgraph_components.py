@@ -34,6 +34,26 @@ class FakeInteractionLlm:
         )
 
 
+class FakeRelationInteractionLlm:
+    async def ainvoke(self, messages: list[Any], **kwargs: Any) -> Any:
+        global FAKE_LLM_CALL_COUNT
+        global FAKE_LLM_LAST_TOOLS
+        _ = messages
+        tools = kwargs.get("tools")
+        FAKE_LLM_CALL_COUNT += 1
+        FAKE_LLM_LAST_TOOLS = [tool.name for tool in tools] if isinstance(tools, list) else []
+        return SimpleNamespace(
+            content=(
+                '{"interaction_type":"dynamic_form","title":"Inventory Setup",'
+                '"description":"Please provide the Inventory Category and Stock Location IDs for setup.",'
+                '"fields":['
+                '{"name":"inventory_category","label":"Inventory Category","type":"text","required":true},'
+                '{"name":"stock_location","label":"Stock Location","type":"text","required":true}'
+                ']}'
+            )
+        )
+
+
 class FakeToolExecutor(ToolExecutor):
     def __init__(
         self,
@@ -53,6 +73,90 @@ class FakeToolExecutor(ToolExecutor):
         return [agent for agent in agents if agent["name"] not in self._hidden_agents]
 
     def _registered_agents(self) -> list[dict[str, Any]]:
+        if self._agent_name == "product":
+            return [
+                {
+                    "name": "product_discovery",
+                    "description": "Focused product specialist for catalog search, analytics, dashboard stats, and stock alerts.",
+                    "skills": [
+                        {
+                            "id": "product_catalog_lookup",
+                            "name": "Product Discovery",
+                            "description": "Search the catalog and inspect product, variant, analytics, dashboard, and stock-alert information.",
+                            "tags": ["product", "catalog", "search", "analytics", "dashboard"],
+                            "examples": ["How many products do I have?", "Search for products matching t-shirt."],
+                        }
+                    ],
+                },
+                {
+                    "name": "product_catalog_admin",
+                    "description": "Focused product specialist for catalog creation, updates, deletion, and exports.",
+                    "skills": [
+                        {
+                            "id": "product_catalog_admin",
+                            "name": "Product Catalog Admin",
+                            "description": "Create, update, delete, export, and bulk-seed products and variants.",
+                            "tags": ["product", "catalog", "create", "update"],
+                            "examples": ["Create the first products for this business."],
+                        }
+                    ],
+                },
+            ]
+        if self._agent_name == "inventory":
+            return [
+                {
+                    "name": "inventory_visibility",
+                    "description": "Focused inventory specialist for stock posture, alerts, reservations, movements, and warehouse visibility.",
+                    "skills": [
+                        {
+                            "id": "inventory_lookup",
+                            "name": "Inventory Visibility",
+                            "description": "Search inventories, inspect stock posture, and review low-stock or expiry alerts.",
+                            "tags": ["inventory", "stock", "warehouse", "alerts"],
+                            "examples": ["Show low-stock inventories."],
+                        }
+                    ],
+                },
+                {
+                    "name": "inventory_setup",
+                    "description": "Focused inventory specialist for stock-location, inventory-category, and inventory-ledger setup and maintenance workflows.",
+                    "skills": [
+                        {
+                            "id": "inventory_setup_admin",
+                            "name": "Inventory Setup Admin",
+                            "description": "Create and update stock locations, inventory categories, and inventory ledgers.",
+                            "tags": ["inventory", "setup", "locations", "categories", "create"],
+                            "examples": ["Create the main inventory ledger for onboarding."],
+                        }
+                    ],
+                },
+                {
+                    "name": "inventory_procurement",
+                    "description": "Focused inventory specialist for purchase orders and receiving.",
+                    "skills": [
+                        {
+                            "id": "inventory_procurement",
+                            "name": "Inventory Procurement",
+                            "description": "Inspect and process purchase orders, receiving, and purchase returns.",
+                            "tags": ["purchase-orders", "receiving", "procurement"],
+                            "examples": ["Show open purchase orders."],
+                        }
+                    ],
+                },
+                {
+                    "name": "inventory_fulfillment",
+                    "description": "Focused inventory specialist for reservations, adjustments, transfers, and shipments.",
+                    "skills": [
+                        {
+                            "id": "inventory_fulfillment",
+                            "name": "Inventory Fulfillment",
+                            "description": "Handle sales-order processing, reservations, adjustments, transfers, and shipment details.",
+                            "tags": ["reservation", "adjustment", "transfer", "shipment"],
+                            "examples": ["Transfer stock between locations."],
+                        }
+                    ],
+                },
+            ]
         agents = [
             {
                 "name": "onboarding",
@@ -168,6 +272,76 @@ class FakeToolExecutor(ToolExecutor):
                 },
             ),
         ]
+        if self._agent_name == "inventory_setup":
+            return specs + [
+                ToolSpec(
+                    name="inventory.search_stock_locations",
+                    description="Search stock locations.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer"},
+                        },
+                        "required": [],
+                    },
+                ),
+                ToolSpec(
+                    name="inventory.list_inventory_categories",
+                    description="List inventory categories.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer"},
+                        },
+                        "required": [],
+                    },
+                ),
+                ToolSpec(
+                    name="inventory.create_inventory",
+                    description="Create an inventory ledger.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "category_id": {
+                                        "type": "string",
+                                        "description": "UUID of InventoryCategory",
+                                    },
+                                },
+                                "required": ["name"],
+                            }
+                        },
+                        "required": ["payload"],
+                    },
+                ),
+                ToolSpec(
+                    name="inventory.create_inventory_category",
+                    description="Create an inventory category.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "default_location_id": {
+                                        "type": "string",
+                                        "description": "UUID of default StockLocation",
+                                    },
+                                },
+                                "required": ["name"],
+                            }
+                        },
+                        "required": ["payload"],
+                    },
+                ),
+            ]
         if self._agent_name != "onboarding":
             return specs
         return specs + [
@@ -389,6 +563,26 @@ class FakeToolExecutor(ToolExecutor):
                         },
                     ],
                 }
+            if agent_name == "inventory_setup":
+                return {
+                    "selected_agent": "inventory_setup",
+                    "delegated_task_id": "delegated-inventory-setup",
+                    "response_text": "Inventory setup specialist engaged.",
+                    "result_parts": [{"kind": "text", "text": "Inventory setup specialist engaged."}],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Inventory setup specialist engaged.",
+                            "final": True,
+                        },
+                    ],
+                }
             if agent_name == "users":
                 if "how many staff" in request.lower():
                     return {
@@ -516,6 +710,36 @@ class FakeToolExecutor(ToolExecutor):
                 "id": "company-1",
                 "name": "Intera Demo Company",
             }
+        if name == "inventory.search_stock_locations":
+            return {
+                "profile_id": 1,
+                "count": 2,
+                "results": [
+                    {
+                        "id": "loc-1",
+                        "name": "Main Warehouse",
+                        "location_type": "Warehouse",
+                        "physical_address": "Lagos",
+                    },
+                    {
+                        "id": "loc-2",
+                        "name": "Front Store",
+                        "location_type": "Store",
+                        "physical_address": "Abuja",
+                    },
+                ],
+            }
+        if name == "inventory.list_inventory_categories":
+            return {
+                "profile_id": 1,
+                "category": {
+                    "count": 2,
+                    "results": [
+                        {"id": "cat-1", "name": "Men's Clothes", "description": "Menswear"},
+                        {"id": "cat-2", "name": "Shoes", "description": "Footwear"},
+                    ],
+                },
+            }
         if name == "inventory.create_stock_location":
             return {
                 "id": f"stock-location-{arguments.get('name','').lower().replace(' ', '-')}",
@@ -563,6 +787,11 @@ def fake_llm_factory(*args: Any, **kwargs: Any) -> Any:
 def fake_interaction_llm_factory(*args: Any, **kwargs: Any) -> Any:
     _ = args, kwargs
     return FakeInteractionLlm()
+
+
+def fake_relation_interaction_llm_factory(*args: Any, **kwargs: Any) -> Any:
+    _ = args, kwargs
+    return FakeRelationInteractionLlm()
 
 
 def build_fake_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:

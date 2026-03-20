@@ -13,6 +13,7 @@ from kafka_a2a.langgraph_processor import (
     _normalize_tool_call_payload,
     _render_tool_prompt_block,
     _select_host_delegation_agent,
+    _select_router_delegation_agent,
     _text_from_parts,
     make_langgraph_chat_processor_from_env,
 )
@@ -49,6 +50,43 @@ def test_render_tool_prompt_block_discourages_tool_calls_for_plain_conversation(
     assert "For greetings or small talk, answer normally in plain text." in prompt
     assert "If the user asks what you can do, what help is available, or wants a list of options to choose from, prefer an interaction tool such as create_multiple_choice." in prompt
     assert 'Never output bare tool names or pseudo-tool JSON such as {"kind":"list_available_agents"}' in prompt
+
+
+def test_render_tool_prompt_block_includes_relation_lookup_rules() -> None:
+    prompt = _render_tool_prompt_block(
+        [
+            ToolSpec(
+                name="inventory.list_inventory_categories",
+                description="List categories.",
+                input_schema={"type": "object", "properties": {}, "required": []},
+            ),
+            ToolSpec(
+                name="inventory.create_inventory",
+                description="Create inventory.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "category_id": {
+                                    "type": "string",
+                                    "description": "UUID of InventoryCategory",
+                                },
+                            },
+                            "required": ["name"],
+                        }
+                    },
+                    "required": ["payload"],
+                },
+            ),
+        ]
+    )
+
+    assert "Never ask the user to manually type backend IDs or UUIDs for relational fields." in prompt
+    assert "`inventory.create_inventory.payload.category_id`" in prompt
+    assert "`inventory.list_inventory_categories`" in prompt
 
 
 def test_normalize_tool_call_payload_promotes_bare_kind_tool_call() -> None:
@@ -128,6 +166,40 @@ def test_build_product_operation_supports_nested_payload_schema() -> None:
         }
     }
     assert operation["missing_required"] == []
+
+
+def test_select_router_delegation_agent_prefers_best_matching_subspecialist() -> None:
+    selected = _select_router_delegation_agent(
+        "i want you to create inventory for me",
+        [
+            {
+                "name": "inventory_visibility",
+                "description": "Focused inventory specialist for stock posture, alerts, reservations, and warehouse visibility.",
+                "skills": [
+                    {
+                        "name": "Inventory Visibility",
+                        "description": "Search inventories and inspect stock posture.",
+                        "tags": ["inventory", "stock", "warehouse"],
+                        "examples": ["Show low-stock inventories."],
+                    }
+                ],
+            },
+            {
+                "name": "inventory_setup",
+                "description": "Focused inventory specialist for stock-location, inventory-category, and inventory-ledger setup and maintenance workflows.",
+                "skills": [
+                    {
+                        "name": "Inventory Setup Admin",
+                        "description": "Create and update stock locations, inventory categories, and inventory ledgers.",
+                        "tags": ["inventory", "setup", "create", "categories"],
+                        "examples": ["Create the main inventory ledger for onboarding."],
+                    }
+                ],
+            },
+        ],
+    )
+
+    assert selected == "inventory_setup"
 
 
 def test_classify_failed_operation_reports_tls_discovery_failure() -> None:
@@ -1265,6 +1337,78 @@ async def test_host_propagates_input_required_from_specialist() -> None:
     assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
     assert result_artifact.parts[0].data["delegated_agent"] == "product"
     assert result_artifact.parts[0].data["delegated_task_id"] == "delegated-2"
+
+
+@pytest.mark.asyncio
+async def test_inventory_router_auto_delegates_to_inventory_setup_subspecialist() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory")
+    task = Task(
+        id="task-router-inventory-create",
+        context_id="ctx-router-inventory-create",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="I want you to create an inventory for me")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="I want you to create an inventory for me")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        (
+            "delegate_to_agent",
+            {
+                "request": "I want you to create an inventory for me",
+                "agent_name": "inventory_setup",
+            },
+        ),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "inventory_setup"
+
+
+@pytest.mark.asyncio
+async def test_inventory_setup_rewrites_relation_text_fields_to_select_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_LLM_FACTORY", "tests.fake_langgraph_components:fake_relation_interaction_llm_factory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    task = Task(
+        id="task-relation-form",
+        context_id="ctx-relation-form",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="help me set up an inventory")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="help me set up an inventory")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("inventory.list_inventory_categories", {"query": "", "limit": 25}),
+        ("inventory.search_stock_locations", {"query": "", "limit": 25}),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["interaction_type"] == "dynamic_form"
+    assert "IDs" not in payload["description"]
+
+    fields = {field["name"]: field for field in payload["fields"]}
+    assert fields["inventory_category"]["type"] == "select"
+    assert fields["inventory_category"]["options"][0]["label"] == "Men's Clothes"
+    assert fields["inventory_category"]["options"][0]["value"] == "cat-1"
+    assert fields["stock_location"]["type"] == "select"
+    assert fields["stock_location"]["options"][0]["label"] == "Main Warehouse"
+    assert fields["stock_location"]["options"][0]["value"] == "loc-1"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
 
 
 @pytest.mark.asyncio

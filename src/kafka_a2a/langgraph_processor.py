@@ -91,6 +91,7 @@ def _render_tool_prompt_block(tools: list[ToolSpec]) -> str:
         + '- Never output legacy wrappers such as {"tool_code":"..."} or print(create_multiple_choice(...)) or print(delegate_to_agent(...)).\n'
         + "- You may call multiple tools in one response.\n"
         + "- After tool results are provided, respond normally with your final answer unless the tool itself is a deliberate frontend interaction payload.\n"
+        + _render_relation_prompt_block(tools)
     )
 
 
@@ -293,6 +294,9 @@ HOST_AGENT_LABELS: dict[str, str] = {
     "pos": "Point of Sale (POS)",
     "users": "User and Workspace Management",
 }
+
+
+ROUTER_AGENT_NAMES: set[str] = {"product", "inventory", "pos"}
 
 
 HOST_DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -622,6 +626,186 @@ ONBOARDING_SCOPE_LABELS: dict[str, str] = {
     "inventory_setup": "Inventory Setup",
     "product_onboarding": "Product Onboarding",
 }
+
+
+RELATION_LOOKUP_REGISTRY: dict[str, dict[str, Any]] = {
+    "inventory.list_inventory_categories": {
+        "label": "Inventory Category",
+        "model_tokens": {"inventorycategory"},
+        "aliases": {
+            "category",
+            "categoryid",
+            "defaultcategory",
+            "defaultcategoryid",
+            "inventorycategory",
+            "inventorycategoryid",
+        },
+        "default_arguments": {"query": "", "limit": 25},
+    },
+    "inventory.search_stock_locations": {
+        "label": "Stock Location",
+        "model_tokens": {"stocklocation"},
+        "aliases": {
+            "defaultlocation",
+            "defaultlocationid",
+            "fromlocationid",
+            "stocklocation",
+            "stocklocationid",
+            "tolocationid",
+        },
+        "default_arguments": {"query": "", "limit": 25},
+    },
+    "product.get_product_categories": {
+        "label": "Product Category",
+        "model_tokens": {"productcategory"},
+        "aliases": {
+            "category",
+            "categoryid",
+            "categoryrefid",
+            "defaultcategory",
+            "productcategory",
+            "productcategoryid",
+        },
+        "default_arguments": {},
+    },
+    "product.search_products": {
+        "label": "Product",
+        "model_tokens": {"product"},
+        "aliases": {"product", "productid"},
+        "default_arguments": {"query": "", "limit": 25},
+    },
+    "inventory.get_all_inventory": {
+        "label": "Inventory",
+        "model_tokens": {"inventory"},
+        "aliases": {"inventory", "inventoryid"},
+        "default_arguments": {"limit": 25},
+    },
+    "inventory.search_inventories": {
+        "label": "Inventory",
+        "model_tokens": {"inventory"},
+        "aliases": {"inventory", "inventoryid"},
+        "default_arguments": {"query": "", "limit": 25},
+    },
+}
+
+
+def _normalize_relation_token(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _relation_lookup_specs(tool_specs: list[ToolSpec]) -> list[dict[str, Any]]:
+    available_names = {spec.name for spec in tool_specs}
+    out: list[dict[str, Any]] = []
+    for tool_name, config in RELATION_LOOKUP_REGISTRY.items():
+        if tool_name not in available_names:
+            continue
+        out.append(
+            {
+                "lookup_tool": tool_name,
+                "label": str(config.get("label") or tool_name),
+                "model_tokens": {
+                    _normalize_relation_token(item)
+                    for item in config.get("model_tokens", set())
+                    if _normalize_relation_token(str(item))
+                },
+                "aliases": {
+                    _normalize_relation_token(item)
+                    for item in config.get("aliases", set())
+                    if _normalize_relation_token(str(item))
+                },
+                "default_arguments": dict(config.get("default_arguments") or {}),
+            }
+        )
+    return out
+
+
+def _iter_schema_leaf_fields(schema: dict[str, Any], *, prefix: str = "") -> list[tuple[str, dict[str, Any]]]:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return []
+
+    leaves: list[tuple[str, dict[str, Any]]] = []
+    for key, value in properties.items():
+        if not isinstance(value, dict):
+            continue
+        path = f"{prefix}.{key}" if prefix else str(key)
+        nested_properties = value.get("properties")
+        if isinstance(nested_properties, dict):
+            leaves.extend(_iter_schema_leaf_fields(value, prefix=path))
+            continue
+        leaves.append((path, value))
+    return leaves
+
+
+def _relation_model_tokens_from_field(path: str, field_schema: dict[str, Any]) -> set[str]:
+    candidates: set[str] = set()
+    description = str(field_schema.get("description") or "").strip()
+    for match in re.findall(r"UUID of ([A-Za-z][A-Za-z0-9_() ]+)", description):
+        cleaned = match.replace("(", " ").replace(")", " ")
+        for token in reversed(cleaned.split()):
+            normalized = _normalize_relation_token(token)
+            if normalized:
+                candidates.add(normalized)
+                break
+
+    normalized_path = _normalize_relation_token(path)
+    field_name = path.split(".")[-1]
+    normalized_field_name = _normalize_relation_token(field_name)
+    if normalized_field_name.endswith("id"):
+        normalized_field_name = normalized_field_name[:-2]
+    for candidate in (
+        normalized_path,
+        normalized_field_name,
+        normalized_field_name.removeprefix("default"),
+        normalized_field_name.removeprefix("parent"),
+        normalized_field_name.removeprefix("child"),
+        normalized_field_name.removeprefix("from"),
+        normalized_field_name.removeprefix("to"),
+    ):
+        if candidate:
+            candidates.add(candidate)
+    return {item for item in candidates if item}
+
+
+def _relation_prompt_hints(tool_specs: list[ToolSpec]) -> list[tuple[str, str, str]]:
+    relation_specs = _relation_lookup_specs(tool_specs)
+    if not relation_specs:
+        return []
+
+    hints: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for spec in tool_specs:
+        if not isinstance(spec.input_schema, dict):
+            continue
+        for path, field_schema in _iter_schema_leaf_fields(spec.input_schema):
+            model_tokens = _relation_model_tokens_from_field(path, field_schema)
+            for relation_spec in relation_specs:
+                if not model_tokens.intersection(relation_spec["model_tokens"]):
+                    continue
+                hint = (spec.name, path, relation_spec["lookup_tool"])
+                if hint in seen:
+                    continue
+                seen.add(hint)
+                hints.append(hint)
+    return hints
+
+
+def _render_relation_prompt_block(tools: list[ToolSpec]) -> str:
+    hints = _relation_prompt_hints(tools)
+    if not hints:
+        return ""
+
+    lines = [
+        "",
+        "Relation/lookup rules:",
+        "- Never ask the user to manually type backend IDs or UUIDs for relational fields.",
+        "- For any relational field, fetch the available records first, present human-readable labels, and submit the matching internal ID only after the user selects an option.",
+    ]
+    for tool_name, field_path, lookup_tool in hints:
+        lines.append(
+            f"- For `{tool_name}.{field_path}`, fetch options with `{lookup_tool}` and present them as selectable labels."
+        )
+    return "\n" + "\n".join(lines)
 
 
 def _with_interaction_metadata(payload: dict[str, Any], **metadata: Any) -> dict[str, Any]:
@@ -1805,6 +1989,38 @@ def _select_host_delegation_agent(query: str, agents: list[dict[str, Any]]) -> s
     return selected or None
 
 
+def _select_router_delegation_agent(query: str, agents: list[dict[str, Any]]) -> str | None:
+    if not agents:
+        return None
+    if len(agents) == 1:
+        return str(agents[0].get("name") or "").strip() or None
+
+    normalized_query = _normalize_relation_token(query)
+    for agent in agents:
+        agent_name = str(agent.get("name") or "").strip()
+        if agent_name and _normalize_relation_token(agent_name) == normalized_query:
+            return agent_name
+        for skill in agent.get("skills") or []:
+            if not isinstance(skill, dict):
+                continue
+            skill_name = str(skill.get("name") or "").strip()
+            skill_id = str(skill.get("id") or "").strip()
+            if skill_name and _normalize_relation_token(skill_name) == normalized_query:
+                return agent_name
+            if skill_id and _normalize_relation_token(skill_id) == normalized_query:
+                return agent_name
+
+    scored = sorted(
+        ((summary, _score_agent_summary(summary, query)) for summary in agents),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if not scored or scored[0][1] <= 0:
+        return None
+    selected = str(scored[0][0].get("name") or "").strip()
+    return selected or None
+
+
 def _coerce_delegated_response(
     delegated: Any,
     *,
@@ -2047,6 +2263,316 @@ def _augment_delegated_response_parts(
     if fallback_payload is not None:
         return [DataPart(data=fallback_payload)]
     return augmented or parts
+
+
+def _matching_relation_specs_for_texts(tool_specs: list[ToolSpec], *texts: str | None) -> list[dict[str, Any]]:
+    normalized_texts = [_normalize_relation_token(text) for text in texts if _normalize_relation_token(text)]
+    if not normalized_texts:
+        return []
+
+    matches: list[dict[str, Any]] = []
+    seen_tools: set[str] = set()
+    for relation_spec in _relation_lookup_specs(tool_specs):
+        aliases = set(relation_spec["aliases"]) | set(relation_spec["model_tokens"])
+        if not aliases:
+            continue
+        matched = False
+        for text in normalized_texts:
+            if any(alias and (alias == text or alias in text or text in alias) for alias in aliases):
+                matched = True
+                break
+        if not matched:
+            continue
+        lookup_tool = str(relation_spec["lookup_tool"] or "").strip()
+        if not lookup_tool or lookup_tool in seen_tools:
+            continue
+        seen_tools.add(lookup_tool)
+        matches.append(relation_spec)
+    return matches
+
+
+def _relation_items_from_lookup_output(lookup_tool: str, output: Any) -> list[dict[str, Any]]:
+    if not isinstance(output, dict):
+        return output if isinstance(output, list) else []
+
+    if lookup_tool == "inventory.list_inventory_categories":
+        category_payload = output.get("category")
+        if isinstance(category_payload, dict):
+            results = category_payload.get("results")
+            return results if isinstance(results, list) else []
+        return category_payload if isinstance(category_payload, list) else []
+
+    if lookup_tool in {
+        "inventory.search_stock_locations",
+        "product.get_product_categories",
+        "product.search_products",
+        "inventory.get_all_inventory",
+        "inventory.search_inventories",
+    }:
+        results = output.get("results")
+        return results if isinstance(results, list) else []
+
+    return []
+
+
+def _relation_option_from_item(lookup_tool: str, item: dict[str, Any]) -> dict[str, Any] | None:
+    identifier = _first_string(item, ["id", "uuid", "value"])
+    if not identifier:
+        return None
+
+    label = _first_string(
+        item,
+        [
+            "name",
+            "title",
+            "label",
+            "inventory_item_name",
+            "stock_location_name",
+            "category",
+        ],
+    )
+    if not label:
+        return None
+
+    description_parts: list[str] = []
+    if lookup_tool == "inventory.search_stock_locations":
+        location_type = _first_string(item, ["location_type"])
+        physical_address = _first_string(item, ["physical_address"])
+        if location_type:
+            description_parts.append(location_type)
+        if physical_address:
+            description_parts.append(physical_address)
+    elif lookup_tool in {"inventory.list_inventory_categories", "product.get_product_categories"}:
+        description = _first_string(item, ["description"])
+        if description:
+            description_parts.append(description)
+    elif lookup_tool == "product.search_products":
+        category = _first_string(item, ["category"])
+        sku = _first_string(item, ["sku"])
+        if category:
+            description_parts.append(category)
+        if sku:
+            description_parts.append(f"SKU: {sku}")
+    elif lookup_tool in {"inventory.get_all_inventory", "inventory.search_inventories"}:
+        category = _first_string(item, ["category"])
+        if category:
+            description_parts.append(category)
+
+    option: dict[str, Any] = {"value": identifier, "label": label}
+    if description_parts:
+        option["description"] = " | ".join(description_parts[:2])
+    return option
+
+
+async def _load_relation_options(
+    relation_spec: dict[str, Any],
+    *,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+    cache: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    lookup_tool = str(relation_spec.get("lookup_tool") or "").strip()
+    if not lookup_tool:
+        return []
+    cached = cache.get(lookup_tool)
+    if cached is not None:
+        return cached
+
+    try:
+        output = await tool_executor.call_tool(
+            name=lookup_tool,
+            arguments=dict(relation_spec.get("default_arguments") or {}),
+            ctx=tool_ctx,
+        )
+    except Exception:
+        cache[lookup_tool] = []
+        return []
+
+    options: list[dict[str, Any]] = []
+    for item in _relation_items_from_lookup_output(lookup_tool, output):
+        if not isinstance(item, dict):
+            continue
+        option = _relation_option_from_item(lookup_tool, item)
+        if option is not None:
+            options.append(option)
+    cache[lookup_tool] = options
+    return options
+
+
+def _sanitize_relation_prompt_text(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return value
+    text = re.sub(r"\bids?\b", "options", text, flags=re.IGNORECASE)
+    text = re.sub(r"\buuids?\b", "options", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bidentifier[s]?\b", "options", text, flags=re.IGNORECASE)
+    return text
+
+
+async def _rewrite_relation_interaction_payload(
+    payload: dict[str, Any],
+    *,
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any] | None:
+    interaction_type = str(payload.get("interaction_type") or "").strip().lower()
+    title = str(payload.get("title") or "").strip()
+    description = str(payload.get("description") or "").strip()
+    relation_cache: dict[str, list[dict[str, Any]]] = {}
+
+    if interaction_type == "dynamic_form":
+        fields = payload.get("fields")
+        if not isinstance(fields, list):
+            return None
+        rewritten_fields: list[dict[str, Any]] = []
+        changed = False
+        for field in fields:
+            if not isinstance(field, dict):
+                rewritten_fields.append(field)
+                continue
+            field_name = str(field.get("name") or "").strip()
+            field_label = str(field.get("label") or "").strip()
+            field_description = str(field.get("description") or "").strip()
+            relation_specs = _matching_relation_specs_for_texts(tool_specs, field_name, field_label, field_description)
+            if not relation_specs:
+                relation_specs = _matching_relation_specs_for_texts(tool_specs, title, description)
+            if not relation_specs:
+                rewritten_fields.append(field)
+                continue
+            options = await _load_relation_options(
+                relation_specs[0],
+                tool_executor=tool_executor,
+                tool_ctx=tool_ctx,
+                cache=relation_cache,
+            )
+            if not options:
+                rewritten_fields.append(field)
+                continue
+            rewritten_field = dict(field)
+            rewritten_field["type"] = "select"
+            rewritten_field["options"] = options
+            rewritten_field["placeholder"] = f"Select {relation_specs[0]['label']}"
+            rewritten_fields.append(rewritten_field)
+            changed = True
+        if changed:
+            rewritten = dict(payload)
+            rewritten["fields"] = rewritten_fields
+            if description:
+                rewritten["description"] = _sanitize_relation_prompt_text(description)
+            return rewritten
+        return None
+
+    if interaction_type == "data_table_review":
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            return None
+        rewritten_fields: list[dict[str, Any]] = []
+        changed = False
+        for row in rows:
+            if not isinstance(row, list) or not row:
+                continue
+            row_label = str(row[0] or "").strip()
+            row_value = str(row[1] or "").strip() if len(row) > 1 else ""
+            relation_specs = _matching_relation_specs_for_texts(tool_specs, row_label, title, description)
+            if relation_specs:
+                options = await _load_relation_options(
+                    relation_specs[0],
+                    tool_executor=tool_executor,
+                    tool_ctx=tool_ctx,
+                    cache=relation_cache,
+                )
+                if options:
+                    rewritten_fields.append(
+                        {
+                            "name": re.sub(r"[^a-z0-9]+", "_", row_label.lower()).strip("_") or "selection",
+                            "type": "select",
+                            "label": row_label,
+                            "required": True,
+                            "options": options,
+                            "placeholder": f"Select {relation_specs[0]['label']}",
+                        }
+                    )
+                    changed = True
+                    continue
+            rewritten_fields.append(
+                {
+                    "name": re.sub(r"[^a-z0-9]+", "_", row_label.lower()).strip("_") or "field",
+                    "type": "text",
+                    "label": row_label,
+                    "required": False,
+                    **({"placeholder": row_value} if row_value else {}),
+                }
+            )
+        if changed:
+            rewritten = {
+                key: value
+                for key, value in payload.items()
+                if key
+                not in {"interaction_type", "headers", "rows", "editable_columns", "allow_add_rows", "allow_delete_rows"}
+            }
+            rewritten["interaction_type"] = "dynamic_form"
+            rewritten["fields"] = rewritten_fields
+            if description:
+                rewritten["description"] = _sanitize_relation_prompt_text(description)
+            return rewritten
+        return None
+
+    if interaction_type == "multiple_choice":
+        relation_specs = _matching_relation_specs_for_texts(tool_specs, title, description)
+        if len(relation_specs) != 1:
+            return None
+        options = await _load_relation_options(
+            relation_specs[0],
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            cache=relation_cache,
+        )
+        if not options:
+            return None
+        rewritten = dict(payload)
+        rewritten["options"] = options
+        if description:
+            rewritten["description"] = _sanitize_relation_prompt_text(description)
+        return rewritten
+
+    return None
+
+
+async def _rewrite_relation_interaction_parts(
+    parts: list[Any],
+    *,
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> list[Any]:
+    rewritten_parts: list[Any] = []
+    changed = False
+    for part in parts:
+        payload: dict[str, Any] | None = None
+        if isinstance(part, DataPart):
+            payload = _interaction_payload_from_obj(part.data)
+        elif isinstance(part, TextPart):
+            payload = _interaction_payload_from_text(part.text)
+
+        if payload is None:
+            rewritten_parts.append(part)
+            continue
+
+        rewritten = await _rewrite_relation_interaction_payload(
+            payload,
+            tool_specs=tool_specs,
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+        )
+        if rewritten is None:
+            rewritten_parts.append(part)
+            continue
+
+        rewritten_parts.append(DataPart(data=rewritten))
+        changed = True
+
+    return rewritten_parts if changed else parts
 
 
 def _delegated_interaction_context(payload: dict[str, Any] | None) -> dict[str, str | None] | None:
@@ -3658,6 +4184,154 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     return
 
         if (
+            agent_name in ROUTER_AGENT_NAMES
+            and tool_executor is not None
+            and "delegate_to_agent" in tool_names
+            and "list_available_agents" in tool_names
+            and user_text_for_memory
+            and interaction_response is None
+            and not _is_host_introspection_query(user_text_for_memory)
+        ):
+            try:
+                router_listing_raw = await tool_executor.call_tool(
+                    name="list_available_agents",
+                    arguments={},
+                    ctx=tool_ctx,
+                )
+            except Exception:
+                router_listing_raw = None
+            router_listing = _coerce_agent_listing(router_listing_raw)
+            selected_agent = _select_router_delegation_agent(user_text_for_memory, router_listing.get("agents") or [])
+
+            if selected_agent:
+                yield TaskStatus(
+                    state=TaskState.working,
+                    message=Message(
+                        role=Role.agent,
+                        parts=[TextPart(text=f"Delegating this request to the {selected_agent} specialist agent.")],
+                        context_id=task.context_id,
+                    ),
+                )
+
+                try:
+                    delegated = await tool_executor.call_tool(
+                        name="delegate_to_agent",
+                        arguments={
+                            "request": user_text_for_memory,
+                            "agent_name": selected_agent,
+                        },
+                        ctx=tool_ctx,
+                    )
+                except Exception as exc:
+                    response_text = str(exc).strip() or "Delegation failed."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+                delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=selected_agent)
+                if delegated_response is None:
+                    response_text = "Delegation did not return a usable result."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+                yield Artifact(
+                    name="delegation",
+                    parts=[
+                        DataPart(
+                            data={
+                                "selectedAgent": delegated_response["delegated_agent"],
+                                "delegatedTaskId": delegated_response["delegated_task_id"],
+                                "finalState": delegated_response["delegated_final_state"].value,
+                                "statusUpdates": delegated_response["status_updates"],
+                            }
+                        )
+                    ],
+                )
+
+                for update in delegated_response["status_updates"]:
+                    if not isinstance(update, dict) or bool(update.get("final")):
+                        continue
+                    state_value = _coerce_task_state(update.get("state"), default=TaskState.working)
+                    message_text = _format_delegation_status_text(
+                        agent_name=delegated_response["delegated_agent"],
+                        state=state_value,
+                        message=str(update.get("message") or "").strip() or None,
+                    )
+                    yield TaskStatus(
+                        state=state_value,
+                        message=Message(
+                            role=Role.agent,
+                            parts=[TextPart(text=message_text)],
+                            context_id=task.context_id,
+                        ),
+                    )
+
+                for artifact_name, payload in delegated_response["child_artifacts"].items():
+                    if not isinstance(artifact_name, str) or not artifact_name.strip():
+                        continue
+                    parts = _ka2a_parts_from_model_content(payload)
+                    if parts:
+                        yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
+
+                response_parts = delegated_response["response_parts"]
+                response_text = delegated_response["response_text"]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=delegated_response["delegated_final_state"],
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+        if (
             agent_name == "host"
             and tool_executor is not None
             and "delegate_to_agent" in tool_names
@@ -4027,6 +4701,18 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             if not response_parts:
                 response_parts = [TextPart(text="Tool execution limit reached.")]
                 response_text = "Tool execution limit reached."
+
+        if tool_executor is not None and tool_specs and response_parts:
+            response_parts = await _rewrite_relation_interaction_parts(
+                response_parts,
+                tool_specs=tool_specs,
+                tool_executor=tool_executor,
+                tool_ctx=tool_ctx,
+            )
+            interaction_payload = _interaction_payload_from_parts(response_parts)
+            if interaction_payload is not None:
+                rewritten_text = _text_from_parts(response_parts)
+                response_text = rewritten_text or json.dumps(interaction_payload, ensure_ascii=False)
 
         artifact = Artifact(name="result", parts=response_parts or [TextPart(text=response_text)])
         yield artifact
