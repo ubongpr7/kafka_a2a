@@ -175,6 +175,7 @@ class Ka2aAgent:
 
         if self._registry is not None:
             await self._registry.publish(agent_name=self.card.name, card=self.card)
+            logger.info("published agent card to registry", extra={"agent_name": self.card.name, "topic": self._registry.topic})
             if self._cfg.registry_heartbeat_s is not None and self._cfg.registry_heartbeat_s > 0:
                 async def _heartbeat() -> None:
                     try:
@@ -183,7 +184,16 @@ class Ka2aAgent:
                                 await asyncio.wait_for(self._stop.wait(), timeout=self._cfg.registry_heartbeat_s)
                                 break
                             except asyncio.TimeoutError:
-                                await self._registry.publish(agent_name=self.card.name, card=self.card)
+                                try:
+                                    await self._registry.publish(agent_name=self.card.name, card=self.card)
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception:
+                                    logger.warning(
+                                        "failed to refresh agent card heartbeat; will retry",
+                                        extra={"agent_name": self.card.name, "topic": self._registry.topic},
+                                        exc_info=True,
+                                    )
                     except asyncio.CancelledError:
                         raise
 
