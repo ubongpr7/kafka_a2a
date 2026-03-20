@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -237,8 +240,12 @@ async def test_multi_mcp_executor_routes_tools_and_forwards_bearer(monkeypatch: 
         server_url: str,
         headers: dict[str, str],
         timeout_s: float,
+        operation: str,
         callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
     ) -> Any:
+        _ = operation, remote_tool, argument_keys
         call: dict[str, Any] = {
             "server_url": server_url,
             "headers": dict(headers),
@@ -322,9 +329,12 @@ async def test_multi_mcp_executor_composes_local_and_remote_tools(monkeypatch: p
         server_url: str,
         headers: dict[str, str],
         timeout_s: float,
+        operation: str,
         callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
     ) -> Any:
-        _ = headers, timeout_s
+        _ = headers, timeout_s, operation, remote_tool, argument_keys
 
         class _Session:
             async def list_tools(self) -> Any:
@@ -409,3 +419,146 @@ async def test_composite_executor_can_skip_unavailable_executor_and_keep_local_t
     assert len(failures) == 1
     assert failures[0]["executor_label"] == "_FailingExecutor"
     assert failures[0]["error"] == "upstream MCP unavailable"
+
+
+@pytest.mark.asyncio
+async def test_run_mcp_session_logs_and_wraps_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    class _AsyncClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self) -> "_AsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            _ = exc_type, exc, tb
+            return False
+
+    class _ClientSession:
+        def __init__(self, read_stream: Any, write_stream: Any) -> None:
+            _ = read_stream, write_stream
+
+        async def __aenter__(self) -> "_ClientSession":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            _ = exc_type, exc, tb
+            return False
+
+        async def initialize(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def fake_streamable_http_client(server_url: str, http_client: Any = None) -> Any:
+        _ = server_url, http_client
+        raise RuntimeError("tls boom")
+        yield None
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "_require_mcp",
+        lambda: (SimpleNamespace(AsyncClient=_AsyncClient), _ClientSession, fake_streamable_http_client),
+    )
+
+    with caplog.at_level(logging.INFO, logger="kafka_a2a.mcp_tools"):
+        with pytest.raises(RuntimeError, match="MCP list_tools failed during connect_stream"):
+            await mcp_tools._run_mcp_session(
+                server_url="https://inventory.mcp.example/mcp",
+                headers={"authorization": "Bearer secret"},
+                timeout_s=12.0,
+                operation="list_tools",
+                callback=lambda session: session.list_tools(),
+            )
+
+    assert "event=session_start" in caplog.text
+    assert "event=session_failed" in caplog.text
+    assert "operation=list_tools" in caplog.text
+    assert "server_url=https://inventory.mcp.example/mcp" in caplog.text
+    assert "header_names=[authorization]" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_wraps_call_tool_failure_with_remote_tool_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "search", "description": "Search products"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                _ = name, arguments
+                raise RuntimeError("remote call blew up")
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            agent_name="onboarding",
+            servers=[
+                McpServerConfig(
+                    id="products",
+                    server_url="http://products-mcp:8000/mcp",
+                    tool_name_prefix="product.",
+                )
+            ],
+        )
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"exposed tool 'product.search' -> remote tool 'search'",
+    ):
+        await executor.call_tool(name="product.search", arguments={"query": "milk"}, ctx=ToolContext())
+
+
+@pytest.mark.asyncio
+async def test_composite_executor_skip_warning_includes_inline_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _FailingRemoteExecutor(ToolExecutor):
+        def debug_metadata(self) -> dict[str, Any]:
+            return {
+                "executor_label": "mcp:inventory",
+                "agent_name": "onboarding",
+                "server_url": "https://inventory.mcp.example/mcp",
+                "auth_mode": "forward_bearer",
+            }
+
+        async def list_tools(self, *, ctx: ToolContext) -> list[ToolSpec]:
+            _ = ctx
+            raise RuntimeError("upstream MCP unavailable")
+
+        async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
+            _ = name, arguments, ctx
+            raise AssertionError("call_tool should not be used for the failing executor")
+
+    executor = CompositeToolExecutor(executors=[_FailingRemoteExecutor()], skip_unavailable=True)
+
+    with caplog.at_level(logging.WARNING, logger="kafka_a2a.mcp_tools"):
+        tools = await executor.list_tools(ctx=ToolContext())
+
+    assert tools == []
+    assert "skipping executor mcp:inventory on agent onboarding" in caplog.text
+    assert "(https://inventory.mcp.example/mcp)" in caplog.text
+    assert "auth=forward_bearer" in caplog.text

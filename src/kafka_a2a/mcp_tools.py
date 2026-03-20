@@ -34,6 +34,60 @@ def _strip(value: str | None) -> str | None:
     return value or None
 
 
+def _short_agent_name(value: str | None) -> str:
+    return _strip(value) or "unknown"
+
+
+def _format_log_kv(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple, set)):
+        return "[" + ", ".join(str(item) for item in value) + "]"
+    return str(value)
+
+
+def _log_mcp_operation(level: str, event: str, **fields: Any) -> None:
+    ordered = [f"event={event}"]
+    for key, value in fields.items():
+        if value in (None, "", [], {}, ()):
+            continue
+        ordered.append(f"{key}={_format_log_kv(value)}")
+    message = "mcp " + " ".join(ordered)
+    getattr(logger, level)(message)
+
+
+def _header_names(headers: Mapping[str, str]) -> list[str]:
+    names: set[str] = set()
+    for key in headers:
+        normalized = _strip(str(key).lower())
+        if normalized:
+            names.add(normalized)
+    return sorted(names)
+
+
+def _build_mcp_failure_message(
+    *,
+    operation: str,
+    phase: str,
+    server_url: str,
+    headers: Mapping[str, str],
+    timeout_s: float,
+    remote_tool: str | None = None,
+    argument_keys: list[str] | None = None,
+    error: Exception,
+) -> str:
+    details = [
+        f"server '{server_url}'",
+        f"headers={_format_log_kv(_header_names(headers))}",
+        f"timeout_s={float(timeout_s)}",
+    ]
+    if remote_tool:
+        details.append(f"remote_tool='{remote_tool}'")
+    if argument_keys:
+        details.append(f"argument_keys={_format_log_kv(argument_keys)}")
+    return f"MCP {operation} failed during {phase} for " + ", ".join(details) + f": {error}"
+
+
 def _to_camel(name: str) -> str:
     parts = name.split("_")
     return parts[0] + "".join(word[:1].upper() + word[1:] for word in parts[1:])
@@ -323,19 +377,58 @@ async def _run_mcp_session(
     server_url: str,
     headers: Mapping[str, str],
     timeout_s: float,
+    operation: str,
     callback: Callable[[Any], Awaitable[Any]],
+    remote_tool: str | None = None,
+    argument_keys: list[str] | None = None,
 ) -> Any:
     httpx, ClientSession, streamable_http_client = _require_mcp()
+    log_fields = {
+        "operation": operation,
+        "server_url": server_url,
+        "timeout_s": float(timeout_s),
+        "header_names": _header_names(headers),
+        "remote_tool": remote_tool,
+        "argument_keys": argument_keys,
+    }
+    phase = "connect_stream"
 
-    async with httpx.AsyncClient(
-        headers=dict(headers),
-        timeout=float(timeout_s),
-        follow_redirects=True,
-    ) as client:
-        async with streamable_http_client(server_url, http_client=client) as (read_stream, write_stream, _):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                return await callback(session)
+    _log_mcp_operation("info", "session_start", **log_fields)
+    try:
+        async with httpx.AsyncClient(
+            headers=dict(headers),
+            timeout=float(timeout_s),
+            follow_redirects=True,
+        ) as client:
+            async with streamable_http_client(server_url, http_client=client) as (read_stream, write_stream, _):
+                phase = "session_initialize"
+                _log_mcp_operation("info", "session_connected", **log_fields)
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    phase = "session_operation"
+                    _log_mcp_operation("info", "session_initialized", **log_fields)
+                    result = await callback(session)
+                    _log_mcp_operation(
+                        "info",
+                        "session_success",
+                        **log_fields,
+                        result_type=type(result).__name__,
+                    )
+                    return result
+    except Exception as exc:
+        _log_mcp_operation("warning", "session_failed", **log_fields, phase=phase, error=str(exc))
+        raise RuntimeError(
+            _build_mcp_failure_message(
+                operation=operation,
+                phase=phase,
+                server_url=server_url,
+                headers=headers,
+                timeout_s=timeout_s,
+                remote_tool=remote_tool,
+                argument_keys=argument_keys,
+                error=exc,
+            )
+        ) from exc
 
 
 def _parse_remote_tool_specs(result: Any) -> list[_RemoteToolSpec]:
@@ -374,6 +467,7 @@ async def _list_remote_tools(*, server_url: str, headers: Mapping[str, str], tim
         server_url=server_url,
         headers=headers,
         timeout_s=timeout_s,
+        operation="list_tools",
         callback=lambda session: session.list_tools(),
     )
     return _parse_remote_tool_specs(result)
@@ -387,11 +481,15 @@ async def _call_remote_tool(
     name: str,
     arguments: dict[str, Any],
 ) -> Any:
+    argument_keys = sorted(str(key) for key in (arguments or {}).keys() if str(key).strip())
     result = await _run_mcp_session(
         server_url=server_url,
         headers=headers,
         timeout_s=timeout_s,
+        operation="call_tool",
         callback=lambda session: session.call_tool(name, arguments=arguments or {}),
+        remote_tool=name,
+        argument_keys=argument_keys,
     )
     return _dump_result(result)
 
@@ -463,18 +561,21 @@ class McpHttpToolExecutor(ToolExecutor):
 
 
 class _ConfiguredMcpServerExecutor(ToolExecutor):
-    def __init__(self, *, config: McpServerConfig, timeout_s: float, tools_cache_s: float) -> None:
+    def __init__(self, *, config: McpServerConfig, timeout_s: float, tools_cache_s: float, agent_name: str | None = None) -> None:
         self._cfg = config
         self._timeout_s = float(timeout_s)
         self._tools_cache_s = float(tools_cache_s)
+        self._agent_name = _short_agent_name(agent_name)
         self._cache: dict[tuple[tuple[str, str], ...], tuple[float, list[_ConfiguredToolSpec]]] = {}
 
     def debug_metadata(self) -> dict[str, Any]:
         return {
             "executor_label": f"mcp:{self._cfg.id}",
             "executor_type": self.__class__.__name__,
+            "agent_name": self._agent_name,
             "server_id": self._cfg.id,
             "server_url": self._cfg.server_url,
+            "auth_mode": self._cfg.auth.mode,
             "tool_name_prefix": self._cfg.tool_name_prefix,
             "allowed_tools": list(self._cfg.tools or []),
         }
@@ -543,14 +644,56 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
         if cached is not None:
             ts, tools = cached
             if self._tools_cache_s <= 0 or (now - ts) < self._tools_cache_s:
+                _log_mcp_operation(
+                    "info",
+                    "list_tools_cache_hit",
+                    agent=self._agent_name,
+                    server=self._cfg.id,
+                    server_url=self._cfg.server_url,
+                    cached_tools=len(tools),
+                )
                 return list(tools)
 
-        remote_tools = await _list_remote_tools(
+        _log_mcp_operation(
+            "info",
+            "list_tools_start",
+            agent=self._agent_name,
+            server=self._cfg.id,
             server_url=self._cfg.server_url,
-            headers=headers,
-            timeout_s=self._timeout_s,
+            auth_mode=self._cfg.auth.mode,
+            bearer_present=bool(ctx.principal and ctx.principal.bearer_token),
+            allowed_tools=len(self._cfg.tools or []),
         )
+        try:
+            remote_tools = await _list_remote_tools(
+                server_url=self._cfg.server_url,
+                headers=headers,
+                timeout_s=self._timeout_s,
+            )
+        except Exception as exc:
+            _log_mcp_operation(
+                "warning",
+                "list_tools_failed",
+                agent=self._agent_name,
+                server=self._cfg.id,
+                server_url=self._cfg.server_url,
+                auth_mode=self._cfg.auth.mode,
+                error=str(exc),
+            )
+            raise RuntimeError(
+                f"MCP list_tools failed for agent '{self._agent_name}' on server '{self._cfg.id}' "
+                f"({self._cfg.server_url}): {exc}"
+            ) from exc
         tools = self._filter_tools(remote_tools)
+        _log_mcp_operation(
+            "info",
+            "list_tools_success",
+            agent=self._agent_name,
+            server=self._cfg.id,
+            server_url=self._cfg.server_url,
+            remote_tools=len(remote_tools),
+            exposed_tools=len(tools),
+        )
         self._cache[cache_key] = (now, list(tools))
         return tools
 
@@ -564,13 +707,53 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             raise RuntimeError(f"Tool '{name}' is not available from MCP server '{self._cfg.id}'.")
 
         headers = self._resolve_headers(ctx=ctx)
-        return await _call_remote_tool(
+        argument_keys = sorted(str(key) for key in (arguments or {}).keys() if str(key).strip())
+        _log_mcp_operation(
+            "info",
+            "call_tool_start",
+            agent=self._agent_name,
+            server=self._cfg.id,
             server_url=self._cfg.server_url,
-            headers=headers,
-            timeout_s=self._timeout_s,
-            name=route.remote_name,
-            arguments=arguments or {},
+            auth_mode=self._cfg.auth.mode,
+            exposed_tool=name,
+            remote_tool=route.remote_name,
+            argument_keys=argument_keys,
         )
+        try:
+            result = await _call_remote_tool(
+                server_url=self._cfg.server_url,
+                headers=headers,
+                timeout_s=self._timeout_s,
+                name=route.remote_name,
+                arguments=arguments or {},
+            )
+        except Exception as exc:
+            _log_mcp_operation(
+                "warning",
+                "call_tool_failed",
+                agent=self._agent_name,
+                server=self._cfg.id,
+                server_url=self._cfg.server_url,
+                exposed_tool=name,
+                remote_tool=route.remote_name,
+                argument_keys=argument_keys,
+                error=str(exc),
+            )
+            raise RuntimeError(
+                f"MCP call_tool failed for agent '{self._agent_name}' on server '{self._cfg.id}' "
+                f"({self._cfg.server_url}) for exposed tool '{name}' -> remote tool '{route.remote_name}': {exc}"
+            ) from exc
+        _log_mcp_operation(
+            "info",
+            "call_tool_success",
+            agent=self._agent_name,
+            server=self._cfg.id,
+            server_url=self._cfg.server_url,
+            exposed_tool=name,
+            remote_tool=route.remote_name,
+            result_type=type(result).__name__,
+        )
+        return result
 
 
 class CompositeToolExecutor(ToolExecutor):
@@ -617,12 +800,18 @@ class CompositeToolExecutor(ToolExecutor):
                 }
                 failures.append(failure)
                 executor_label = str(failure.get("executor_label") or executor.__class__.__name__)
+                agent_name = str(failure.get("agent_name") or "").strip()
                 server_url = str(failure.get("server_url") or "").strip()
+                auth_mode = str(failure.get("auth_mode") or "").strip()
+                agent_suffix = f" on agent {agent_name}" if agent_name else ""
                 server_suffix = f" ({server_url})" if server_url else ""
+                auth_suffix = f" auth={auth_mode}" if auth_mode else ""
                 logger.warning(
-                    "tool executor failed during list_tools; skipping executor %s%s: %s",
+                    "tool executor failed during list_tools; skipping executor %s%s%s%s: %s",
                     executor_label,
+                    agent_suffix,
                     server_suffix,
+                    auth_suffix,
                     str(exc),
                     extra=failure,
                     exc_info=True,
@@ -675,6 +864,7 @@ class MultiMcpToolExecutor(ToolExecutor):
                     config=server,
                     timeout_s=self._cfg.timeout_s,
                     tools_cache_s=self._cfg.tools_cache_s,
+                    agent_name=self._cfg.agent_name,
                 )
             )
         if extra_executor is not None:
