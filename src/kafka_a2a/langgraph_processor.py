@@ -1052,6 +1052,137 @@ def _tool_schema_required(spec: ToolSpec | None) -> list[str]:
     return [str(item).strip() for item in required if isinstance(item, str) and item.strip()]
 
 
+def _classify_error_text(error_text: str | None) -> dict[str, Any]:
+    raw = str(error_text or "").strip()
+    lowered = raw.lower()
+    if not raw:
+        return {"error_kind": "unknown", "error_summary": "An unknown error occurred.", "retryable": True}
+    if any(token in lowered for token in ("tlsv1_alert", "tlsv1 alert", "ssl:", "certificate verify failed", "wrong version number")):
+        return {
+            "error_kind": "tls",
+            "error_summary": "TLS handshake failed while connecting to the upstream service.",
+            "retryable": True,
+        }
+    if any(token in lowered for token in ("could not resolve host", "name or service not known", "nodename nor servname provided", "temporary failure in name resolution")):
+        return {
+            "error_kind": "dns",
+            "error_summary": "The upstream service hostname could not be resolved.",
+            "retryable": True,
+        }
+    if "timed out" in lowered or "timeout" in lowered:
+        return {
+            "error_kind": "timeout",
+            "error_summary": "The upstream service timed out before it responded.",
+            "retryable": True,
+        }
+    if any(
+        token in lowered
+        for token in (
+            "requires a forwarded bearer token",
+            "requires request-scoped mcp credentials",
+            "requires a static token",
+            "unauthorized",
+            "forbidden",
+            "401",
+            "403",
+            "authentication",
+        )
+    ):
+        return {
+            "error_kind": "auth",
+            "error_summary": "The upstream service rejected the request because authentication is missing or invalid.",
+            "retryable": False,
+        }
+    if "is not registered" in lowered or "no downstream specialist agents are registered" in lowered:
+        return {
+            "error_kind": "registry",
+            "error_summary": "The required specialist agent is not currently visible in the registry.",
+            "retryable": True,
+        }
+    if "unknown tool" in lowered or "not available from mcp server" in lowered:
+        return {
+            "error_kind": "tool_unavailable",
+            "error_summary": "The required tool is not exposed by the current agent configuration.",
+            "retryable": False,
+        }
+    return {"error_kind": "unknown", "error_summary": raw, "retryable": True}
+
+
+def _service_label_from_tool_name(tool_name: str | None) -> str:
+    name = str(tool_name or "").strip().lower()
+    if name.startswith("inventory."):
+        return "inventory"
+    if name.startswith("product."):
+        return "product"
+    if name.startswith("users."):
+        return "users"
+    if name.startswith("pos."):
+        return "pos"
+    return "service"
+
+
+def _friendly_discovery_issue_message(failure: dict[str, Any], *, tool_name: str | None = None) -> str | None:
+    if not isinstance(failure, dict):
+        return None
+    summary = str(failure.get("error_summary") or "").strip()
+    if not summary:
+        summary = _classify_error_text(failure.get("error")).get("error_summary", "").strip()
+    if not summary:
+        return None
+    label = str(
+        failure.get("server_id")
+        or failure.get("executor_label")
+        or _service_label_from_tool_name(tool_name)
+    ).strip()
+    return f"{label}: {summary}"
+
+
+def _classify_failed_operation(item: dict[str, Any]) -> dict[str, Any]:
+    reason = str(item.get("reason") or "").strip().lower()
+    tool_name = str(item.get("tool_name") or "").strip() or None
+    if reason == "missing_required_arguments":
+        missing = [
+            str(value).strip()
+            for value in item.get("missing", [])
+            if isinstance(item.get("missing"), list) and str(value).strip()
+        ]
+        missing_text = ", ".join(missing) if missing else "required fields"
+        return {
+            "error_kind": "schema_mismatch",
+            "error_summary": f"The tool schema requires additional fields: {missing_text}.",
+            "retryable": False,
+        }
+    if reason == "tool_unavailable":
+        discovery_failures = item.get("discovery_failures")
+        if isinstance(discovery_failures, list):
+            for failure in discovery_failures:
+                message = _friendly_discovery_issue_message(failure, tool_name=tool_name)
+                if message:
+                    classified = _classify_error_text(failure.get("error"))
+                    return {
+                        "error_kind": classified["error_kind"],
+                        "error_summary": message,
+                        "retryable": bool(classified.get("retryable", True)),
+                    }
+        service_label = _service_label_from_tool_name(tool_name)
+        return {
+            "error_kind": "tool_unavailable",
+            "error_summary": f"The required {service_label} tool is not currently available.",
+            "retryable": False,
+        }
+    if reason == "tool_error":
+        classified = _classify_error_text(item.get("error"))
+        service_label = _service_label_from_tool_name(tool_name)
+        if classified["error_kind"] == "unknown":
+            return {
+                "error_kind": "tool_error",
+                "error_summary": f"The {service_label} operation failed: {str(item.get('error') or '').strip()}",
+                "retryable": True,
+            }
+        return classified
+    return _classify_error_text(item.get("error"))
+
+
 def _nested_object_tool_spec(spec: ToolSpec | None, key: str) -> ToolSpec | None:
     properties = _tool_schema_properties(spec)
     nested = properties.get(key)
@@ -1220,33 +1351,25 @@ def _onboarding_operation_summary(
         lines.append("Completed: " + ", ".join(created_labels))
     if failed_operations:
         failed_labels = [str(item.get("label") or "").strip() for item in failed_operations if str(item.get("label") or "").strip()]
-        if failed_labels:
-            lines.append("Still pending: " + ", ".join(failed_labels))
-        discovery_messages: list[str] = []
-        seen_discovery_messages: set[str] = set()
+        blocker_messages: list[str] = []
+        seen_blockers: set[str] = set()
+        retryable_values: list[bool] = []
         for item in failed_operations:
-            discovery_failures = item.get("discovery_failures")
-            if not isinstance(discovery_failures, list):
+            classified = _classify_failed_operation(item)
+            retryable_values.append(bool(classified.get("retryable", True)))
+            message = str(classified.get("error_summary") or "").strip()
+            if not message or message in seen_blockers:
                 continue
-            for failure in discovery_failures:
-                if not isinstance(failure, dict):
-                    continue
-                executor_label = str(
-                    failure.get("executor_label")
-                    or failure.get("server_id")
-                    or failure.get("executor_type")
-                    or "tool executor"
-                ).strip()
-                error_text = str(failure.get("error") or "").strip()
-                if not error_text:
-                    continue
-                message = f"{executor_label}: {error_text}"
-                if message in seen_discovery_messages:
-                    continue
-                seen_discovery_messages.add(message)
-                discovery_messages.append(message)
-        if discovery_messages:
-            lines.append("Discovery issues: " + "; ".join(discovery_messages[:3]))
+            seen_blockers.add(message)
+            blocker_messages.append(message)
+        if blocker_messages:
+            lines.append("Blocking issues: " + "; ".join(blocker_messages[:3]))
+        if failed_labels:
+            if blocker_messages and len(failed_labels) > 3:
+                retry_guidance = "Retry may succeed once the blocked service recovers." if any(retryable_values) else "Retry will not help until the configuration is fixed."
+                lines.append(f"Still pending: {len(failed_labels)} onboarding steps are blocked. {retry_guidance}")
+            else:
+                lines.append("Still pending: " + ", ".join(failed_labels))
     return "\n".join(lines)
 
 
@@ -1347,6 +1470,16 @@ def _tool_discovery_failures_for_name(tool_executor: ToolExecutor | None, tool_n
     if len(failures) == 1 and isinstance(failures[0], dict):
         return [dict(failures[0])]
     return []
+
+
+def _annotate_failed_operation(item: dict[str, Any]) -> dict[str, Any]:
+    classified = _classify_failed_operation(item)
+    return {
+        **item,
+        "error_kind": classified.get("error_kind"),
+        "error_summary": classified.get("error_summary"),
+        "retryable": classified.get("retryable"),
+    }
 
 
 def _build_stock_location_operation(
@@ -3215,23 +3348,27 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     if tool_name not in tool_names:
                         discovery_failures = _tool_discovery_failures_for_name(tool_executor, tool_name)
                         failed_items.append(
-                            {
-                                "label": operation.get("label"),
-                                "tool_name": tool_name,
-                                "reason": "tool_unavailable",
-                                **({"discovery_failures": discovery_failures} if discovery_failures else {}),
-                            }
+                            _annotate_failed_operation(
+                                {
+                                    "label": operation.get("label"),
+                                    "tool_name": tool_name,
+                                    "reason": "tool_unavailable",
+                                    **({"discovery_failures": discovery_failures} if discovery_failures else {}),
+                                }
+                            )
                         )
                         continue
                     missing_required = operation.get("missing_required")
                     if isinstance(missing_required, list) and missing_required:
                         failed_items.append(
-                            {
-                                "label": operation.get("label"),
-                                "tool_name": tool_name,
-                                "reason": "missing_required_arguments",
-                                "missing": list(missing_required),
-                            }
+                            _annotate_failed_operation(
+                                {
+                                    "label": operation.get("label"),
+                                    "tool_name": tool_name,
+                                    "reason": "missing_required_arguments",
+                                    "missing": list(missing_required),
+                                }
+                            )
                         )
                         continue
 
@@ -3251,12 +3388,14 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         }
                     except Exception as exc:
                         failed_items.append(
-                            {
-                                "label": operation.get("label"),
-                                "tool_name": tool_name,
-                                "reason": "tool_error",
-                                "error": str(exc),
-                            }
+                            _annotate_failed_operation(
+                                {
+                                    "label": operation.get("label"),
+                                    "tool_name": tool_name,
+                                    "reason": "tool_error",
+                                    "error": str(exc),
+                                }
+                            )
                         )
 
                 if not any_tool_executed and not created_map and "delegate_to_agent" in tool_names:
@@ -3271,7 +3410,15 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                             ctx=tool_ctx,
                         )
                     except Exception as exc:
-                        failed_items.append({"label": "delegated onboarding submission", "reason": "tool_error", "error": str(exc)})
+                        failed_items.append(
+                            _annotate_failed_operation(
+                                {
+                                    "label": "delegated onboarding submission",
+                                    "reason": "tool_error",
+                                    "error": str(exc),
+                                }
+                            )
+                        )
                     else:
                         delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=fallback_agent)
                         if delegated_response is not None:

@@ -5,9 +5,11 @@ import pytest
 from tests import fake_langgraph_components
 from kafka_a2a.langgraph_processor import (
     _build_product_operation,
+    _classify_failed_operation,
     _interaction_payload_from_text,
     _is_host_capability_picker_query,
     _is_host_introspection_query,
+    _onboarding_operation_summary,
     _normalize_tool_call_payload,
     _render_tool_prompt_block,
     _select_host_delegation_agent,
@@ -126,6 +128,72 @@ def test_build_product_operation_supports_nested_payload_schema() -> None:
         }
     }
     assert operation["missing_required"] == []
+
+
+def test_classify_failed_operation_reports_tls_discovery_failure() -> None:
+    classified = _classify_failed_operation(
+        {
+            "label": "stock location 'Main Warehouse'",
+            "tool_name": "inventory.create_stock_location",
+            "reason": "tool_unavailable",
+            "discovery_failures": [
+                {
+                    "server_id": "inventory",
+                    "error": "httpx.ConnectError: [SSL: TLSV1_ALERT_INTERNAL_ERROR] tlsv1 alert internal error (_ssl.c:1032)",
+                }
+            ],
+        }
+    )
+
+    assert classified["error_kind"] == "tls"
+    assert classified["retryable"] is True
+    assert classified["error_summary"] == "inventory: TLS handshake failed while connecting to the upstream service."
+
+
+def test_onboarding_operation_summary_prioritizes_blocking_issues() -> None:
+    summary = _onboarding_operation_summary(
+        created_operations={},
+        failed_operations=[
+            {
+                "label": "stock location 'Main Warehouse'",
+                "tool_name": "inventory.create_stock_location",
+                "reason": "tool_unavailable",
+                "discovery_failures": [
+                    {
+                        "server_id": "inventory",
+                        "error": "httpx.ConnectError: [SSL: TLSV1_ALERT_INTERNAL_ERROR] tlsv1 alert internal error (_ssl.c:1032)",
+                    }
+                ],
+            },
+            {
+                "label": "inventory category 'Beverages'",
+                "tool_name": "inventory.create_inventory_category",
+                "reason": "tool_unavailable",
+                "discovery_failures": [
+                    {
+                        "server_id": "inventory",
+                        "error": "httpx.ConnectError: [SSL: TLSV1_ALERT_INTERNAL_ERROR] tlsv1 alert internal error (_ssl.c:1032)",
+                    }
+                ],
+            },
+            {
+                "label": "product 'Soda'",
+                "tool_name": "product.create_product",
+                "reason": "missing_required_arguments",
+                "missing": ["payload"],
+            },
+            {
+                "label": "delegated onboarding submission",
+                "reason": "tool_error",
+                "error": "Requested agent 'inventory' is not registered.",
+            },
+        ],
+    )
+
+    assert "Blocking issues: inventory: TLS handshake failed while connecting to the upstream service." in summary
+    assert "The tool schema requires additional fields: payload." in summary
+    assert "The required specialist agent is not currently visible in the registry." in summary
+    assert "Still pending: 4 onboarding steps are blocked." in summary
 
 
 def test_normalize_tool_call_payload_supports_legacy_tool_code_wrapper() -> None:

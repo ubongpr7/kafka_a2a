@@ -33,7 +33,7 @@ def test_multi_mcp_config_resolves_agent_specific_servers(tmp_path: Path) -> Non
         json.dumps(
             {
                 "version": 1,
-                "servers": [
+                "sharedServers": [
                     {
                         "id": "shared",
                         "serverUrl": "http://shared-mcp:8000/mcp",
@@ -133,6 +133,93 @@ def test_multi_mcp_config_resolves_multiple_specialists_without_cross_pollution(
     assert [server.id for server in product_cfg.servers] == ["products"]
     assert [server.id for server in inventory_cfg.servers] == ["inventory"]
     assert [server.id for server in pos_cfg.servers] == ["pos"]
+
+
+def test_multi_mcp_config_supports_shared_server_references(tmp_path: Path) -> None:
+    config_path = tmp_path / "mcp-tools.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "sharedServers": [
+                    {
+                        "id": "inventory",
+                        "serverUrl": "http://inventory-mcp:8000/mcp",
+                        "toolNamePrefix": "inventory.",
+                        "auth": {"mode": "forward_bearer"},
+                    },
+                    {
+                        "id": "products",
+                        "serverUrl": "http://products-mcp:8000/mcp",
+                        "toolNamePrefix": "product.",
+                        "auth": {"mode": "forward_bearer"},
+                    },
+                ],
+                "agents": {
+                    "onboarding": {
+                        "servers": [
+                            {
+                                "ref": "inventory",
+                                "tools": ["create_inventory", "create_stock_location"],
+                            },
+                            {
+                                "ref": "products",
+                                "tools": ["create_product"],
+                            },
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = MultiMcpToolExecutorConfig.from_env(
+        {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": "onboarding"}
+    )
+
+    assert [server.id for server in cfg.servers] == ["inventory", "products"]
+    assert cfg.servers[0].server_url == "http://inventory-mcp:8000/mcp"
+    assert cfg.servers[0].tool_name_prefix == "inventory."
+    assert cfg.servers[0].tools == ["create_inventory", "create_stock_location"]
+    assert cfg.servers[1].server_url == "http://products-mcp:8000/mcp"
+    assert cfg.servers[1].tool_name_prefix == "product."
+    assert cfg.servers[1].tools == ["create_product"]
+
+
+def test_multi_mcp_config_does_not_apply_shared_servers_as_host_fallback(tmp_path: Path) -> None:
+    config_path = tmp_path / "mcp-tools.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "sharedServers": [
+                    {
+                        "id": "inventory",
+                        "serverUrl": "http://inventory-mcp:8000/mcp",
+                        "toolNamePrefix": "inventory.",
+                    }
+                ],
+                "agents": {
+                    "inventory": {
+                        "servers": [
+                            {
+                                "ref": "inventory",
+                                "tools": ["search_inventories"],
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = MultiMcpToolExecutorConfig.from_env(
+        {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": "host"}
+    )
+
+    assert cfg.servers == []
 
 
 @pytest.mark.asyncio

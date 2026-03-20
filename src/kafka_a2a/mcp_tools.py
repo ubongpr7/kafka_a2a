@@ -135,6 +135,62 @@ class McpServerConfig(_McpToolsModel):
         return out or None
 
 
+class McpAgentServerConfig(_McpToolsModel):
+    ref: str | None = None
+    id: str | None = None
+    server_url: str | None = None
+    tools: list[str] | None = None
+    tool_name_prefix: str | None = None
+    headers: dict[str, str] | None = None
+    auth: McpServerAuthConfig | None = None
+    enabled: bool | None = None
+
+    @field_validator("ref", "id", "server_url", "tool_name_prefix")
+    @classmethod
+    def _strip_optional_text(cls, value: str | None) -> str | None:
+        return _strip(value)
+
+    @field_validator("tools")
+    @classmethod
+    def _normalize_tools(cls, value: list[str] | None) -> list[str] | None:
+        return McpServerConfig._normalize_tools(value)
+
+    @field_validator("headers")
+    @classmethod
+    def _normalize_headers(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        return McpServerConfig._normalize_headers(value)
+
+    def resolve(self, *, shared_servers: dict[str, McpServerConfig]) -> McpServerConfig:
+        base = shared_servers.get(self.ref or "") if self.ref else None
+        if self.ref and base is None:
+            raise ValueError(f"Unknown MCP server reference '{self.ref}'.")
+
+        identifier = self.id or (base.id if base is not None else None)
+        server_url = self.server_url or (base.server_url if base is not None else None)
+        if not identifier:
+            raise ValueError("MCP agent server entry requires 'id' or a valid 'ref'.")
+        if not server_url:
+            raise ValueError(f"MCP agent server '{identifier}' requires 'serverUrl' or a valid 'ref'.")
+
+        return McpServerConfig(
+            id=identifier,
+            server_url=server_url,
+            tools=self.tools if self.tools is not None else (list(base.tools) if base and base.tools is not None else None),
+            tool_name_prefix=(
+                self.tool_name_prefix
+                if self.tool_name_prefix is not None
+                else (base.tool_name_prefix if base is not None else None)
+            ),
+            headers=self.headers if self.headers is not None else (dict(base.headers) if base and base.headers is not None else None),
+            auth=self.auth if self.auth is not None else (base.auth.model_copy(deep=True) if base is not None else McpServerAuthConfig()),
+            enabled=self.enabled if self.enabled is not None else (base.enabled if base is not None else True),
+        )
+
+
+class McpAgentDefinition(_McpToolsModel):
+    servers: list[McpAgentServerConfig] = Field(default_factory=list)
+
+
 class McpAgentConfig(_McpToolsModel):
     servers: list[McpServerConfig] = Field(default_factory=list)
 
@@ -142,13 +198,33 @@ class McpAgentConfig(_McpToolsModel):
 class McpAgentConfigFile(_McpToolsModel):
     version: int = 1
     servers: list[McpServerConfig] = Field(default_factory=list)
-    agents: dict[str, McpAgentConfig] = Field(default_factory=dict)
+    shared_servers: list[McpServerConfig] = Field(default_factory=list)
+    agents: dict[str, McpAgentDefinition] = Field(default_factory=dict)
 
     def resolve_agent(self, *, agent_name: str | None) -> McpAgentConfig:
         name = _strip(agent_name)
         if name and name in self.agents:
-            return self.agents[name]
-        return McpAgentConfig(servers=list(self.servers))
+            shared_servers = {server.id: server for server in [*self.servers, *self.shared_servers]}
+            return McpAgentConfig(
+                servers=[
+                    server.resolve(shared_servers=shared_servers)
+                    for server in self.agents[name].servers
+                ]
+            )
+        return McpAgentConfig(
+            servers=[
+                McpAgentServerConfig(
+                    id=server.id,
+                    server_url=server.server_url,
+                    tools=list(server.tools) if server.tools is not None else None,
+                    tool_name_prefix=server.tool_name_prefix,
+                    headers=dict(server.headers) if server.headers is not None else None,
+                    auth=server.auth.model_copy(deep=True),
+                    enabled=server.enabled,
+                )
+                for server in self.servers
+            ]
+        )
 
 
 @dataclass(slots=True)

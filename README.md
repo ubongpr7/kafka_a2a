@@ -457,14 +457,31 @@ Example `mcp-tools.example.json`:
 ```json
 {
   "version": 1,
+  "sharedServers": [
+    {
+      "id": "products",
+      "serverUrl": "http://products-mcp:8000/mcp/",
+      "toolNamePrefix": "product.",
+      "auth": { "mode": "forward_bearer" }
+    },
+    {
+      "id": "inventory",
+      "serverUrl": "http://inventory-mcp:8000/mcp/",
+      "toolNamePrefix": "inventory.",
+      "auth": { "mode": "forward_bearer" }
+    },
+    {
+      "id": "pos",
+      "serverUrl": "http://pos-mcp:8000/mcp/",
+      "toolNamePrefix": "pos.",
+      "auth": { "mode": "forward_bearer" }
+    }
+  ],
   "agents": {
     "product": {
       "servers": [
         {
-          "id": "products",
-          "serverUrl": "http://products-mcp:8000/mcp/",
-          "toolNamePrefix": "product.",
-          "auth": { "mode": "forward_bearer" },
+          "ref": "products",
           "tools": [
             "search_products",
             "get_product_details",
@@ -480,10 +497,7 @@ Example `mcp-tools.example.json`:
     "inventory": {
       "servers": [
         {
-          "id": "inventory",
-          "serverUrl": "http://inventory-mcp:8000/mcp/",
-          "toolNamePrefix": "inventory.",
-          "auth": { "mode": "forward_bearer" },
+          "ref": "inventory",
           "tools": [
             "search_inventories",
             "get_inventory_alerts",
@@ -498,10 +512,7 @@ Example `mcp-tools.example.json`:
     "pos": {
       "servers": [
         {
-          "id": "pos",
-          "serverUrl": "http://pos-mcp:8000/mcp/",
-          "toolNamePrefix": "pos.",
-          "auth": { "mode": "forward_bearer" },
+          "ref": "pos",
           "tools": [
             "get_current_pos_session",
             "search_pos_orders",

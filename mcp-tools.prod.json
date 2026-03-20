@@ -1,15 +1,44 @@
 {
   "version": 1,
+  "sharedServers": [
+    {
+      "id": "users",
+      "serverUrl": "https://users.mcp.interaims.com/mcp/",
+      "toolNamePrefix": "users.",
+      "auth": {
+        "mode": "forward_bearer"
+      }
+    },
+    {
+      "id": "products",
+      "serverUrl": "https://product.mcp.interaims.com/mcp/",
+      "toolNamePrefix": "product.",
+      "auth": {
+        "mode": "forward_bearer"
+      }
+    },
+    {
+      "id": "inventory",
+      "serverUrl": "https://inventory.mcp.interaims.com/mcp/",
+      "toolNamePrefix": "inventory.",
+      "auth": {
+        "mode": "forward_bearer"
+      }
+    },
+    {
+      "id": "pos",
+      "serverUrl": "https://pos.mcp.interaims.com/mcp/",
+      "toolNamePrefix": "pos.",
+      "auth": {
+        "mode": "forward_bearer"
+      }
+    }
+  ],
   "agents": {
     "onboarding": {
       "servers": [
         {
-          "id": "users",
-          "serverUrl": "https://users.mcp.interaims.com/mcp/",
-          "toolNamePrefix": "users.",
-          "auth": {
-            "mode": "forward_bearer"
-          },
+          "ref": "users",
           "tools": [
             "list_accessible_company_profiles",
             "get_active_company_profile",
@@ -17,12 +46,7 @@
           ]
         },
         {
-          "id": "products",
-          "serverUrl": "https://product.mcp.interaims.com/mcp/",
-          "toolNamePrefix": "product.",
-          "auth": {
-            "mode": "forward_bearer"
-          },
+          "ref": "products",
           "tools": [
             "create_product",
             "create_product_variant",
@@ -30,12 +54,7 @@
           ]
         },
         {
-          "id": "inventory",
-          "serverUrl": "https://inventory.mcp.interaims.com/mcp/",
-          "toolNamePrefix": "inventory.",
-          "auth": {
-            "mode": "forward_bearer"
-          },
+          "ref": "inventory",
           "tools": [
             "search_inventories",
             "search_stock_locations",
@@ -50,12 +69,7 @@
     "users": {
       "servers": [
         {
-          "id": "users",
-          "serverUrl": "https://users.mcp.interaims.com/mcp/",
-          "toolNamePrefix": "users.",
-          "auth": {
-            "mode": "forward_bearer"
-          },
+          "ref": "users",
           "tools": [
             "list_accessible_company_profiles",
             "get_active_company_profile",
@@ -80,12 +94,7 @@
     "product": {
       "servers": [
         {
-          "id": "products",
-          "serverUrl": "https://product.mcp.interaims.com/mcp/",
-          "toolNamePrefix": "product.",
-          "auth": {
-            "mode": "forward_bearer"
-          },
+          "ref": "products",
           "tools": [
             "search_products",
             "get_product_details",
@@ -148,12 +157,7 @@
     "inventory": {
       "servers": [
         {
-          "id": "inventory",
-          "serverUrl": "https://inventory.mcp.interaims.com/mcp/",
-          "toolNamePrefix": "inventory.",
-          "auth": {
-            "mode": "forward_bearer"
-          },
+          "ref": "inventory",
           "tools": [
             "search_inventories",
             "get_inventory_details",
@@ -224,12 +228,7 @@
     "pos": {
       "servers": [
         {
-          "id": "pos",
-          "serverUrl": "https://pos.mcp.interaims.com/mcp/",
-          "toolNamePrefix": "pos.",
-          "auth": {
-            "mode": "forward_bearer"
-          },
+          "ref": "pos",
           "tools": [
             "get_current_pos_session",
             "search_pos_orders",
