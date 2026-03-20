@@ -57,6 +57,7 @@
           "ref": "inventory",
           "tools": [
             "search_inventories",
+            "get_all_inventory",
             "search_stock_locations",
             "list_inventory_categories",
             "create_inventory_category",
@@ -160,6 +161,8 @@
           "ref": "inventory",
           "tools": [
             "search_inventories",
+            "list_inventory_items",
+            "get_all_inventory",
             "get_inventory_details",
             "search_stock_items",
             "get_inventory_item_details",
