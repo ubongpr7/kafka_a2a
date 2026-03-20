@@ -1052,6 +1052,26 @@ def _tool_schema_required(spec: ToolSpec | None) -> list[str]:
     return [str(item).strip() for item in required if isinstance(item, str) and item.strip()]
 
 
+def _nested_object_tool_spec(spec: ToolSpec | None, key: str) -> ToolSpec | None:
+    properties = _tool_schema_properties(spec)
+    nested = properties.get(key)
+    if not isinstance(nested, dict):
+        return None
+    nested_properties = nested.get("properties")
+    nested_required = nested.get("required")
+    if not isinstance(nested_properties, dict) and not isinstance(nested_required, list):
+        return None
+    return ToolSpec(
+        name=f"{spec.name}.{key}" if spec is not None else key,
+        description="",
+        input_schema={
+            "type": "object",
+            "properties": nested_properties if isinstance(nested_properties, dict) else {},
+            "required": nested_required if isinstance(nested_required, list) else [],
+        },
+    )
+
+
 def _match_schema_key(spec: ToolSpec | None, candidates: list[str]) -> str | None:
     if not candidates:
         return None
@@ -1347,9 +1367,30 @@ def _build_product_operation(
     tool_name = "product.create_product"
     spec = _tool_spec_by_name(tool_specs, tool_name)
     arguments = _company_context_arguments(spec, company_context)
+    base_argument_keys = set(arguments)
     _set_schema_arg(arguments, spec, ["name", "product_name", "productName", "title"], product_name)
     _set_schema_arg(arguments, spec, ["category_name", "categoryName", "product_category", "productCategory", "category"], product_category)
     _set_schema_arg(arguments, spec, ["pos_ready", "posReady", "pos_visible", "posVisible", "quick_sale", "quickSale"], pos_ready)
+    payload_spec = _nested_object_tool_spec(spec, "payload")
+    payload_required = "payload" in _tool_schema_required(spec)
+    top_level_product_args_added = bool(set(arguments) - base_argument_keys)
+    if payload_spec is not None and (payload_required or not top_level_product_args_added):
+        payload_arguments: dict[str, Any] = {}
+        _set_schema_arg(payload_arguments, payload_spec, ["name", "product_name", "productName", "title"], product_name)
+        _set_schema_arg(
+            payload_arguments,
+            payload_spec,
+            ["category_name", "categoryName", "product_category", "productCategory", "category"],
+            product_category,
+        )
+        _set_schema_arg(
+            payload_arguments,
+            payload_spec,
+            ["pos_ready", "posReady", "pos_visible", "posVisible", "quick_sale", "quickSale"],
+            pos_ready,
+        )
+        if payload_arguments:
+            arguments["payload"] = payload_arguments
     return {
         "tool_name": tool_name,
         "label": f"product '{product_name}'",

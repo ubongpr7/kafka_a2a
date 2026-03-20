@@ -4,6 +4,7 @@ import pytest
 
 from tests import fake_langgraph_components
 from kafka_a2a.langgraph_processor import (
+    _build_product_operation,
     _interaction_payload_from_text,
     _is_host_capability_picker_query,
     _is_host_introspection_query,
@@ -86,6 +87,45 @@ def test_normalize_tool_call_payload_leaves_interaction_payload_untouched() -> N
     normalized = _normalize_tool_call_payload(payload, tool_names={"create_dynamic_form"})
 
     assert normalized == payload
+
+
+def test_build_product_operation_supports_nested_payload_schema() -> None:
+    operation = _build_product_operation(
+        tool_specs=[
+            ToolSpec(
+                name="product.create_product",
+                description="Create a product.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "category_name": {"type": "string"},
+                                "pos_ready": {"type": "boolean"},
+                            },
+                            "required": ["name"],
+                        }
+                    },
+                    "required": ["payload"],
+                },
+            )
+        ],
+        company_context=None,
+        product_name="Women's Cotton T-Shirt",
+        product_category="Women's Wear",
+        pos_ready=True,
+    )
+
+    assert operation["arguments"] == {
+        "payload": {
+            "name": "Women's Cotton T-Shirt",
+            "category_name": "Women's Wear",
+            "pos_ready": True,
+        }
+    }
+    assert operation["missing_required"] == []
 
 
 def test_normalize_tool_call_payload_supports_legacy_tool_code_wrapper() -> None:
