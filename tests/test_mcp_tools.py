@@ -225,6 +225,55 @@ def test_multi_mcp_config_does_not_apply_shared_servers_as_host_fallback(tmp_pat
     assert cfg.servers == []
 
 
+def test_prod_config_keeps_top_level_domain_routers_free_of_remote_tool_surfaces() -> None:
+    config_path = Path(__file__).resolve().parents[1] / "mcp-tools.prod.json"
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    parsed = MultiMcpToolExecutorConfig.from_env(
+        {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": "product"}
+    )
+    assert parsed.servers == []
+
+    parsed = MultiMcpToolExecutorConfig.from_env(
+        {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": "inventory"}
+    )
+    assert parsed.servers == []
+
+    parsed = MultiMcpToolExecutorConfig.from_env(
+        {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": "pos"}
+    )
+    assert parsed.servers == []
+
+    # The file itself should still expose focused MCP surfaces through sub-agents.
+    assert "product_discovery" in raw["agents"]
+    assert "inventory_visibility" in raw["agents"]
+    assert "pos_live" in raw["agents"]
+
+
+def test_prod_config_splits_heavy_domains_into_focused_subagents() -> None:
+    config_path = Path(__file__).resolve().parents[1] / "mcp-tools.prod.json"
+
+    expected = {
+        "product_discovery": ("products", 12),
+        "product_catalog_admin": ("products", 20),
+        "product_merchandising": ("products", 24),
+        "product_pricing": ("products", 22),
+        "inventory_visibility": ("inventory", 18),
+        "inventory_setup": ("inventory", 18),
+        "inventory_procurement": ("inventory", 18),
+        "inventory_fulfillment": ("inventory", 25),
+        "pos_live": ("pos", 30),
+        "pos_admin": ("pos", 20),
+    }
+
+    for agent_name, (server_id, max_tools) in expected.items():
+        cfg = MultiMcpToolExecutorConfig.from_env(
+            {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": agent_name}
+        )
+        assert [server.id for server in cfg.servers] == [server_id]
+        assert len(cfg.servers[0].tools or []) <= max_tools
+        assert len(cfg.servers[0].tools or []) > 0
+
+
 @pytest.mark.asyncio
 async def test_multi_mcp_executor_routes_tools_and_forwards_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
     from kafka_a2a import mcp_tools

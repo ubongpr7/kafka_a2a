@@ -51,7 +51,7 @@ Wire format:
 ## Quickstart (Docker Compose)
 
 This repo ships a single `docker-compose.yml` that starts:
-- The real Intera agents (`host-agent`, `onboarding-agent`, `users-agent`, `product-agent`, `inventory-agent`, and `pos-agent`)
+- The real Intera agents, including top-level routers (`host-agent`, `onboarding-agent`, `users-agent`, `product-agent`, `inventory-agent`, `pos-agent`) and focused product/inventory/POS sub-agents
 - A gateway (`/chat`, `/upload`, `/stream`)
 - An A2A-compatible HTTP proxy (JSON-RPC POST `/` + SSE streaming + Agent Card endpoint)
 
@@ -81,7 +81,7 @@ If your Kafka cluster has **auto-topic-creation disabled**, create the required 
 
 ```bash
 # Uses KA2A_BOOTSTRAP_SERVERS from .env
-docker compose run --rm gateway ensure-topics --agents host,onboarding,users,product,inventory,pos --client-ids gateway,proxy
+docker compose run --rm gateway ensure-topics --agents host,onboarding,users,product,inventory,pos,product_discovery,product_catalog_admin,product_merchandising,product_pricing,inventory_visibility,inventory_setup,inventory_procurement,inventory_fulfillment,pos_live,pos_admin --client-ids gateway,proxy
 ```
 
 Optional: if you want to run Kafka locally for development, you can use `kafka/docker-compose.yml` and then point
@@ -293,7 +293,9 @@ AgentCard override (optional):
 - `KA2A_AGENT_CARD_PATH=/path/to/agent-card.json` (mount it in Docker and the agent will merge Kafka transport info)
   - Example cards are in `agent_cards/host.agent-card.json`, `agent_cards/onboarding.agent-card.json`,
     `agent_cards/users.agent-card.json`, `agent_cards/product.agent-card.json`,
-    `agent_cards/inventory.agent-card.json`, and `agent_cards/pos.agent-card.json`
+    `agent_cards/inventory.agent-card.json`, `agent_cards/pos.agent-card.json`,
+    plus focused sub-agent cards such as `agent_cards/product_discovery.agent-card.json`,
+    `agent_cards/inventory_visibility.agent-card.json`, and `agent_cards/pos_live.agent-card.json`
 
 Long-session memory (optional):
 - `KA2A_CONTEXT_MEMORY_STORE` = `off` | `memory` | `redis` (default `off`)

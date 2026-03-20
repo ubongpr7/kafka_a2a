@@ -21,6 +21,7 @@ services:
     environment:
       KA2A_SYSTEM_PROMPT_PATH: /app/prompts/host_agent.txt
       KA2A_TOOL_EXECUTOR: kafka_a2a.local_tools:build_interaction_tool_executor
+      KA2A_ALLOWED_DOWNSTREAM_AGENTS: onboarding,users,product,inventory,pos
     command:
       [
         "agent",
@@ -40,6 +41,7 @@ services:
     environment:
       KA2A_SYSTEM_PROMPT_PATH: /app/prompts/onboarding_agent.txt
       KA2A_TOOL_EXECUTOR: kafka_a2a.local_tools:build_interaction_tool_executor
+      KA2A_ALLOWED_DOWNSTREAM_AGENTS: users,product,inventory
     command:
       [
         "agent",
@@ -57,11 +59,81 @@ services:
       - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
     environment:
       KA2A_SYSTEM_PROMPT_PATH: /app/prompts/product_agent.txt
+      KA2A_TOOL_EXECUTOR: kafka_a2a.local_tools:build_interaction_tool_executor
+      KA2A_ALLOWED_DOWNSTREAM_AGENTS: product_discovery,product_catalog_admin,product_merchandising,product_pricing
     command:
       [
         "agent",
         "--agent-card-path",
         "/app/agent_cards/product.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  product-discovery-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/product_discovery_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/product_discovery.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  product-catalog-admin-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/product_catalog_admin_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/product_catalog_admin.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  product-merchandising-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/product_merchandising_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/product_merchandising.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  product-pricing-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/product_pricing_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/product_pricing.agent-card.json",
         "--processor",
         "langgraph-chat"
       ]
@@ -74,11 +146,81 @@ services:
       - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
     environment:
       KA2A_SYSTEM_PROMPT_PATH: /app/prompts/inventory_agent.txt
+      KA2A_TOOL_EXECUTOR: kafka_a2a.local_tools:build_interaction_tool_executor
+      KA2A_ALLOWED_DOWNSTREAM_AGENTS: inventory_visibility,inventory_setup,inventory_procurement,inventory_fulfillment
     command:
       [
         "agent",
         "--agent-card-path",
         "/app/agent_cards/inventory.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  inventory-visibility-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/inventory_visibility_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/inventory_visibility.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  inventory-setup-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/inventory_setup_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/inventory_setup.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  inventory-procurement-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/inventory_procurement_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/inventory_procurement.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  inventory-fulfillment-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/inventory_fulfillment_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/inventory_fulfillment.agent-card.json",
         "--processor",
         "langgraph-chat"
       ]
@@ -108,11 +250,47 @@ services:
       - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
     environment:
       KA2A_SYSTEM_PROMPT_PATH: /app/prompts/pos_agent.txt
+      KA2A_TOOL_EXECUTOR: kafka_a2a.local_tools:build_interaction_tool_executor
+      KA2A_ALLOWED_DOWNSTREAM_AGENTS: pos_live,pos_admin
     command:
       [
         "agent",
         "--agent-card-path",
         "/app/agent_cards/pos.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  pos-live-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/pos_live_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/pos_live.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+
+  pos-admin-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/pos_admin_agent.txt
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/pos_admin.agent-card.json",
         "--processor",
         "langgraph-chat"
       ]
@@ -124,8 +302,18 @@ services:
       - onboarding-agent
       - users-agent
       - product-agent
+      - product-discovery-agent
+      - product-catalog-admin-agent
+      - product-merchandising-agent
+      - product-pricing-agent
       - inventory-agent
+      - inventory-visibility-agent
+      - inventory-setup-agent
+      - inventory-procurement-agent
+      - inventory-fulfillment-agent
       - pos-agent
+      - pos-live-agent
+      - pos-admin-agent
     ports:
       - "7006:7006"
     command: ["gateway", "--default-agent", "host", "--host", "0.0.0.0", "--port", "7006"]
@@ -137,8 +325,18 @@ services:
       - onboarding-agent
       - users-agent
       - product-agent
+      - product-discovery-agent
+      - product-catalog-admin-agent
+      - product-merchandising-agent
+      - product-pricing-agent
       - inventory-agent
+      - inventory-visibility-agent
+      - inventory-setup-agent
+      - inventory-procurement-agent
+      - inventory-fulfillment-agent
       - pos-agent
+      - pos-live-agent
+      - pos-admin-agent
     ports:
       - "7007:7007"
     command: ["proxy", "--agent-name", "host", "--host", "0.0.0.0", "--port", "7007"]

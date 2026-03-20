@@ -1,7 +1,7 @@
 {
   "protocolVersion": "0.3.0",
   "name": "pos",
-  "description": "POS service specialist agent for cashier sessions, live orders, held carts, terminals, tables, customers, discounts, and daily sales state.",
+  "description": "POS orchestration agent that routes live cashier/order work and setup/admin tasks to focused POS specialists.",
   "url": "kafka://pos",
   "preferredTransport": "kafka",
   "version": "0.1.0",
@@ -15,7 +15,7 @@
     {
       "id": "pos_live_operations",
       "name": "POS Live Operations",
-      "description": "Inspect the cashier's current session, active POS orders, held carts, and order workflow state using the POS MCP tools.",
+      "description": "Route active cashier-session, draft-order, held-cart, checkout, payment, and live order workflow requests to the live POS specialist.",
       "tags": ["pos", "cashier", "session", "orders", "held-carts", "checkout"],
       "examples": [
         "What POS session is currently open for me?",
@@ -28,7 +28,7 @@
     {
       "id": "pos_setup_visibility",
       "name": "POS Setup Visibility",
-      "description": "Inspect POS configuration, terminals, tables, customers, discounts, and daily sales posture.",
+      "description": "Route POS configuration, terminals, tables, customers, discounts, and daily sales questions to the POS admin specialist.",
       "tags": ["configuration", "terminals", "tables", "customers", "discounts", "sales"],
       "examples": [
         "Show the active POS configuration.",

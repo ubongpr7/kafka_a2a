@@ -1,0 +1,29 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "pos_live",
+  "description": "Focused POS specialist for live cashier sessions, active and held orders, checkout actions, reservations, and live order fulfillment state.",
+  "url": "kafka://pos_live",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "pos_live_operations",
+      "name": "POS Live Operations",
+      "description": "Inspect and act on the current POS session, draft orders, held carts, checkout, and payment flow.",
+      "tags": ["pos", "cashier", "session", "orders", "held-carts", "checkout", "payment"],
+      "examples": [
+        "What POS session is currently open for me?",
+        "Show held POS carts.",
+        "Process payment for the current order."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "inventory_visibility",
+  "description": "Focused inventory specialist for stock posture, inventory lookup, alerts, warehouse visibility, reservations, movements, tracking, and expiry monitoring.",
+  "url": "kafka://inventory_visibility",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "inventory_lookup",
+      "name": "Inventory Visibility",
+      "description": "Search inventories, inspect stock posture, track movements, and review low-stock or expiry alerts.",
+      "tags": ["inventory", "stock", "warehouse", "alerts", "reorder", "expiry", "reservations", "movements"],
+      "examples": [
+        "Show low-stock inventories.",
+        "Inspect what is stored in Rack B.",
+        "Show recent stock movements for barcode B-123."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

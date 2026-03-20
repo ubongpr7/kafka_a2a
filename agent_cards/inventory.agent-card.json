@@ -1,7 +1,7 @@
 {
   "protocolVersion": "0.3.0",
   "name": "inventory",
-  "description": "Inventory service specialist agent for stock visibility, inventory setup, locations, reservations, movements, and inventory alerts inside Intera Inventory.",
+  "description": "Inventory orchestration agent that routes visibility, setup, procurement, and fulfillment tasks to focused inventory specialists.",
   "url": "kafka://inventory",
   "preferredTransport": "kafka",
   "version": "0.1.0",
@@ -13,10 +13,10 @@
   "defaultOutputModes": ["text"],
   "skills": [
     {
-      "id": "inventory_lookup",
-      "name": "Inventory Lookup",
-      "description": "Search inventories and inspect current stock posture, alerts, warehouse readiness, and other inventory-state questions using the inventory MCP tools.",
-      "tags": ["inventory", "stock", "warehouse", "alerts", "reorder", "expiry"],
+      "id": "inventory_visibility",
+      "name": "Inventory Visibility",
+      "description": "Route inventory lookup, warehouse posture, low-stock, expiry, reservations, and movement tracing questions to the visibility specialist.",
+      "tags": ["inventory", "stock", "warehouse", "alerts", "reorder", "expiry", "tracking"],
       "examples": [
         "Show low-stock inventories.",
         "Check whether printer toner is running low.",
@@ -28,7 +28,7 @@
     {
       "id": "inventory_setup_admin",
       "name": "Inventory Setup Admin",
-      "description": "Create and update stock locations, inventory categories, and inventory ledgers for onboarding and workspace setup flows.",
+      "description": "Route stock-location, inventory-category, and inventory-ledger setup work to the inventory setup specialist.",
       "tags": ["inventory", "setup", "onboarding", "locations", "categories", "create", "warehouse"],
       "examples": [
         "Create the first stock locations for this company.",
@@ -39,14 +39,27 @@
       "outputModes": ["text"]
     },
     {
-      "id": "stock_operations_visibility",
-      "name": "Stock Operations Visibility",
-      "description": "Inspect stock locations, reservations, and movement history for inventory operations.",
-      "tags": ["reservations", "movements", "locations", "lot", "serial", "tracking"],
+      "id": "inventory_procurement",
+      "name": "Inventory Procurement",
+      "description": "Route purchase-order and procurement workflows, including receiving and purchase-return preparation, to the procurement specialist.",
+      "tags": ["purchase-orders", "receiving", "procurement", "vendors", "purchase-return"],
       "examples": [
-        "Find stock reservations for sales order SO-1002.",
-        "Show recent stock movements for barcode B-123.",
-        "Inspect what is stored in Rack B."
+        "Show open purchase orders.",
+        "Receive items against a purchase order.",
+        "Download the purchase order PDF."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    },
+    {
+      "id": "inventory_fulfillment",
+      "name": "Inventory Fulfillment",
+      "description": "Route sales-order, return-order, reservation, transfer, and stock-adjustment workflows to the fulfillment specialist.",
+      "tags": ["sales-orders", "returns", "fulfillment", "reservation", "adjustment", "transfer"],
+      "examples": [
+        "Reserve stock for a sales order.",
+        "Ship a sales order.",
+        "Transfer stock between locations."
       ],
       "inputModes": ["text"],
       "outputModes": ["text"]

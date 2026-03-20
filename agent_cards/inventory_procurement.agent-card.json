@@ -1,0 +1,29 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "inventory_procurement",
+  "description": "Focused inventory specialist for purchase-order visibility, receiving, procurement workflows, purchase-order documents, and purchase-return preparation.",
+  "url": "kafka://inventory_procurement",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "inventory_procurement",
+      "name": "Inventory Procurement",
+      "description": "Inspect and process purchase orders, receiving, line items, purchase returns, and procurement documents.",
+      "tags": ["purchase-orders", "receiving", "procurement", "purchase-return", "suppliers"],
+      "examples": [
+        "Show open purchase orders.",
+        "Receive items against a purchase order.",
+        "Download the purchase order PDF."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

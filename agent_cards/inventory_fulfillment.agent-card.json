@@ -1,0 +1,29 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "inventory_fulfillment",
+  "description": "Focused inventory specialist for sales-order, return-order, reservation, stock-adjustment, transfer, and shipment workflows.",
+  "url": "kafka://inventory_fulfillment",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "inventory_fulfillment",
+      "name": "Inventory Fulfillment",
+      "description": "Handle sales-order processing, return-order processing, reservations, adjustments, transfers, and shipment details.",
+      "tags": ["sales-orders", "returns", "fulfillment", "reservation", "adjustment", "transfer", "shipment"],
+      "examples": [
+        "Reserve stock for a sales order.",
+        "Ship a sales order.",
+        "Transfer stock between locations."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

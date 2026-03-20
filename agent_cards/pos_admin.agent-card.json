@@ -1,0 +1,29 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "pos_admin",
+  "description": "Focused POS specialist for POS configuration, terminals, tables, customers, discounts, session history, and daily sales posture.",
+  "url": "kafka://pos_admin",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "pos_setup_visibility",
+      "name": "POS Setup Visibility",
+      "description": "Inspect and maintain POS configuration, terminals, tables, customers, discounts, and daily sales posture.",
+      "tags": ["configuration", "terminals", "tables", "customers", "discounts", "sales", "admin"],
+      "examples": [
+        "Show the active POS configuration.",
+        "List active terminals.",
+        "Summarize today's POS sales."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

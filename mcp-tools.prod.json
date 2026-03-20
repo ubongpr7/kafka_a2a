@@ -92,7 +92,7 @@
         }
       ]
     },
-    "product": {
+    "product_discovery": {
       "servers": [
         {
           "ref": "products",
@@ -101,25 +101,54 @@
             "get_product_details",
             "search_product_variants",
             "get_product_analytics",
-            "get_product_price_history",
-            "get_product_pricing_rules",
             "get_product_variant_details",
             "get_product_attributes",
             "get_product_attribute_values",
             "get_product_categories",
             "get_product_dashboard_stats",
-            "get_product_stock_alerts",
-            "get_product_price_trends",
+            "get_product_stock_alerts"
+          ]
+        }
+      ]
+    },
+    "product_catalog_admin": {
+      "servers": [
+        {
+          "ref": "products",
+          "tools": [
+            "search_products",
+            "get_product_details",
+            "search_product_variants",
+            "get_product_variant_details",
+            "get_product_categories",
             "create_product",
             "update_product",
-            "toggle_product_quick_sale",
-            "toggle_product_featured",
             "create_product_variant",
             "update_product_variant",
-            "toggle_variant_featured",
-            "toggle_variant_pos_visible",
             "delete_product",
             "delete_product_variant",
+            "export_product_catalog_csv",
+            "export_product_variant_csv",
+            "trigger_ai_bulk_product_create",
+            "get_bulk_product_task_status",
+            "bulk_update_product_pos_settings"
+          ]
+        }
+      ]
+    },
+    "product_merchandising": {
+      "servers": [
+        {
+          "ref": "products",
+          "tools": [
+            "search_products",
+            "get_product_details",
+            "search_product_variants",
+            "get_product_variant_details",
+            "toggle_product_quick_sale",
+            "toggle_product_featured",
+            "toggle_variant_featured",
+            "toggle_variant_pos_visible",
             "list_product_attribute_links",
             "create_product_attribute_link",
             "update_product_attribute_link",
@@ -128,6 +157,27 @@
             "update_product_attribute_value",
             "delete_product_attribute_value",
             "toggle_product_attribute_value_active",
+            "list_variant_media",
+            "add_variant_media",
+            "remove_variant_media",
+            "set_attachment_primary",
+            "remove_attachment"
+          ]
+        }
+      ]
+    },
+    "product_pricing": {
+      "servers": [
+        {
+          "ref": "products",
+          "tools": [
+            "search_products",
+            "get_product_details",
+            "search_product_variants",
+            "get_product_variant_details",
+            "get_product_price_history",
+            "get_product_pricing_rules",
+            "get_product_price_trends",
             "create_pricing_strategy",
             "update_pricing_strategy",
             "delete_pricing_strategy",
@@ -139,23 +189,13 @@
             "reject_price_change",
             "search_purchase_price_history",
             "end_purchase_price_period",
-            "export_product_catalog_csv",
-            "export_product_variant_csv",
             "export_product_price_history_csv",
-            "list_variant_media",
-            "add_variant_media",
-            "remove_variant_media",
-            "set_attachment_primary",
-            "remove_attachment",
-            "trigger_ai_bulk_product_create",
-            "get_bulk_product_task_status",
-            "bulk_update_product_pos_settings",
             "bulk_update_product_prices"
           ]
         }
       ]
     },
-    "inventory": {
+    "inventory_visibility": {
       "servers": [
         {
           "ref": "inventory",
@@ -172,6 +212,42 @@
             "search_stock_reservations",
             "search_stock_movements",
             "get_stock_analytics",
+            "get_stock_item_tracking_history",
+            "search_expiring_stock_items",
+            "search_low_stock_items"
+          ]
+        }
+      ]
+    },
+    "inventory_setup": {
+      "servers": [
+        {
+          "ref": "inventory",
+          "tools": [
+            "search_inventories",
+            "get_all_inventory",
+            "get_inventory_details",
+            "search_stock_locations",
+            "list_inventory_categories",
+            "get_inventory_category_tree",
+            "get_inventory_category_details",
+            "get_inventory_category_children",
+            "get_inventory_category_inventories",
+            "create_inventory_category",
+            "update_inventory_category",
+            "create_inventory",
+            "update_inventory",
+            "create_stock_location",
+            "update_stock_location"
+          ]
+        }
+      ]
+    },
+    "inventory_procurement": {
+      "servers": [
+        {
+          "ref": "inventory",
+          "tools": [
             "search_purchase_orders",
             "get_purchase_order_details",
             "get_purchase_order_analytics",
@@ -181,6 +257,21 @@
             "complete_purchase_order",
             "cancel_purchase_order",
             "create_purchase_return_order",
+            "list_purchase_order_line_items",
+            "add_purchase_order_line_item",
+            "update_purchase_order_line_item",
+            "remove_purchase_order_line_item",
+            "download_purchase_order_pdf",
+            "resend_purchase_order_email"
+          ]
+        }
+      ]
+    },
+    "inventory_fulfillment": {
+      "servers": [
+        {
+          "ref": "inventory",
+          "tools": [
             "search_sales_orders",
             "get_sales_order_details",
             "reserve_sales_order",
@@ -198,27 +289,7 @@
             "create_stock_reservation",
             "release_stock_reservation",
             "fulfill_stock_reservation",
-            "list_inventory_categories",
-            "get_inventory_category_tree",
-            "get_inventory_category_details",
-            "get_inventory_category_children",
-            "get_inventory_category_inventories",
-            "create_inventory_category",
-            "update_inventory_category",
-            "create_inventory",
-            "update_inventory",
-            "create_stock_location",
-            "update_stock_location",
-            "get_stock_item_tracking_history",
             "update_stock_item_status",
-            "search_expiring_stock_items",
-            "search_low_stock_items",
-            "list_purchase_order_line_items",
-            "add_purchase_order_line_item",
-            "update_purchase_order_line_item",
-            "remove_purchase_order_line_item",
-            "download_purchase_order_pdf",
-            "resend_purchase_order_email",
             "list_sales_order_line_items",
             "get_sales_order_shipments",
             "add_sales_order_line_item",
@@ -228,7 +299,7 @@
         }
       ]
     },
-    "pos": {
+    "pos_live": {
       "servers": [
         {
           "ref": "pos",
@@ -236,13 +307,7 @@
             "get_current_pos_session",
             "search_pos_orders",
             "get_pos_order_details",
-            "get_pos_daily_summary",
-            "get_pos_configuration",
-            "search_pos_terminals",
-            "search_pos_tables",
-            "search_pos_customers",
             "list_held_pos_orders",
-            "search_pos_discounts",
             "open_pos_session",
             "close_pos_session",
             "get_or_create_pos_draft_order",
@@ -261,6 +326,26 @@
             "hold_pos_order",
             "retrieve_held_pos_order",
             "cancel_pos_order",
+            "update_pos_order",
+            "assign_customer_to_pos_order",
+            "assign_table_to_pos_order",
+            "search_pos_customers",
+            "search_pos_tables"
+          ]
+        }
+      ]
+    },
+    "pos_admin": {
+      "servers": [
+        {
+          "ref": "pos",
+          "tools": [
+            "get_pos_daily_summary",
+            "get_pos_configuration",
+            "search_pos_terminals",
+            "search_pos_tables",
+            "search_pos_customers",
+            "search_pos_discounts",
             "list_pos_sessions",
             "get_pos_session_details",
             "create_pos_configuration",
@@ -272,10 +357,7 @@
             "create_pos_table",
             "update_pos_table",
             "create_pos_discount",
-            "update_pos_discount",
-            "update_pos_order",
-            "assign_customer_to_pos_order",
-            "assign_table_to_pos_order"
+            "update_pos_discount"
           ]
         }
       ]

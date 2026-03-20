@@ -1,0 +1,29 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "product_discovery",
+  "description": "Focused product specialist for catalog search, variant lookup, product analytics, dashboard stats, and product stock alerts.",
+  "url": "kafka://product_discovery",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "product_catalog_lookup",
+      "name": "Product Catalog Lookup",
+      "description": "Search the catalog and inspect product, variant, analytics, dashboard, and stock-alert information.",
+      "tags": ["product", "catalog", "search", "sku", "barcode", "analytics", "dashboard", "stock-alerts"],
+      "examples": [
+        "Search for products matching 'printer ink'.",
+        "Show product details for a barcode.",
+        "List products currently low on stock."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

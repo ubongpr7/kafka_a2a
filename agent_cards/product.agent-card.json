@@ -1,7 +1,7 @@
 {
   "protocolVersion": "0.3.0",
   "name": "product",
-  "description": "Product service specialist agent for catalog search, onboarding creation, variants, pricing, and product analytics inside Intera Inventory.",
+  "description": "Product orchestration agent that routes catalog discovery, catalog administration, merchandising, and pricing tasks to focused product specialists.",
   "url": "kafka://product",
   "preferredTransport": "kafka",
   "version": "0.1.0",
@@ -13,10 +13,10 @@
   "defaultOutputModes": ["text"],
   "skills": [
     {
-      "id": "product_catalog_lookup",
-      "name": "Product Catalog Lookup",
-      "description": "Search the Product service and answer product discovery questions using the product MCP tools.",
-      "tags": ["product", "catalog", "search", "sku", "barcode", "product-service"],
+      "id": "product_catalog_discovery",
+      "name": "Product Catalog Discovery",
+      "description": "Route product search, variant lookup, dashboard, stock-alert, and analytics questions to the product discovery specialist.",
+      "tags": ["product", "catalog", "search", "sku", "barcode", "analytics", "dashboard"],
       "examples": [
         "Search for products matching 'printer ink'.",
         "Find barcode scanners in the catalog.",
@@ -27,27 +27,40 @@
       "outputModes": ["text"]
     },
     {
-      "id": "product_catalog_onboarding",
-      "name": "Product Catalog Onboarding",
-      "description": "Create initial products, variants, and related catalog setup items during guided onboarding or catalog seeding flows.",
-      "tags": ["product", "onboarding", "catalog", "create", "variants", "setup"],
+      "id": "product_catalog_administration",
+      "name": "Product Catalog Administration",
+      "description": "Route product creation, product updates, bulk catalog seeding, and catalog export work to the product admin specialist.",
+      "tags": ["product", "catalog", "create", "update", "delete", "variants", "bulk"],
       "examples": [
         "Create the first products for this business.",
         "Seed the initial catalog during onboarding.",
-        "Add a first set of POS-ready products."
+        "Bulk update POS settings for selected products."
       ],
       "inputModes": ["text"],
       "outputModes": ["text"]
     },
     {
-      "id": "product_pricing_and_variants",
-      "name": "Product Pricing and Variants",
-      "description": "Inspect product variants, pricing rules, price history, and product analytics.",
-      "tags": ["variants", "pricing", "analytics", "price-history", "pricing-rules", "pos-ready"],
+      "id": "product_merchandising",
+      "name": "Product Merchandising",
+      "description": "Route featured/quick-sale toggles, variant visibility, media, and product attribute maintenance to the merchandising specialist.",
+      "tags": ["merchandising", "featured", "quick-sale", "media", "attributes", "variant"],
       "examples": [
-        "Show the variants for product Espresso.",
+        "Mark a product as featured.",
+        "Update product attribute values.",
+        "Manage variant media attachments."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    },
+    {
+      "id": "product_pricing",
+      "name": "Product Pricing",
+      "description": "Route pricing rules, price-history, price-trend, and purchase-price workflows to the pricing specialist.",
+      "tags": ["pricing", "price-history", "price-trends", "pricing-rules", "purchase-price"],
+      "examples": [
         "Inspect recent price changes for a product.",
-        "Check whether a product is POS-ready and low on stock."
+        "Show the pricing rules for a product.",
+        "Bulk update product prices."
       ],
       "inputModes": ["text"],
       "outputModes": ["text"]

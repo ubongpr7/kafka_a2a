@@ -1,0 +1,29 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "product_pricing",
+  "description": "Focused product specialist for price history, price trends, pricing strategies, pricing rules, purchase-price history, and bulk price updates.",
+  "url": "kafka://product_pricing",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "product_pricing",
+      "name": "Product Pricing",
+      "description": "Inspect and manage pricing rules, price history, price trends, and bulk price changes.",
+      "tags": ["pricing", "price-history", "price-trends", "pricing-rules", "pricing-strategy", "purchase-price"],
+      "examples": [
+        "Inspect recent price changes for a product.",
+        "Show the pricing rules for a product.",
+        "Bulk update product prices."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

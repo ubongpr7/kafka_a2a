@@ -1,0 +1,29 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "product_merchandising",
+  "description": "Focused product specialist for featured and quick-sale toggles, variant visibility, product attributes, and media attachment workflows.",
+  "url": "kafka://product_merchandising",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "product_merchandising",
+      "name": "Product Merchandising",
+      "description": "Maintain product merchandising state, attribute values, and variant media.",
+      "tags": ["product", "merchandising", "featured", "quick-sale", "media", "attributes", "variant"],
+      "examples": [
+        "Mark a product as featured.",
+        "Update product attribute values.",
+        "Set the primary image for a variant."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}
