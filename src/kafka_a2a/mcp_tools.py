@@ -540,8 +540,14 @@ class CompositeToolExecutor(ToolExecutor):
                     "error": str(exc),
                 }
                 failures.append(failure)
+                executor_label = str(failure.get("executor_label") or executor.__class__.__name__)
+                server_url = str(failure.get("server_url") or "").strip()
+                server_suffix = f" ({server_url})" if server_url else ""
                 logger.warning(
-                    "tool executor failed during list_tools; skipping executor",
+                    "tool executor failed during list_tools; skipping executor %s%s: %s",
+                    executor_label,
+                    server_suffix,
+                    str(exc),
                     extra=failure,
                     exc_info=True,
                 )
