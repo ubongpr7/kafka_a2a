@@ -1144,6 +1144,7 @@ async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects
     assert payload["onboarding_scope"] == "inventory_setup"
 
     fields = {field["name"]: field for field in payload["steps"][0]["fields"]}
+    assert fields["default_inventory_name"]["type"] == "text"
     assert fields["related_stock_location_id"]["type"] == "select"
     assert fields["related_stock_location_id"]["options"][0]["label"] == "Main Warehouse"
     assert fields["related_stock_location_id"]["options"][0]["value"] == "loc-1"

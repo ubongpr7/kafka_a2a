@@ -837,6 +837,30 @@ def _normalize_relation_token(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
 
+def _relation_text_match_score(text: str, alias: str) -> int:
+    normalized_text = _normalize_relation_token(text)
+    normalized_alias = _normalize_relation_token(alias)
+    if not normalized_text or not normalized_alias:
+        return 0
+
+    prefixes = ("default", "related", "parent", "child", "from", "to", "selected", "primary")
+    suffixes = ("id", "uuid", "ref", "reference", "identifier")
+
+    if normalized_text == normalized_alias:
+        return 500 + len(normalized_alias)
+    if any(normalized_text == f"{normalized_alias}{suffix}" for suffix in suffixes):
+        return 480 + len(normalized_alias)
+    if any(normalized_text == f"{prefix}{normalized_alias}" for prefix in prefixes):
+        return 460 + len(normalized_alias)
+    if any(normalized_text == f"{prefix}{normalized_alias}{suffix}" for prefix in prefixes for suffix in suffixes):
+        return 470 + len(normalized_alias)
+    if any(normalized_text.endswith(f"{normalized_alias}{suffix}") for suffix in suffixes):
+        return 300 + len(normalized_alias)
+    if normalized_text.endswith(normalized_alias):
+        return 200 + len(normalized_alias)
+    return 0
+
+
 def _relation_lookup_specs(tool_specs: list[ToolSpec]) -> list[dict[str, Any]]:
     available_names = {spec.name for spec in tool_specs}
     out: list[dict[str, Any]] = []
@@ -2570,25 +2594,24 @@ def _matching_relation_specs_for_texts(tool_specs: list[ToolSpec], *texts: str |
     if not normalized_texts:
         return []
 
-    matches: list[dict[str, Any]] = []
-    seen_tools: set[str] = set()
+    scored_matches: list[tuple[int, int, dict[str, Any]]] = []
     for relation_spec in _relation_lookup_specs(tool_specs):
         aliases = set(relation_spec["aliases"]) | set(relation_spec["model_tokens"])
         if not aliases:
             continue
-        matched = False
+        best_score = 0
+        best_alias_len = 0
         for text in normalized_texts:
-            if any(alias and (alias == text or alias in text or text in alias) for alias in aliases):
-                matched = True
-                break
-        if not matched:
+            for alias in aliases:
+                score = _relation_text_match_score(text, alias)
+                if score > best_score:
+                    best_score = score
+                    best_alias_len = len(alias)
+        if best_score <= 0:
             continue
-        lookup_tool = str(relation_spec["lookup_tool"] or "").strip()
-        if not lookup_tool or lookup_tool in seen_tools:
-            continue
-        seen_tools.add(lookup_tool)
-        matches.append(relation_spec)
-    return matches
+        scored_matches.append((best_score, best_alias_len, relation_spec))
+    scored_matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [relation_spec for _, _, relation_spec in scored_matches]
 
 
 def _relation_items_from_lookup_output(lookup_tool: str, output: Any) -> list[dict[str, Any]]:
@@ -2878,6 +2901,9 @@ async def _rewrite_relation_interaction_payload(
                     tool_ctx=tool_ctx,
                     cache=relation_cache,
                 )
+                if not options:
+                    rewritten_fields.append(field)
+                    continue
                 rewritten_field = dict(field)
                 rewritten_field["type"] = "select"
                 rewritten_field["options"] = options
