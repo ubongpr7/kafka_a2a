@@ -569,6 +569,189 @@ async def test_host_capability_selection_routes_onboarding_to_guided_flow_reques
 
 
 @pytest.mark.asyncio
+async def test_host_capability_selection_inventory_opens_domain_area_picker() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Choose What You Need Help With",
+        "description": "Select the area you want help with. I can continue from your choice.",
+        "options": [
+            {"value": "onboarding", "label": "Inventory Onboarding"},
+            {"value": "product", "label": "Product Management"},
+            {"value": "inventory", "label": "Inventory Management"},
+            {"value": "pos", "label": "Point of Sale (POS)"},
+            {"value": "users", "label": "User and Workspace Management"},
+            {"value": "general", "label": "General Question"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
+    task = Task(
+        id="task-capability-inventory-menu",
+        context_id="ctx-capability-inventory-menu",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"inventory","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="hello, what can you do for me")]),
+            Message(role=Role.agent, parts=[DataPart(data=picker_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"inventory","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        (
+            "create_multiple_choice",
+            {
+                "title": "Inventory Management",
+                "description": (
+                    "Choose the inventory area you want help with. You can also type a specific inventory question."
+                ),
+                "options": [
+                    {"value": "inventory_setup", "label": "Set Up Inventory"},
+                    {"value": "inventory_visibility", "label": "Stock and Warehouse Visibility"},
+                    {"value": "inventory_procurement", "label": "Purchase Orders and Receiving"},
+                    {"value": "inventory_fulfillment", "label": "Transfers, Adjustments, and Fulfillment"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["interaction_type"] == "multiple_choice"
+    assert payload["workflow"] == "host_domain_area_picker"
+    assert payload["workflow_stage"] == "area_picker"
+    assert payload["domain_agent"] == "inventory"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_host_inventory_domain_picker_selection_delegates_to_inventory_router() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    domain_picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Inventory Management",
+        "description": "Choose the inventory area you want help with. You can also type a specific inventory question.",
+        "options": [
+            {"value": "inventory_setup", "label": "Set Up Inventory"},
+            {"value": "inventory_visibility", "label": "Stock and Warehouse Visibility"},
+            {"value": "inventory_procurement", "label": "Purchase Orders and Receiving"},
+            {"value": "inventory_fulfillment", "label": "Transfers, Adjustments, and Fulfillment"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+        "workflow": "host_domain_area_picker",
+        "workflow_stage": "area_picker",
+        "domain_agent": "inventory",
+    }
+    task = Task(
+        id="task-capability-inventory-route",
+        context_id="ctx-capability-inventory-route",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[
+                    TextPart(
+                        text='{"type":"multiple_choice_response","selected":"inventory_setup","additional_input":null}'
+                    )
+                ],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="hello, what can you do for me")]),
+            Message(role=Role.agent, parts=[DataPart(data=domain_picker_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"inventory_setup","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "The user selected Set Up Inventory from the Inventory Management menu. "
+                    "Help them create or configure stock locations, inventory categories, or inventory ledgers. "
+                    "Start with a short structured choice or the next required setup step. "
+                    "Never ask for raw internal ids when lookups or selections can be used instead."
+                ),
+                "agent_name": "inventory",
+            },
+        ),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "inventory"
+
+
+@pytest.mark.asyncio
+async def test_host_inventory_domain_picker_free_text_stays_in_inventory_domain() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    domain_picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Inventory Management",
+        "description": "Choose the inventory area you want help with. You can also type a specific inventory question.",
+        "options": [
+            {"value": "inventory_setup", "label": "Set Up Inventory"},
+            {"value": "inventory_visibility", "label": "Stock and Warehouse Visibility"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+        "workflow": "host_domain_area_picker",
+        "workflow_stage": "area_picker",
+        "domain_agent": "inventory",
+    }
+    task = Task(
+        id="task-capability-inventory-free-text",
+        context_id="ctx-capability-inventory-free-text",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="show low stock")]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="hello, what can you do for me")]),
+            Message(role=Role.agent, parts=[DataPart(data=domain_picker_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="show low stock")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "delegate_to_agent",
+            {
+                "request": "show low stock",
+                "agent_name": "inventory",
+            },
+        ),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "inventory"
+
+
+@pytest.mark.asyncio
 async def test_host_direct_staff_query_routes_to_users() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="host")
     task = Task(

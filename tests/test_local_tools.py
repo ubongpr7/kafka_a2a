@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from kafka_a2a.local_tools import KafkaDelegationBackend, LocalInteractionToolExecutor, _score_card
@@ -185,3 +187,62 @@ def test_kafka_delegation_backend_accepts_human_friendly_agent_aliases() -> None
     selected = backend._select_agent(cards=cards, request="show product counts", agent_name="Product Discovery")
 
     assert selected.name == "product_discovery"
+
+
+def test_kafka_delegation_backend_uses_agent_specific_client_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KA2A_HOST_DELEGATOR_CLIENT_ID", "host-delegator")
+
+    host_backend = KafkaDelegationBackend(agent_name="host")
+    inventory_backend = KafkaDelegationBackend(agent_name="inventory")
+
+    assert host_backend._delegator_client_id == "host-delegator"
+    assert inventory_backend._delegator_client_id == "inventory-delegator"
+    assert inventory_backend._reply_group_id.startswith("ka2a.client.inventory-delegator.")
+
+
+def test_kafka_delegation_backend_ignores_zero_gateway_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KA2A_GATEWAY_REQUEST_TIMEOUT_S", "0")
+    monkeypatch.delenv("KA2A_DELEGATION_REQUEST_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("KA2A_HOST_DELEGATION_REQUEST_TIMEOUT_S", raising=False)
+
+    backend = KafkaDelegationBackend(agent_name="inventory")
+
+    assert backend._request_timeout_s == 30.0
+
+
+@pytest.mark.asyncio
+async def test_kafka_delegation_backend_times_out_stuck_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = KafkaDelegationBackend(agent_name="inventory")
+    backend._request_timeout_s = 0.01
+    backend._state.started = True
+
+    async def _list_registered_cards() -> list[AgentCard]:
+        return [
+            AgentCard(
+                name="inventory_setup",
+                description="Inventory setup specialist",
+                url="kafka://inventory_setup",
+                version="0.1.0",
+            )
+        ]
+
+    class _SlowClient:
+        async def stream_message(self, *, agent_name: str, message, metadata=None):
+            _ = agent_name, message, metadata
+            await asyncio.sleep(1)
+
+            async def _iter():
+                if False:
+                    yield None
+
+            return _iter()
+
+    backend._list_registered_cards = _list_registered_cards  # type: ignore[method-assign]
+    backend._state.client = _SlowClient()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="Timed out waiting for delegated response from 'inventory_setup'"):
+        await backend.delegate(
+            request="create an inventory",
+            agent_name="inventory_setup",
+            ctx=ToolContext(),
+        )

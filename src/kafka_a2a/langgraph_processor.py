@@ -299,6 +299,99 @@ HOST_AGENT_LABELS: dict[str, str] = {
 ROUTER_AGENT_NAMES: set[str] = {"product", "inventory", "pos"}
 
 
+HOST_DOMAIN_AREA_PICKERS: dict[str, dict[str, Any]] = {
+    "product": {
+        "title": "Product Management",
+        "description": "Choose the product area you want help with. You can also type a specific product question.",
+        "options": [
+            {"value": "product_discovery", "label": "Search and Product Discovery"},
+            {"value": "product_catalog_admin", "label": "Create or Update Products"},
+            {"value": "product_merchandising", "label": "Merchandising and Attributes"},
+            {"value": "product_pricing", "label": "Pricing and Price Rules"},
+        ],
+    },
+    "inventory": {
+        "title": "Inventory Management",
+        "description": "Choose the inventory area you want help with. You can also type a specific inventory question.",
+        "options": [
+            {"value": "inventory_setup", "label": "Set Up Inventory"},
+            {"value": "inventory_visibility", "label": "Stock and Warehouse Visibility"},
+            {"value": "inventory_procurement", "label": "Purchase Orders and Receiving"},
+            {"value": "inventory_fulfillment", "label": "Transfers, Adjustments, and Fulfillment"},
+        ],
+    },
+    "pos": {
+        "title": "Point of Sale (POS)",
+        "description": "Choose the POS area you want help with. You can also type a specific POS question.",
+        "options": [
+            {"value": "pos_live", "label": "Live Cashier and Orders"},
+            {"value": "pos_setup", "label": "POS Setup and Daily Sales"},
+        ],
+    },
+}
+
+
+HOST_DOMAIN_AREA_REQUESTS: dict[str, dict[str, str]] = {
+    "product": {
+        "product_discovery": (
+            "The user selected Search and Product Discovery from the Product Management menu. "
+            "Help them search the catalog, inspect product details, or review product analytics. "
+            "Start with a short structured choice only if the next step is still ambiguous."
+        ),
+        "product_catalog_admin": (
+            "The user selected Create or Update Products from the Product Management menu. "
+            "Help them create, update, bulk seed, or export products. "
+            "Start with a short structured choice or the next required step in that workflow."
+        ),
+        "product_merchandising": (
+            "The user selected Merchandising and Attributes from the Product Management menu. "
+            "Help them manage featured products, quick-sale state, attributes, or media. "
+            "Start with a short structured choice or the next required step in that workflow."
+        ),
+        "product_pricing": (
+            "The user selected Pricing and Price Rules from the Product Management menu. "
+            "Help them inspect price history, pricing rules, or update prices. "
+            "Start with a short structured choice or the next required step in that workflow."
+        ),
+    },
+    "inventory": {
+        "inventory_setup": (
+            "The user selected Set Up Inventory from the Inventory Management menu. "
+            "Help them create or configure stock locations, inventory categories, or inventory ledgers. "
+            "Start with a short structured choice or the next required setup step. "
+            "Never ask for raw internal ids when lookups or selections can be used instead."
+        ),
+        "inventory_visibility": (
+            "The user selected Stock and Warehouse Visibility from the Inventory Management menu. "
+            "Help them inspect stock posture, warehouse contents, alerts, reservations, or movements. "
+            "Start with a short structured choice only if the request is still ambiguous."
+        ),
+        "inventory_procurement": (
+            "The user selected Purchase Orders and Receiving from the Inventory Management menu. "
+            "Help them inspect purchase orders, receiving, suppliers, or purchase returns. "
+            "Start with a short structured choice or the next required step in that workflow."
+        ),
+        "inventory_fulfillment": (
+            "The user selected Transfers, Adjustments, and Fulfillment from the Inventory Management menu. "
+            "Help them reserve stock, transfer inventory, adjust quantities, or handle fulfillment tasks. "
+            "Start with a short structured choice or the next required step in that workflow."
+        ),
+    },
+    "pos": {
+        "pos_live": (
+            "The user selected Live Cashier and Orders from the Point of Sale menu. "
+            "Help them inspect the current session, live orders, held carts, checkout, or payments. "
+            "Start with a short structured choice only if the next step is still ambiguous."
+        ),
+        "pos_setup": (
+            "The user selected POS Setup and Daily Sales from the Point of Sale menu. "
+            "Help them inspect terminals, tables, customers, discounts, or daily sales posture. "
+            "Start with a short structured choice or the next required step in that workflow."
+        ),
+    },
+}
+
+
 HOST_DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
     "onboarding": (
         "onboarding",
@@ -565,6 +658,57 @@ def _host_capability_picker_arguments(
         "multiple": False,
         "allow_input": True,
     }
+
+
+def _host_domain_area_picker_arguments(agent_name: str) -> dict[str, Any] | None:
+    config = HOST_DOMAIN_AREA_PICKERS.get(agent_name)
+    if not isinstance(config, dict):
+        return None
+    return {
+        "title": str(config.get("title") or _friendly_agent_label(agent_name)),
+        "description": str(config.get("description") or ""),
+        "options": list(config.get("options") or []),
+        "multiple": False,
+        "allow_input": True,
+    }
+
+
+def _is_host_domain_area_picker_payload(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return (
+        str(payload.get("interaction_type") or "").strip().lower() == "multiple_choice"
+        and str(payload.get("workflow") or "").strip().lower() == "host_domain_area_picker"
+        and str(payload.get("domain_agent") or "").strip().lower() in ROUTER_AGENT_NAMES
+    )
+
+
+def _interaction_additional_input(response: dict[str, Any] | None) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    additional_input = response.get("additional_input")
+    if isinstance(additional_input, str) and additional_input.strip():
+        return additional_input.strip()
+    return None
+
+
+def _host_domain_area_follow_up_request(payload: dict[str, Any], response: dict[str, Any]) -> tuple[str, str] | None:
+    domain_agent = str(payload.get("domain_agent") or "").strip().lower()
+    if domain_agent not in ROUTER_AGENT_NAMES:
+        return None
+
+    additional_input = _interaction_additional_input(response)
+    if additional_input:
+        return domain_agent, additional_input
+
+    selected_value = _selected_interaction_value(response)
+    if not selected_value:
+        return None
+
+    request = HOST_DOMAIN_AREA_REQUESTS.get(domain_agent, {}).get(selected_value)
+    if not request:
+        return None
+    return domain_agent, request
 
 
 def _host_follow_up_request_for_agent(agent_name: str) -> str:
@@ -3198,6 +3342,34 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 )
                 return
 
+            if selected_value in ROUTER_AGENT_NAMES and "create_multiple_choice" in tool_names:
+                picker_arguments = _host_domain_area_picker_arguments(selected_value)
+                if picker_arguments is not None:
+                    try:
+                        interaction_output = await tool_executor.call_tool(
+                            name="create_multiple_choice",
+                            arguments=picker_arguments,
+                            ctx=tool_ctx,
+                        )
+                    except Exception:
+                        interaction_output = None
+                    if isinstance(interaction_output, dict):
+                        interaction_output["workflow"] = "host_domain_area_picker"
+                        interaction_output["workflow_stage"] = "area_picker"
+                        interaction_output["domain_agent"] = selected_value
+                        response_text = json.dumps(interaction_output, ensure_ascii=False)
+                        response_parts = [DataPart(data=interaction_output)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
+
             yield TaskStatus(
                 state=TaskState.working,
                 message=Message(
@@ -3324,6 +3496,292 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 assistant_text=response_text,
             )
             return
+
+        if (
+            agent_name == "host"
+            and tool_executor is not None
+            and "delegate_to_agent" in tool_names
+            and interaction_response is not None
+            and _is_host_domain_area_picker_payload(last_interaction_payload)
+        ):
+            follow_up = _host_domain_area_follow_up_request(last_interaction_payload, interaction_response)
+            if follow_up is None:
+                response_parts = [DataPart(data=last_interaction_payload)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.input_required,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                return
+
+            delegated_agent_name, delegated_request = follow_up
+            yield TaskStatus(
+                state=TaskState.working,
+                message=Message(
+                    role=Role.agent,
+                    parts=[TextPart(text=f"Delegating this request to the {delegated_agent_name} specialist agent.")],
+                    context_id=task.context_id,
+                ),
+            )
+
+            try:
+                delegated = await tool_executor.call_tool(
+                    name="delegate_to_agent",
+                    arguments={
+                        "request": delegated_request,
+                        "agent_name": delegated_agent_name,
+                    },
+                    ctx=tool_ctx,
+                )
+            except Exception as exc:
+                response_text = str(exc).strip() or "Delegation failed."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+            delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=delegated_agent_name)
+            if delegated_response is None:
+                response_text = "Delegation did not return a usable result."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+            yield Artifact(
+                name="delegation",
+                parts=[
+                    DataPart(
+                        data={
+                            "selectedAgent": delegated_response["delegated_agent"],
+                            "delegatedTaskId": delegated_response["delegated_task_id"],
+                            "finalState": delegated_response["delegated_final_state"].value,
+                            "statusUpdates": delegated_response["status_updates"],
+                        }
+                    )
+                ],
+            )
+
+            for update in delegated_response["status_updates"]:
+                if not isinstance(update, dict) or bool(update.get("final")):
+                    continue
+                state_value = _coerce_task_state(update.get("state"), default=TaskState.working)
+                message_text = _format_delegation_status_text(
+                    agent_name=delegated_response["delegated_agent"],
+                    state=state_value,
+                    message=str(update.get("message") or "").strip() or None,
+                )
+                yield TaskStatus(
+                    state=state_value,
+                    message=Message(
+                        role=Role.agent,
+                        parts=[TextPart(text=message_text)],
+                        context_id=task.context_id,
+                    ),
+                )
+
+            for artifact_name, payload in delegated_response["child_artifacts"].items():
+                if not isinstance(artifact_name, str) or not artifact_name.strip():
+                    continue
+                parts = _ka2a_parts_from_model_content(payload)
+                if parts:
+                    yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
+
+            response_parts = delegated_response["response_parts"]
+            response_text = delegated_response["response_text"]
+            yield Artifact(name="result", parts=response_parts)
+            yield TaskStatus(
+                state=delegated_response["delegated_final_state"],
+                message=Message(
+                    role=Role.agent,
+                    parts=response_parts,
+                    context_id=task.context_id,
+                ),
+            )
+
+            await _maybe_update_memory(
+                llm=llm,
+                context_id=task.context_id,
+                metadata=metadata,
+                existing=mem,
+                history=history if isinstance(history, list) else None,
+                user_text=user_text_for_memory,
+                assistant_text=response_text,
+            )
+            return
+
+        if (
+            agent_name == "host"
+            and tool_executor is not None
+            and "delegate_to_agent" in tool_names
+            and user_text_for_memory
+            and interaction_response is None
+            and _is_host_domain_area_picker_payload(last_interaction_payload)
+        ):
+            delegated_agent_name = str(last_interaction_payload.get("domain_agent") or "").strip().lower()
+            if delegated_agent_name in ROUTER_AGENT_NAMES:
+                yield TaskStatus(
+                    state=TaskState.working,
+                    message=Message(
+                        role=Role.agent,
+                        parts=[TextPart(text=f"Delegating this request to the {delegated_agent_name} specialist agent.")],
+                        context_id=task.context_id,
+                    ),
+                )
+
+                try:
+                    delegated = await tool_executor.call_tool(
+                        name="delegate_to_agent",
+                        arguments={
+                            "request": user_text_for_memory,
+                            "agent_name": delegated_agent_name,
+                        },
+                        ctx=tool_ctx,
+                    )
+                except Exception as exc:
+                    response_text = str(exc).strip() or "Delegation failed."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+                delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=delegated_agent_name)
+                if delegated_response is None:
+                    response_text = "Delegation did not return a usable result."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+                yield Artifact(
+                    name="delegation",
+                    parts=[
+                        DataPart(
+                            data={
+                                "selectedAgent": delegated_response["delegated_agent"],
+                                "delegatedTaskId": delegated_response["delegated_task_id"],
+                                "finalState": delegated_response["delegated_final_state"].value,
+                                "statusUpdates": delegated_response["status_updates"],
+                            }
+                        )
+                    ],
+                )
+
+                for update in delegated_response["status_updates"]:
+                    if not isinstance(update, dict) or bool(update.get("final")):
+                        continue
+                    state_value = _coerce_task_state(update.get("state"), default=TaskState.working)
+                    message_text = _format_delegation_status_text(
+                        agent_name=delegated_response["delegated_agent"],
+                        state=state_value,
+                        message=str(update.get("message") or "").strip() or None,
+                    )
+                    yield TaskStatus(
+                        state=state_value,
+                        message=Message(
+                            role=Role.agent,
+                            parts=[TextPart(text=message_text)],
+                            context_id=task.context_id,
+                        ),
+                    )
+
+                for artifact_name, payload in delegated_response["child_artifacts"].items():
+                    if not isinstance(artifact_name, str) or not artifact_name.strip():
+                        continue
+                    parts = _ka2a_parts_from_model_content(payload)
+                    if parts:
+                        yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
+
+                response_parts = delegated_response["response_parts"]
+                response_text = delegated_response["response_text"]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=delegated_response["delegated_final_state"],
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
 
         delegated_interaction = _delegated_interaction_context(last_interaction_payload)
         if (

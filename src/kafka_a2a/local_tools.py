@@ -110,6 +110,22 @@ def _parse_optional_timeout_s(*values: str | None) -> float | None:
     return None
 
 
+def _parse_timeout_s_with_default(*values: str | None, default: float) -> float:
+    for value in values:
+        if value is None:
+            continue
+        raw = value.strip()
+        if not raw:
+            continue
+        try:
+            timeout_s = float(raw)
+        except Exception:
+            continue
+        if timeout_s > 0:
+            return timeout_s
+    return float(default)
+
+
 def _card_summary(card: AgentCard) -> dict[str, Any]:
     return {
         "name": card.name,
@@ -324,16 +340,21 @@ class _DelegationState:
 
 
 class KafkaDelegationBackend:
-    def __init__(self) -> None:
+    def __init__(self, *, agent_name: str | None = None) -> None:
         self._bootstrap = os.getenv("KA2A_BOOTSTRAP_SERVERS", "localhost:9092")
-        self._host_agent_name = (os.getenv("KA2A_AGENT_NAME") or "host").strip()
+        self._agent_name = (agent_name or os.getenv("KA2A_AGENT_NAME") or "host").strip() or "host"
+        generic_delegator_client_id = (os.getenv("KA2A_DELEGATOR_CLIENT_ID") or "").strip() or None
+        host_delegator_client_id = (os.getenv("KA2A_HOST_DELEGATOR_CLIENT_ID") or "").strip() or None
         self._delegator_client_id = (
-            os.getenv("KA2A_HOST_DELEGATOR_CLIENT_ID") or f"{self._host_agent_name}-delegator"
-        ).strip()
-        self._request_timeout_s = _parse_optional_timeout_s(
-            os.getenv("KA2A_REQUEST_TIMEOUT_S"),
-            os.getenv("KA2A_GATEWAY_REQUEST_TIMEOUT_S"),
-            os.getenv("KA2A_PROXY_REQUEST_TIMEOUT_S"),
+            generic_delegator_client_id
+            or (host_delegator_client_id if self._agent_name == "host" else None)
+            or f"{self._agent_name}-delegator"
+        )
+        self._reply_group_id = f"ka2a.client.{self._delegator_client_id}.{uuid4()}"
+        self._request_timeout_s = _parse_timeout_s_with_default(
+            os.getenv("KA2A_DELEGATION_REQUEST_TIMEOUT_S"),
+            os.getenv("KA2A_HOST_DELEGATION_REQUEST_TIMEOUT_S") if self._agent_name == "host" else None,
+            default=30.0,
         )
         self._directory_ttl_s = float(os.getenv("KA2A_DIRECTORY_ENTRY_TTL_S") or "300")
         self._directory_offset_reset = (os.getenv("KA2A_DIRECTORY_AUTO_OFFSET_RESET") or "earliest").strip().lower()
@@ -356,6 +377,7 @@ class KafkaDelegationBackend:
                 transport=transport,
                 config=Ka2aClientConfig(
                     client_id=self._delegator_client_id,
+                    reply_group_id=self._reply_group_id,
                     request_timeout_s=self._request_timeout_s,
                 ),
             )
@@ -390,7 +412,7 @@ class KafkaDelegationBackend:
             cards_now = [
                 card
                 for card in self._state.directory.list()
-                if (card.name or "").strip() and card.name != self._host_agent_name
+                if (card.name or "").strip() and card.name != self._agent_name
             ]
             cards_now.sort(key=lambda card: card.name)
             best = cards_now or best
@@ -458,75 +480,86 @@ class KafkaDelegationBackend:
         selected = self._select_agent(cards=visible_cards, request=request, agent_name=agent_name)
 
         assert self._state.client is not None
-        if delegated_task_id:
-            stream = await self._state.client.continue_task_stream(
-                agent_name=selected.name,
-                task_id=delegated_task_id,
-                message=Message(role=Role.user, parts=[TextPart(text=request)]),
-                metadata=ctx.metadata,
-            )
-        else:
-            stream = await self._state.client.stream_message(
-                agent_name=selected.name,
-                message=Message(role=Role.user, parts=[TextPart(text=request)]),
-                metadata=ctx.metadata,
-            )
-
-        delegated_task_id: str | None = None
-        result_parts_payload: list[dict[str, Any]] | None = None
-        response_text: str | None = None
-        artifacts: dict[str, list[dict[str, Any]]] = {}
-        status_updates: list[dict[str, Any]] = []
-
-        async for event in stream:
-            if isinstance(event, Task):
-                delegated_task_id = event.id
-                status_updates.append(
-                    {
-                        "state": _task_state_value(event.status.state) or "submitted",
-                        "timestamp": _timestamp_to_iso(getattr(event.status, "timestamp", None)),
-                        "final": False,
-                        "message": None,
-                    }
+        async def _run_delegation() -> dict[str, Any]:
+            if delegated_task_id:
+                stream = await self._state.client.continue_task_stream(
+                    agent_name=selected.name,
+                    task_id=delegated_task_id,
+                    message=Message(role=Role.user, parts=[TextPart(text=request)]),
+                    metadata=ctx.metadata,
                 )
-                continue
-            if isinstance(event, TaskArtifactUpdateEvent):
-                artifact_name = (event.artifact.name or "").strip() or "artifact"
-                payload = [_part_to_payload(part) for part in (event.artifact.parts or [])]
-                if artifact_name == "result":
-                    result_parts_payload = payload
-                else:
-                    artifacts[artifact_name] = payload
-                continue
-            if isinstance(event, TaskStatusUpdateEvent):
-                status_updates.append(
-                    {
-                        "state": _task_state_value(event.status.state) or "working",
-                        "timestamp": _timestamp_to_iso(getattr(event.status, "timestamp", None)),
-                        "final": bool(event.final),
-                        "message": _text_from_parts(event.status.message.parts if event.status.message else None) or None,
-                    }
+            else:
+                stream = await self._state.client.stream_message(
+                    agent_name=selected.name,
+                    message=Message(role=Role.user, parts=[TextPart(text=request)]),
+                    metadata=ctx.metadata,
                 )
-                if event.final:
-                    response_text = _text_from_parts(event.status.message.parts if event.status.message else None) or None
-                    break
 
-        if response_text is None and result_parts_payload:
-            response_text = "\n".join(
-                item.get("text", "")
-                for item in result_parts_payload
-                if isinstance(item, dict) and item.get("kind") == "text"
-            ).strip() or None
+            child_task_id: str | None = None
+            result_parts_payload: list[dict[str, Any]] | None = None
+            response_text: str | None = None
+            artifacts: dict[str, list[dict[str, Any]]] = {}
+            status_updates: list[dict[str, Any]] = []
 
-        return {
-            "selected_agent": selected.name,
-            "delegated_task_id": delegated_task_id,
-            "response_text": response_text or "",
-            "result_parts": result_parts_payload or [],
-            "artifacts": artifacts,
-            "status_updates": status_updates,
-            "agent_card": _card_summary(selected),
-        }
+            async for event in stream:
+                if isinstance(event, Task):
+                    child_task_id = event.id
+                    status_updates.append(
+                        {
+                            "state": _task_state_value(event.status.state) or "submitted",
+                            "timestamp": _timestamp_to_iso(getattr(event.status, "timestamp", None)),
+                            "final": False,
+                            "message": None,
+                        }
+                    )
+                    continue
+                if isinstance(event, TaskArtifactUpdateEvent):
+                    artifact_name = (event.artifact.name or "").strip() or "artifact"
+                    payload = [_part_to_payload(part) for part in (event.artifact.parts or [])]
+                    if artifact_name == "result":
+                        result_parts_payload = payload
+                    else:
+                        artifacts[artifact_name] = payload
+                    continue
+                if isinstance(event, TaskStatusUpdateEvent):
+                    status_updates.append(
+                        {
+                            "state": _task_state_value(event.status.state) or "working",
+                            "timestamp": _timestamp_to_iso(getattr(event.status, "timestamp", None)),
+                            "final": bool(event.final),
+                            "message": _text_from_parts(event.status.message.parts if event.status.message else None)
+                            or None,
+                        }
+                    )
+                    if event.final:
+                        response_text = (
+                            _text_from_parts(event.status.message.parts if event.status.message else None) or None
+                        )
+                        break
+
+            if response_text is None and result_parts_payload:
+                response_text = "\n".join(
+                    item.get("text", "")
+                    for item in result_parts_payload
+                    if isinstance(item, dict) and item.get("kind") == "text"
+                ).strip() or None
+
+            return {
+                "selected_agent": selected.name,
+                "delegated_task_id": child_task_id,
+                "response_text": response_text or "",
+                "result_parts": result_parts_payload or [],
+                "artifacts": artifacts,
+                "status_updates": status_updates,
+                "agent_card": _card_summary(selected),
+            }
+
+        try:
+            return await asyncio.wait_for(_run_delegation(), timeout=self._request_timeout_s)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Timed out waiting for delegated response from '{selected.name}' after {self._request_timeout_s:.1f}s."
+            ) from exc
 
 
 DELEGATION_TOOL_SPECS: dict[str, ToolSpec] = {
@@ -567,11 +600,12 @@ class LocalInteractionToolExecutor(ToolExecutor):
     def __init__(
         self,
         *,
+        agent_name: str | None = None,
         functions: dict[str, Callable[..., Dict[str, Any]]] | None = None,
         delegation_backend: DelegationBackend | None = None,
     ) -> None:
         self._functions = functions or LOCAL_UTILITY_FUNCTIONS
-        self._delegation = delegation_backend or KafkaDelegationBackend()
+        self._delegation = delegation_backend or KafkaDelegationBackend(agent_name=agent_name)
         self._specs = {name: _function_tool_spec(name, fn) for name, fn in self._functions.items()}
         self._specs.update(DELEGATION_TOOL_SPECS)
 
@@ -626,9 +660,9 @@ class LocalInteractionToolExecutor(ToolExecutor):
         return fn(**resolved)
 
 
-def build_interaction_tool_executor() -> ToolExecutor:
-    return LocalInteractionToolExecutor()
+def build_interaction_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:
+    return LocalInteractionToolExecutor(agent_name=agent_name)
 
 
-def build_host_tool_executor() -> ToolExecutor:
-    return LocalInteractionToolExecutor()
+def build_host_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:
+    return LocalInteractionToolExecutor(agent_name=agent_name)
