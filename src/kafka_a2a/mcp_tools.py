@@ -462,6 +462,23 @@ def _dump_result(result: Any) -> Any:
     return result
 
 
+def _compact_tool_arguments(value: Any) -> Any:
+    if isinstance(value, dict):
+        compacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if item is None:
+                continue
+            nested = _compact_tool_arguments(item)
+            if nested is None:
+                continue
+            compacted[key] = nested
+        return compacted
+    if isinstance(value, list):
+        compacted_list = [_compact_tool_arguments(item) for item in value]
+        return [item for item in compacted_list if item is not None]
+    return value
+
+
 async def _list_remote_tools(*, server_url: str, headers: Mapping[str, str], timeout_s: float) -> list[_RemoteToolSpec]:
     result = await _run_mcp_session(
         server_url=server_url,
@@ -481,13 +498,14 @@ async def _call_remote_tool(
     name: str,
     arguments: dict[str, Any],
 ) -> Any:
-    argument_keys = sorted(str(key) for key in (arguments or {}).keys() if str(key).strip())
+    compact_arguments = _compact_tool_arguments(arguments or {})
+    argument_keys = sorted(str(key) for key in compact_arguments.keys() if str(key).strip())
     result = await _run_mcp_session(
         server_url=server_url,
         headers=headers,
         timeout_s=timeout_s,
         operation="call_tool",
-        callback=lambda session: session.call_tool(name, arguments=arguments or {}),
+        callback=lambda session: session.call_tool(name, arguments=compact_arguments),
         remote_tool=name,
         argument_keys=argument_keys,
     )
@@ -707,7 +725,8 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             raise RuntimeError(f"Tool '{name}' is not available from MCP server '{self._cfg.id}'.")
 
         headers = self._resolve_headers(ctx=ctx)
-        argument_keys = sorted(str(key) for key in (arguments or {}).keys() if str(key).strip())
+        compact_arguments = _compact_tool_arguments(arguments or {})
+        argument_keys = sorted(str(key) for key in compact_arguments.keys() if str(key).strip())
         _log_mcp_operation(
             "info",
             "call_tool_start",
@@ -725,7 +744,7 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
                 headers=headers,
                 timeout_s=self._timeout_s,
                 name=route.remote_name,
-                arguments=arguments or {},
+                arguments=compact_arguments,
             )
         except Exception as exc:
             _log_mcp_operation(

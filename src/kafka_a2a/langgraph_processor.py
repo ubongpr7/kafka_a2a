@@ -944,6 +944,8 @@ def _render_relation_prompt_block(tools: list[ToolSpec]) -> str:
         "Relation/lookup rules:",
         "- Never ask the user to manually type backend IDs or UUIDs for relational fields.",
         "- For any relational field, fetch the available records first, present human-readable labels, and submit the matching internal ID only after the user selects an option.",
+        "- When loading selectable reference data for the current tenant, prefer list/get-all tools over search tools whenever both are available.",
+        "- If only a search-style lookup tool exists, call it with an empty string and omit optional filters/null values instead of asking the user for a search term.",
     ]
     for tool_name, field_path, lookup_tool in hints:
         lines.append(

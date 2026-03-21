@@ -370,6 +370,75 @@ async def test_multi_mcp_executor_routes_tools_and_forwards_bearer(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_multi_mcp_executor_omits_none_arguments_before_remote_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        call = {
+            "server_url": server_url,
+            "headers": dict(headers),
+            "timeout_s": timeout_s,
+            "operation": operation,
+            "remote_tool": remote_tool,
+            "argument_keys": list(argument_keys or []),
+        }
+        calls.append(call)
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "list_inventory_categories", "description": "List inventory categories"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                call["tool_name"] = name
+                call["arguments"] = dict(arguments or {})
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["list_inventory_categories"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    result = await executor.call_tool(
+        name="inventory.list_inventory_categories",
+        arguments={"query": None, "limit": 25, "active_only": None},
+        ctx=ToolContext(),
+    )
+
+    assert result == {
+        "tool": "list_inventory_categories",
+        "arguments": {"limit": 25},
+    }
+    assert calls[-1]["argument_keys"] == ["limit"]
+    assert calls[-1]["arguments"] == {"limit": 25}
+
+
+@pytest.mark.asyncio
 async def test_multi_mcp_executor_composes_local_and_remote_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     from kafka_a2a import mcp_tools
 

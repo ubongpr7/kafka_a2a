@@ -86,6 +86,8 @@ def test_render_tool_prompt_block_includes_relation_lookup_rules() -> None:
     )
 
     assert "Never ask the user to manually type backend IDs or UUIDs for relational fields." in prompt
+    assert "prefer list/get-all tools over search tools whenever both are available." in prompt
+    assert "omit optional filters/null values" in prompt
     assert "`inventory.create_inventory.payload.category_id`" in prompt
     assert "`inventory.list_inventory_categories`" in prompt
 
