@@ -1219,6 +1219,65 @@ async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects
 
 
 @pytest.mark.asyncio
+async def test_onboarding_agent_inventory_setup_scope_populates_category_options_from_text_wrapped_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "KA2A_TOOL_EXECUTOR",
+        "tests.fake_langgraph_components:build_fake_category_text_wrapped_tool_executor",
+    )
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
+    picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Start Inventory Onboarding",
+        "description": "Choose the setup area you want to complete first. I will guide you step by step.",
+        "options": [
+            {"value": "full_setup", "label": "Full Inventory Setup"},
+            {"value": "stock_locations", "label": "Stock Locations"},
+            {"value": "inventory_categories", "label": "Inventory Categories"},
+            {"value": "inventory_setup", "label": "Inventory Setup"},
+            {"value": "product_onboarding", "label": "Product Onboarding"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+        "workflow": "inventory_onboarding",
+        "workflow_stage": "scope_picker",
+    }
+    task = Task(
+        id="task-onboarding-scope-relations-category-text-wrapped",
+        context_id="ctx-onboarding-scope-relations-category-text-wrapped",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"inventory_setup","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="help me set up inventory")]),
+            Message(role=Role.agent, parts=[DataPart(data=picker_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"inventory_setup","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    fields = {field["name"]: field for field in payload["steps"][0]["fields"]}
+
+    assert fields["related_stock_location_id"]["type"] == "select"
+    assert fields["related_stock_location_id"]["options"][0]["label"] == "Main Warehouse"
+    assert fields["inventory_category_id"]["type"] == "select"
+    assert fields["inventory_category_id"]["options"][0]["label"] == "Men's Clothes"
+    assert fields["inventory_category_id"]["options"][0]["value"] == "cat-1"
+
+
+@pytest.mark.asyncio
 async def test_onboarding_agent_wizard_completion_prompts_for_review() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
     wizard_payload = {

@@ -835,6 +835,22 @@ class FakeWrappedLookupToolExecutor(FakeToolExecutor):
         }
 
 
+class FakeCategoryTextWrappedToolExecutor(FakeToolExecutor):
+    async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
+        result = await super().call_tool(name=name, arguments=arguments, ctx=ctx)
+        if name != "inventory.list_inventory_categories":
+            return result
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Inventory categories lookup result:\n```json\n" + json.dumps(result) + "\n```",
+                }
+            ],
+            "isError": False,
+        }
+
+
 def fake_llm_factory(*args: Any, **kwargs: Any) -> Any:
     _ = args, kwargs
     return FakeLlm()
@@ -868,6 +884,10 @@ def build_fake_tool_executor_with_category_failures(*, agent_name: str | None = 
 
 def build_fake_wrapped_lookup_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:
     return FakeWrappedLookupToolExecutor(agent_name=agent_name)
+
+
+def build_fake_category_text_wrapped_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:
+    return FakeCategoryTextWrappedToolExecutor(agent_name=agent_name)
 
 
 def reset_fake_components() -> None:

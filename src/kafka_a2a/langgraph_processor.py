@@ -108,6 +108,14 @@ def _extract_json_candidate_from_text(text: str) -> str | None:
 
     if raw.startswith("{") or raw.startswith("["):
         return raw
+
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = raw.find(opener)
+        end = raw.rfind(closer)
+        if start >= 0 and end > start:
+            candidate = raw[start : end + 1].strip()
+            if candidate:
+                return candidate
     return None
 
 
@@ -1671,6 +1679,15 @@ def _coerce_mapping_from_tool_output(value: Any) -> dict[str, Any] | None:
             nested = value.get(key)
             if isinstance(nested, dict):
                 return nested
+        content = value.get("content")
+        if isinstance(content, list):
+            nested = _coerce_mapping_from_tool_output(content)
+            if isinstance(nested, dict):
+                return nested
+        if isinstance(content, str):
+            nested = _extract_json_object_from_text(content)
+            if isinstance(nested, dict):
+                return nested
         return value
     if isinstance(value, list):
         for item in value:
@@ -2627,8 +2644,13 @@ def _relation_items_from_lookup_output(lookup_tool: str, output: Any) -> list[di
         category_payload = output.get("category")
         if isinstance(category_payload, dict):
             results = category_payload.get("results")
-            return results if isinstance(results, list) else []
-        return category_payload if isinstance(category_payload, list) else []
+            if isinstance(results, list):
+                return results
+        if isinstance(category_payload, list):
+            return category_payload
+        fallback = _find_relation_items(category_payload)
+        if fallback:
+            return fallback
 
     if lookup_tool in {
         "inventory.search_stock_locations",
@@ -2638,8 +2660,58 @@ def _relation_items_from_lookup_output(lookup_tool: str, output: Any) -> list[di
         "inventory.search_inventories",
     }:
         results = output.get("results")
-        return results if isinstance(results, list) else []
+        if isinstance(results, list):
+            return results
 
+    return _find_relation_items(output)
+
+
+def _relation_item_has_identifier_and_label(item: dict[str, Any]) -> bool:
+    return bool(
+        _first_string(item, ["id", "uuid", "value"])
+        and _first_string(
+            item,
+            ["name", "title", "label", "inventory_item_name", "stock_location_name", "category"],
+        )
+    )
+
+
+def _find_relation_items(value: Any, *, depth: int = 0) -> list[dict[str, Any]]:
+    if depth > 6:
+        return []
+    if isinstance(value, list):
+        dict_items = [item for item in value if isinstance(item, dict)]
+        if dict_items and any(_relation_item_has_identifier_and_label(item) for item in dict_items):
+            return dict_items
+        for item in value:
+            nested = _find_relation_items(item, depth=depth + 1)
+            if nested:
+                return nested
+        return []
+    if isinstance(value, dict):
+        preferred_keys = (
+            "results",
+            "items",
+            "data",
+            "result",
+            "category",
+            "categories",
+            "location",
+            "locations",
+            "records",
+        )
+        seen_keys: set[str] = set()
+        for key in preferred_keys:
+            seen_keys.add(key)
+            nested = _find_relation_items(value.get(key), depth=depth + 1)
+            if nested:
+                return nested
+        for key, nested_value in value.items():
+            if key in seen_keys:
+                continue
+            nested = _find_relation_items(nested_value, depth=depth + 1)
+            if nested:
+                return nested
     return []
 
 
