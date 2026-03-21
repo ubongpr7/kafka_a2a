@@ -1069,18 +1069,20 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
                         "placeholder": "Primary sellable stock ledger for the business.",
                     },
                     {
-                        "name": "related_location_name",
-                        "type": "text",
+                        "name": "related_stock_location_id",
+                        "type": "select",
                         "label": "Primary Location for This Inventory",
                         "required": False,
-                        "placeholder": "Main Warehouse",
+                        "options": [],
+                        "placeholder": "Select a stock location",
                     },
                     {
-                        "name": "category_name",
-                        "type": "text",
+                        "name": "inventory_category_id",
+                        "type": "select",
                         "label": "Default Category",
                         "required": False,
-                        "placeholder": "General Merchandise",
+                        "options": [],
+                        "placeholder": "Select an inventory category",
                     },
                 ],
             }
@@ -1100,11 +1102,12 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
                         "placeholder": "Coca-Cola 50cl\nFanta 50cl\nSprite 50cl",
                     },
                     {
-                        "name": "product_category",
-                        "type": "text",
+                        "name": "product_category_id",
+                        "type": "select",
                         "label": "Default Product Category",
                         "required": False,
-                        "placeholder": "Beverages",
+                        "options": [],
+                        "placeholder": "Select a product category",
                     },
                     {
                         "name": "pos_ready",
@@ -1222,6 +1225,32 @@ def _onboarding_wizard_arguments(scope: str) -> dict[str, Any]:
     }
 
 
+def _wizard_label_field_name(field_name: str) -> str | None:
+    name = str(field_name or "").strip()
+    if not name:
+        return None
+    if name.endswith("_id"):
+        return f"{name[:-3]}_label"
+    if name.endswith("_label"):
+        return name
+    return f"{name}_label"
+
+
+def _wizard_option_label(field: dict[str, Any], value: Any) -> str | None:
+    options = field.get("options")
+    if not isinstance(options, list):
+        return None
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        option_value = option.get("value")
+        if option_value is None or str(option_value) != str(value):
+            continue
+        label = str(option.get("label") or option_value).strip()
+        return label or None
+    return None
+
+
 def _split_multiline_values(value: Any) -> list[str]:
     if not isinstance(value, str):
         return []
@@ -1233,9 +1262,15 @@ def _split_multiline_values(value: Any) -> list[str]:
     return entries
 
 
-def _normalize_onboarding_wizard_data(scope: str, response: dict[str, Any]) -> dict[str, Any]:
+def _normalize_onboarding_wizard_data(
+    scope: str,
+    response: dict[str, Any],
+    *,
+    wizard_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     responses = response.get("all_responses") if isinstance(response.get("all_responses"), dict) else {}
-    steps = _onboarding_wizard_steps(scope)
+    payload_steps = wizard_payload.get("steps") if isinstance(wizard_payload, dict) else None
+    steps = payload_steps if isinstance(payload_steps, list) and payload_steps else _onboarding_wizard_steps(scope)
     step_values: dict[str, dict[str, Any]] = {}
     flat: dict[str, Any] = {}
 
@@ -1245,10 +1280,22 @@ def _normalize_onboarding_wizard_data(scope: str, response: dict[str, Any]) -> d
             continue
         step_id = str(step.get("id") or f"step_{index}")
         step_values[step_id] = raw_step
+        field_map = {
+            str(field.get("name") or "").strip(): field
+            for field in step.get("fields", [])
+            if isinstance(field, dict) and str(field.get("name") or "").strip()
+        }
         for key, value in raw_step.items():
             if value in ("", None, [], {}):
                 continue
             flat[key] = value
+            field = field_map.get(key)
+            if not isinstance(field, dict):
+                continue
+            label_value = _wizard_option_label(field, value)
+            label_key = _wizard_label_field_name(key)
+            if label_value and label_key and label_key not in flat:
+                flat[label_key] = label_value
 
     return {
         "scope": scope,
@@ -1263,7 +1310,10 @@ def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
     lines = [f"Scope: {ONBOARDING_SCOPE_LABELS.get(scope, scope.replace('_', ' ').title())}"]
 
     primary_location = str(flat.get("primary_location_name") or "").strip()
-    primary_location_type = str(flat.get("primary_location_type") or "").strip()
+    primary_location_type = (
+        str(flat.get("primary_location_type_label") or "").strip()
+        or str(flat.get("primary_location_type") or "").strip()
+    )
     if primary_location:
         label = primary_location
         if primary_location_type:
@@ -1286,11 +1336,17 @@ def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
     if inventory_description:
         lines.append(f"Inventory note: {inventory_description}")
 
-    related_location_name = str(flat.get("related_location_name") or "").strip()
+    related_location_name = (
+        str(flat.get("related_stock_location_label") or "").strip()
+        or str(flat.get("related_location_name") or "").strip()
+    )
     if related_location_name:
         lines.append(f"Ledger location: {related_location_name}")
 
-    category_name = str(flat.get("category_name") or "").strip()
+    category_name = (
+        str(flat.get("inventory_category_label") or "").strip()
+        or str(flat.get("category_name") or "").strip()
+    )
     if category_name:
         lines.append(f"Default category: {category_name}")
 
@@ -1298,7 +1354,10 @@ def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
     if product_names:
         lines.append("Products: " + ", ".join(product_names))
 
-    product_category = str(flat.get("product_category") or "").strip()
+    product_category = (
+        str(flat.get("product_category_label") or "").strip()
+        or str(flat.get("product_category") or "").strip()
+    )
     if product_category:
         lines.append(f"Product category: {product_category}")
 
@@ -1860,16 +1919,86 @@ def _build_inventory_operation(
     company_context: dict[str, Any] | None,
     inventory_name: str,
     inventory_description: str | None,
+    related_location_id: str | None,
     related_location_name: str | None,
+    category_id: str | None,
     category_name: str | None,
 ) -> dict[str, Any]:
     tool_name = "inventory.create_inventory"
     spec = _tool_spec_by_name(tool_specs, tool_name)
     arguments = _company_context_arguments(spec, company_context)
+    base_argument_keys = set(arguments)
     _set_schema_arg(arguments, spec, ["name", "inventory_name", "inventoryName", "title"], inventory_name)
     _set_schema_arg(arguments, spec, ["description", "inventory_description", "inventoryDescription", "notes"], inventory_description)
-    _set_schema_arg(arguments, spec, ["location_name", "locationName", "stock_location_name", "stockLocationName", "default_location_name", "defaultLocationName"], related_location_name)
-    _set_schema_arg(arguments, spec, ["category_name", "categoryName", "inventory_category_name", "inventoryCategoryName", "default_category_name", "defaultCategoryName"], category_name)
+
+    location_id_key = _match_schema_key(
+        spec,
+        ["location_id", "locationId", "stock_location_id", "stockLocationId", "default_location_id", "defaultLocationId"],
+    )
+    if location_id_key and related_location_id not in (None, "", [], {}):
+        arguments[location_id_key] = related_location_id
+    else:
+        _set_schema_arg(
+            arguments,
+            spec,
+            ["location_name", "locationName", "stock_location_name", "stockLocationName", "default_location_name", "defaultLocationName"],
+            related_location_name,
+        )
+
+    category_id_key = _match_schema_key(
+        spec,
+        ["category_id", "categoryId", "inventory_category_id", "inventoryCategoryId", "default_category_id", "defaultCategoryId"],
+    )
+    if category_id_key and category_id not in (None, "", [], {}):
+        arguments[category_id_key] = category_id
+    else:
+        _set_schema_arg(
+            arguments,
+            spec,
+            ["category_name", "categoryName", "inventory_category_name", "inventoryCategoryName", "default_category_name", "defaultCategoryName"],
+            category_name,
+        )
+
+    payload_spec = _nested_object_tool_spec(spec, "payload")
+    payload_required = "payload" in _tool_schema_required(spec)
+    top_level_inventory_args_added = bool(set(arguments) - base_argument_keys)
+    if payload_spec is not None and (payload_required or not top_level_inventory_args_added):
+        payload_arguments: dict[str, Any] = {}
+        _set_schema_arg(payload_arguments, payload_spec, ["name", "inventory_name", "inventoryName", "title"], inventory_name)
+        _set_schema_arg(
+            payload_arguments,
+            payload_spec,
+            ["description", "inventory_description", "inventoryDescription", "notes"],
+            inventory_description,
+        )
+        payload_location_id_key = _match_schema_key(
+            payload_spec,
+            ["location_id", "locationId", "stock_location_id", "stockLocationId", "default_location_id", "defaultLocationId"],
+        )
+        if payload_location_id_key and related_location_id not in (None, "", [], {}):
+            payload_arguments[payload_location_id_key] = related_location_id
+        else:
+            _set_schema_arg(
+                payload_arguments,
+                payload_spec,
+                ["location_name", "locationName", "stock_location_name", "stockLocationName", "default_location_name", "defaultLocationName"],
+                related_location_name,
+            )
+        payload_category_id_key = _match_schema_key(
+            payload_spec,
+            ["category_id", "categoryId", "inventory_category_id", "inventoryCategoryId", "default_category_id", "defaultCategoryId"],
+        )
+        if payload_category_id_key and category_id not in (None, "", [], {}):
+            payload_arguments[payload_category_id_key] = category_id
+        else:
+            _set_schema_arg(
+                payload_arguments,
+                payload_spec,
+                ["category_name", "categoryName", "inventory_category_name", "inventoryCategoryName", "default_category_name", "defaultCategoryName"],
+                category_name,
+            )
+        if payload_arguments:
+            arguments["payload"] = payload_arguments
     return {
         "tool_name": tool_name,
         "label": f"inventory ledger '{inventory_name}'",
@@ -1885,6 +2014,7 @@ def _build_product_operation(
     tool_specs: list[ToolSpec],
     company_context: dict[str, Any] | None,
     product_name: str,
+    product_category_id: str | None,
     product_category: str | None,
     pos_ready: bool | None,
 ) -> dict[str, Any]:
@@ -1893,7 +2023,14 @@ def _build_product_operation(
     arguments = _company_context_arguments(spec, company_context)
     base_argument_keys = set(arguments)
     _set_schema_arg(arguments, spec, ["name", "product_name", "productName", "title"], product_name)
-    _set_schema_arg(arguments, spec, ["category_name", "categoryName", "product_category", "productCategory", "category"], product_category)
+    product_category_id_key = _match_schema_key(
+        spec,
+        ["category_id", "categoryId", "product_category_id", "productCategoryId", "default_category_id", "defaultCategoryId"],
+    )
+    if product_category_id_key and product_category_id not in (None, "", [], {}):
+        arguments[product_category_id_key] = product_category_id
+    else:
+        _set_schema_arg(arguments, spec, ["category_name", "categoryName", "product_category", "productCategory", "category"], product_category)
     _set_schema_arg(arguments, spec, ["pos_ready", "posReady", "pos_visible", "posVisible", "quick_sale", "quickSale"], pos_ready)
     payload_spec = _nested_object_tool_spec(spec, "payload")
     payload_required = "payload" in _tool_schema_required(spec)
@@ -1901,12 +2038,19 @@ def _build_product_operation(
     if payload_spec is not None and (payload_required or not top_level_product_args_added):
         payload_arguments: dict[str, Any] = {}
         _set_schema_arg(payload_arguments, payload_spec, ["name", "product_name", "productName", "title"], product_name)
-        _set_schema_arg(
-            payload_arguments,
+        payload_category_id_key = _match_schema_key(
             payload_spec,
-            ["category_name", "categoryName", "product_category", "productCategory", "category"],
-            product_category,
+            ["category_id", "categoryId", "product_category_id", "productCategoryId", "default_category_id", "defaultCategoryId"],
         )
+        if payload_category_id_key and product_category_id not in (None, "", [], {}):
+            payload_arguments[payload_category_id_key] = product_category_id
+        else:
+            _set_schema_arg(
+                payload_arguments,
+                payload_spec,
+                ["category_name", "categoryName", "product_category", "productCategory", "category"],
+                product_category,
+            )
         _set_schema_arg(
             payload_arguments,
             payload_spec,
@@ -1979,13 +2123,17 @@ def _onboarding_plan_operations(
                     company_context=company_context,
                     inventory_name=inventory_name,
                     inventory_description=str(flat.get("inventory_description") or "").strip() or None,
+                    related_location_id=str(flat.get("related_stock_location_id") or "").strip() or None,
                     related_location_name=(
-                        str(flat.get("related_location_name") or "").strip()
+                        str(flat.get("related_stock_location_label") or "").strip()
+                        or str(flat.get("related_location_name") or "").strip()
                         or str(flat.get("primary_location_name") or "").strip()
                         or None
                     ),
+                    category_id=str(flat.get("inventory_category_id") or "").strip() or None,
                     category_name=(
-                        str(flat.get("category_name") or "").strip()
+                        str(flat.get("inventory_category_label") or "").strip()
+                        or str(flat.get("category_name") or "").strip()
                         or (categories[0] if categories else None)
                     ),
                 )
@@ -1996,7 +2144,12 @@ def _onboarding_plan_operations(
     )
     if should_create_products:
         product_names = _split_multiline_values(flat.get("product_names") or flat.get("initial_product_names"))
-        product_category = str(flat.get("product_category") or "").strip() or None
+        product_category = (
+            str(flat.get("product_category_label") or "").strip()
+            or str(flat.get("product_category") or "").strip()
+            or None
+        )
+        product_category_id = str(flat.get("product_category_id") or "").strip() or None
         pos_ready = flat.get("pos_ready")
         pos_ready_value = pos_ready if isinstance(pos_ready, bool) else None
         for product_name in product_names:
@@ -2005,6 +2158,7 @@ def _onboarding_plan_operations(
                     tool_specs=tool_specs,
                     company_context=company_context,
                     product_name=product_name,
+                    product_category_id=product_category_id,
                     product_category=product_category or (categories[0] if categories else None),
                     pos_ready=pos_ready_value,
                 )
@@ -2680,6 +2834,69 @@ async def _rewrite_relation_interaction_payload(
             rewritten["description"] = _sanitize_relation_prompt_text(description)
         return rewritten
 
+    if interaction_type == "wizard_flow":
+        steps = payload.get("steps")
+        if not isinstance(steps, list):
+            return None
+        rewritten_steps: list[dict[str, Any]] = []
+        changed = False
+        for step in steps:
+            if not isinstance(step, dict):
+                rewritten_steps.append(step)
+                continue
+            fields = step.get("fields")
+            if not isinstance(fields, list):
+                rewritten_steps.append(step)
+                continue
+            rewritten_fields: list[dict[str, Any]] = []
+            step_changed = False
+            for field in fields:
+                if not isinstance(field, dict):
+                    rewritten_fields.append(field)
+                    continue
+                field_type = str(field.get("type") or "").strip().lower()
+                if field_type not in {"text", "select"}:
+                    rewritten_fields.append(field)
+                    continue
+                field_name = str(field.get("name") or "").strip()
+                field_label = str(field.get("label") or "").strip()
+                field_description = str(field.get("description") or "").strip()
+                relation_specs = _matching_relation_specs_for_texts(
+                    tool_specs,
+                    field_name,
+                    field_label,
+                    field_description,
+                )
+                if not relation_specs:
+                    rewritten_fields.append(field)
+                    continue
+                options = await _load_relation_options(
+                    relation_specs[0],
+                    tool_executor=tool_executor,
+                    tool_ctx=tool_ctx,
+                    cache=relation_cache,
+                )
+                rewritten_field = dict(field)
+                rewritten_field["type"] = "select"
+                rewritten_field["options"] = options
+                rewritten_field["placeholder"] = f"Select {relation_specs[0]['label']}"
+                rewritten_fields.append(rewritten_field)
+                step_changed = True
+            if step_changed:
+                rewritten_step = dict(step)
+                rewritten_step["fields"] = rewritten_fields
+                rewritten_steps.append(rewritten_step)
+                changed = True
+            else:
+                rewritten_steps.append(step)
+        if changed:
+            rewritten = dict(payload)
+            rewritten["steps"] = rewritten_steps
+            if description:
+                rewritten["description"] = _sanitize_relation_prompt_text(description)
+            return rewritten
+        return None
+
     return None
 
 
@@ -2717,6 +2934,22 @@ async def _rewrite_relation_interaction_parts(
         changed = True
 
     return rewritten_parts if changed else parts
+
+
+async def _rewrite_relation_interaction_dict(
+    payload: dict[str, Any],
+    *,
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any]:
+    rewritten = await _rewrite_relation_interaction_payload(
+        payload,
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    return rewritten if isinstance(rewritten, dict) else payload
 
 
 def _delegated_interaction_context(payload: dict[str, Any] | None) -> dict[str, str | None] | None:
@@ -4048,6 +4281,12 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     interaction_output = None
 
                 if isinstance(interaction_output, dict):
+                    interaction_output = await _rewrite_relation_interaction_dict(
+                        interaction_output,
+                        tool_specs=tool_specs,
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                    )
                     interaction_output = _with_interaction_metadata(
                         interaction_output,
                         workflow="inventory_onboarding",
@@ -4129,7 +4368,11 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     )
                     return
 
-                onboarding_data = _normalize_onboarding_wizard_data(selected_scope, interaction_response)
+                onboarding_data = _normalize_onboarding_wizard_data(
+                    selected_scope,
+                    interaction_response,
+                    wizard_payload=last_interaction_payload,
+                )
                 company_context = await _maybe_active_company_context()
                 if company_context:
                     onboarding_data["company_context"] = company_context
@@ -4229,6 +4472,12 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         interaction_output = None
 
                     if isinstance(interaction_output, dict):
+                        interaction_output = await _rewrite_relation_interaction_dict(
+                            interaction_output,
+                            tool_specs=tool_specs,
+                            tool_executor=tool_executor,
+                            tool_ctx=tool_ctx,
+                        )
                         interaction_output = _with_interaction_metadata(
                             interaction_output,
                             workflow="inventory_onboarding",

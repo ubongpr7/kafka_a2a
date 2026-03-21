@@ -4,6 +4,7 @@ import pytest
 
 from tests import fake_langgraph_components
 from kafka_a2a.langgraph_processor import (
+    _build_inventory_operation,
     _build_product_operation,
     _classify_failed_operation,
     _interaction_payload_from_text,
@@ -154,6 +155,7 @@ def test_build_product_operation_supports_nested_payload_schema() -> None:
         ],
         company_context=None,
         product_name="Women's Cotton T-Shirt",
+        product_category_id=None,
         product_category="Women's Wear",
         pos_ready=True,
     )
@@ -163,6 +165,50 @@ def test_build_product_operation_supports_nested_payload_schema() -> None:
             "name": "Women's Cotton T-Shirt",
             "category_name": "Women's Wear",
             "pos_ready": True,
+        }
+    }
+    assert operation["missing_required"] == []
+
+
+def test_build_inventory_operation_prefers_relation_ids_in_nested_payload_schema() -> None:
+    operation = _build_inventory_operation(
+        tool_specs=[
+            ToolSpec(
+                name="inventory.create_inventory",
+                description="Create inventory.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "description": {"type": "string"},
+                                "stock_location_id": {"type": "string"},
+                                "category_id": {"type": "string"},
+                            },
+                            "required": ["name"],
+                        }
+                    },
+                    "required": ["payload"],
+                },
+            )
+        ],
+        company_context=None,
+        inventory_name="Main Inventory",
+        inventory_description="Primary sellable stock ledger",
+        related_location_id="loc-1",
+        related_location_name="Main Warehouse",
+        category_id="cat-1",
+        category_name="Men's Clothes",
+    )
+
+    assert operation["arguments"] == {
+        "payload": {
+            "name": "Main Inventory",
+            "description": "Primary sellable stock ledger",
+            "stock_location_id": "loc-1",
+            "category_id": "cat-1",
         }
     }
     assert operation["missing_required"] == []
@@ -1042,6 +1088,72 @@ async def test_onboarding_agent_scope_selection_opens_wizard() -> None:
 
 
 @pytest.mark.asyncio
+async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
+    picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Start Inventory Onboarding",
+        "description": "Choose the setup area you want to complete first. I will guide you step by step.",
+        "options": [
+            {"value": "full_setup", "label": "Full Inventory Setup"},
+            {"value": "stock_locations", "label": "Stock Locations"},
+            {"value": "inventory_categories", "label": "Inventory Categories"},
+            {"value": "inventory_setup", "label": "Inventory Setup"},
+            {"value": "product_onboarding", "label": "Product Onboarding"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+        "workflow": "inventory_onboarding",
+        "workflow_stage": "scope_picker",
+    }
+    task = Task(
+        id="task-onboarding-scope-relations",
+        context_id="ctx-onboarding-scope-relations",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"inventory_setup","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="help me set up inventory")]),
+            Message(role=Role.agent, parts=[DataPart(data=picker_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"inventory_setup","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "create_wizard_flow",
+        "inventory.search_stock_locations",
+        "inventory.list_inventory_categories",
+        "users.get_active_company_profile",
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["interaction_type"] == "wizard_flow"
+    assert payload["workflow_stage"] == "wizard"
+    assert payload["onboarding_scope"] == "inventory_setup"
+
+    fields = {field["name"]: field for field in payload["steps"][0]["fields"]}
+    assert fields["related_stock_location_id"]["type"] == "select"
+    assert fields["related_stock_location_id"]["options"][0]["label"] == "Main Warehouse"
+    assert fields["related_stock_location_id"]["options"][0]["value"] == "loc-1"
+    assert fields["inventory_category_id"]["type"] == "select"
+    assert fields["inventory_category_id"]["options"][0]["label"] == "Men's Clothes"
+    assert fields["inventory_category_id"]["options"][0]["value"] == "cat-1"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
 async def test_onboarding_agent_wizard_completion_prompts_for_review() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
     wizard_payload = {
@@ -1090,6 +1202,93 @@ async def test_onboarding_agent_wizard_completion_prompts_for_review() -> None:
     assert result_artifact.parts[0].data["onboarding_data"]["flat"]["default_inventory_name"] == "Main Inventory"
     assert "Main Warehouse" in result_artifact.parts[0].data["onboarding_summary"]
     assert result_artifact.parts[0].data["onboarding_data"]["company_context"]["name"] == "Intera Demo Company"
+
+
+@pytest.mark.asyncio
+async def test_onboarding_agent_review_uses_relation_labels_from_wizard_selection() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
+    wizard_payload = {
+        "interaction_type": "wizard_flow",
+        "title": "Inventory Setup Wizard",
+        "description": "Fill in the setup details and I will prepare the onboarding action plan.",
+        "steps": [
+            {
+                "id": "inventory",
+                "title": "Inventory Setup",
+                "description": "Define the first inventory ledger you want to create.",
+                "fields": [
+                    {
+                        "name": "default_inventory_name",
+                        "type": "text",
+                        "label": "Inventory Name",
+                        "required": True,
+                    },
+                    {
+                        "name": "related_stock_location_id",
+                        "type": "select",
+                        "label": "Primary Location for This Inventory",
+                        "required": False,
+                        "options": [
+                            {"value": "loc-1", "label": "Main Warehouse"},
+                            {"value": "loc-2", "label": "Front Store"},
+                        ],
+                    },
+                    {
+                        "name": "inventory_category_id",
+                        "type": "select",
+                        "label": "Default Category",
+                        "required": False,
+                        "options": [
+                            {"value": "cat-1", "label": "Men's Clothes"},
+                            {"value": "cat-2", "label": "Shoes"},
+                        ],
+                    },
+                ],
+            }
+        ],
+        "allow_back": True,
+        "show_progress": True,
+        "workflow": "inventory_onboarding",
+        "workflow_stage": "wizard",
+        "onboarding_scope": "inventory_setup",
+    }
+    response_text = (
+        '{"type":"wizard_flow_response","completed":true,"all_responses":'
+        '{"step_0":{"default_inventory_name":"Main Inventory","related_stock_location_id":"loc-1","inventory_category_id":"cat-2"}}}'
+    )
+    task = Task(
+        id="task-onboarding-review-relations",
+        context_id="ctx-onboarding-review-relations",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=response_text)]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="help me set up inventory")]),
+            Message(role=Role.agent, parts=[DataPart(data=wizard_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=response_text)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "users.get_active_company_profile",
+        "create_multiple_choice",
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["interaction_type"] == "multiple_choice"
+    assert payload["workflow_stage"] == "review"
+    assert payload["onboarding_data"]["flat"]["related_stock_location_id"] == "loc-1"
+    assert payload["onboarding_data"]["flat"]["related_stock_location_label"] == "Main Warehouse"
+    assert payload["onboarding_data"]["flat"]["inventory_category_id"] == "cat-2"
+    assert payload["onboarding_data"]["flat"]["inventory_category_label"] == "Shoes"
+    assert "Ledger location: Main Warehouse" in payload["onboarding_summary"]
+    assert "Default category: Shoes" in payload["onboarding_summary"]
+    assert "loc-1" not in payload["onboarding_summary"]
+    assert "cat-2" not in payload["onboarding_summary"]
 
 
 @pytest.mark.asyncio

@@ -351,6 +351,35 @@ class FakeToolExecutor(ToolExecutor):
                 input_schema={"type": "object", "properties": {}, "required": []},
             ),
             ToolSpec(
+                name="inventory.search_stock_locations",
+                description="Search stock locations.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": [],
+                },
+            ),
+            ToolSpec(
+                name="inventory.list_inventory_categories",
+                description="List inventory categories.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": [],
+                },
+            ),
+            ToolSpec(
+                name="product.get_product_categories",
+                description="List product categories.",
+                input_schema={"type": "object", "properties": {}, "required": []},
+            ),
+            ToolSpec(
                 name="inventory.create_stock_location",
                 description="Create a stock location.",
                 input_schema={
@@ -380,7 +409,9 @@ class FakeToolExecutor(ToolExecutor):
                     "properties": {
                         "name": {"type": "string"},
                         "description": {"type": "string"},
+                        "stock_location_id": {"type": "string"},
                         "location_name": {"type": "string"},
+                        "category_id": {"type": "string"},
                         "category_name": {"type": "string"},
                     },
                     "required": ["name"],
@@ -393,6 +424,7 @@ class FakeToolExecutor(ToolExecutor):
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
+                        "category_id": {"type": "string"},
                         "category_name": {"type": "string"},
                         "pos_ready": {"type": "boolean"},
                     },
