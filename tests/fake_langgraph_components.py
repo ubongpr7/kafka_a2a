@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -811,6 +812,29 @@ class FakeToolExecutorWithCategoryFailures(FakeToolExecutor):
         super().__init__(agent_name=agent_name, failing_tools={"inventory.create_inventory_category"})
 
 
+class FakeWrappedLookupToolExecutor(FakeToolExecutor):
+    async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
+        result = await super().call_tool(name=name, arguments=arguments, ctx=ctx)
+        if name not in {
+            "inventory.search_stock_locations",
+            "inventory.list_inventory_categories",
+            "product.get_product_categories",
+            "inventory.get_all_inventory",
+            "inventory.search_inventories",
+        }:
+            return result
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(result),
+                }
+            ],
+            "structuredContent": result,
+            "isError": False,
+        }
+
+
 def fake_llm_factory(*args: Any, **kwargs: Any) -> Any:
     _ = args, kwargs
     return FakeLlm()
@@ -840,6 +864,10 @@ def build_fake_tool_executor_without_users_or_onboarding(*, agent_name: str | No
 
 def build_fake_tool_executor_with_category_failures(*, agent_name: str | None = None) -> ToolExecutor:
     return FakeToolExecutorWithCategoryFailures(agent_name=agent_name)
+
+
+def build_fake_wrapped_lookup_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:
+    return FakeWrappedLookupToolExecutor(agent_name=agent_name)
 
 
 def reset_fake_components() -> None:

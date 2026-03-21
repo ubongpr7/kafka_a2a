@@ -87,6 +87,7 @@ def test_render_tool_prompt_block_includes_relation_lookup_rules() -> None:
 
     assert "Never ask the user to manually type backend IDs or UUIDs for relational fields." in prompt
     assert "prefer list/get-all tools over search tools whenever both are available." in prompt
+    assert "Do not tell the user the backend requires those parameters." in prompt
     assert "omit optional filters/null values" in prompt
     assert "`inventory.create_inventory.payload.category_id`" in prompt
     assert "`inventory.list_inventory_categories`" in prompt
@@ -1154,6 +1155,67 @@ async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects_from_wrapped_lookup_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "KA2A_TOOL_EXECUTOR",
+        "tests.fake_langgraph_components:build_fake_wrapped_lookup_tool_executor",
+    )
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
+    picker_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Start Inventory Onboarding",
+        "description": "Choose the setup area you want to complete first. I will guide you step by step.",
+        "options": [
+            {"value": "full_setup", "label": "Full Inventory Setup"},
+            {"value": "stock_locations", "label": "Stock Locations"},
+            {"value": "inventory_categories", "label": "Inventory Categories"},
+            {"value": "inventory_setup", "label": "Inventory Setup"},
+            {"value": "product_onboarding", "label": "Product Onboarding"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+        "workflow": "inventory_onboarding",
+        "workflow_stage": "scope_picker",
+    }
+    task = Task(
+        id="task-onboarding-scope-relations-wrapped",
+        context_id="ctx-onboarding-scope-relations-wrapped",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"inventory_setup","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="help me set up inventory")]),
+            Message(role=Role.agent, parts=[DataPart(data=picker_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"inventory_setup","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    fields = {field["name"]: field for field in payload["steps"][0]["fields"]}
+
+    assert fields["default_inventory_name"]["type"] == "text"
+    assert fields["related_stock_location_id"]["type"] == "select"
+    assert fields["related_stock_location_id"]["options"][0]["label"] == "Main Warehouse"
+    assert fields["related_stock_location_id"]["options"][0]["value"] == "loc-1"
+    assert fields["inventory_category_id"]["type"] == "select"
+    assert fields["inventory_category_id"]["options"][0]["label"] == "Men's Clothes"
+    assert fields["inventory_category_id"]["options"][0]["value"] == "cat-1"
 
 
 @pytest.mark.asyncio

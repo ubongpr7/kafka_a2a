@@ -969,6 +969,7 @@ def _render_relation_prompt_block(tools: list[ToolSpec]) -> str:
         "- Never ask the user to manually type backend IDs or UUIDs for relational fields.",
         "- For any relational field, fetch the available records first, present human-readable labels, and submit the matching internal ID only after the user selects an option.",
         "- When loading selectable reference data for the current tenant, prefer list/get-all tools over search tools whenever both are available.",
+        "- If a list/get-all tool exposes optional query, limit, or filter arguments, treat those as internal defaults for the agent to supply. Do not tell the user the backend requires those parameters.",
         "- If only a search-style lookup tool exists, call it with an empty string and omit optional filters/null values instead of asking the user for a search term.",
     ]
     for tool_name, field_path, lookup_tool in hints:
@@ -2615,6 +2616,10 @@ def _matching_relation_specs_for_texts(tool_specs: list[ToolSpec], *texts: str |
 
 
 def _relation_items_from_lookup_output(lookup_tool: str, output: Any) -> list[dict[str, Any]]:
+    coerced = _coerce_mapping_from_tool_output(output)
+    if isinstance(coerced, dict):
+        output = coerced
+
     if not isinstance(output, dict):
         return output if isinstance(output, list) else []
 

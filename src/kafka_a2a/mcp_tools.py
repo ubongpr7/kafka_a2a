@@ -458,7 +458,35 @@ def _parse_remote_tool_specs(result: Any) -> list[_RemoteToolSpec]:
 
 def _dump_result(result: Any) -> Any:
     if hasattr(result, "model_dump"):
-        return result.model_dump(by_alias=True, exclude_none=True)  # type: ignore[no-any-return]
+        result = result.model_dump(by_alias=True, exclude_none=True)  # type: ignore[assignment]
+
+    if isinstance(result, dict):
+        structured = result.get("structuredContent")
+        if structured is None:
+            structured = result.get("structured_content")
+        if structured is not None:
+            return structured
+
+        content = result.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                nested = item.get("structuredContent")
+                if nested is None:
+                    nested = item.get("structured_content")
+                if nested is not None:
+                    return nested
+                if isinstance(item.get("data"), dict):
+                    return item["data"]
+                text = item.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+
     return result
 
 

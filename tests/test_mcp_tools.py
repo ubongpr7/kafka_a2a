@@ -439,6 +439,85 @@ async def test_multi_mcp_executor_omits_none_arguments_before_remote_call(
 
 
 @pytest.mark.asyncio
+async def test_multi_mcp_executor_unwraps_structured_content_from_remote_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "search_stock_locations", "description": "Search stock locations"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                _ = name, arguments
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "profile_id": 1,
+                                    "results": [
+                                        {"id": "loc-1", "name": "Main Warehouse"},
+                                    ],
+                                }
+                            ),
+                        }
+                    ],
+                    "structuredContent": {
+                        "profile_id": 1,
+                        "results": [
+                            {"id": "loc-1", "name": "Main Warehouse"},
+                        ],
+                    },
+                    "isError": False,
+                }
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["search_stock_locations"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    result = await executor.call_tool(
+        name="inventory.search_stock_locations",
+        arguments={"query": "", "limit": 25},
+        ctx=ToolContext(),
+    )
+
+    assert result == {
+        "profile_id": 1,
+        "results": [
+            {"id": "loc-1", "name": "Main Warehouse"},
+        ],
+    }
+
+
+@pytest.mark.asyncio
 async def test_multi_mcp_executor_composes_local_and_remote_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     from kafka_a2a import mcp_tools
 
