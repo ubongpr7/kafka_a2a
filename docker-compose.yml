@@ -31,6 +31,8 @@ services:
         "langgraph-chat",
         "--push-notifications",
       ]
+    restart: unless-stopped
+
 
   onboarding-agent:
     <<: *ka2a_image
@@ -50,7 +52,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
-
+    restart: unless-stopped
   product-agent:
     <<: *ka2a_image
     volumes:
@@ -69,6 +71,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   product-discovery-agent:
     <<: *ka2a_image
@@ -86,6 +89,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   product-catalog-admin-agent:
     <<: *ka2a_image
@@ -103,6 +107,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   product-merchandising-agent:
     <<: *ka2a_image
@@ -120,6 +125,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   product-pricing-agent:
     <<: *ka2a_image
@@ -137,6 +143,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   inventory-agent:
     <<: *ka2a_image
@@ -156,7 +163,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
-
+    restart: unless-stopped
   inventory-visibility-agent:
     <<: *ka2a_image
     volumes:
@@ -173,6 +180,8 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
+
 
   inventory-setup-agent:
     <<: *ka2a_image
@@ -190,6 +199,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   inventory-procurement-agent:
     <<: *ka2a_image
@@ -207,6 +217,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   inventory-fulfillment-agent:
     <<: *ka2a_image
@@ -224,6 +235,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   users-agent:
     <<: *ka2a_image
@@ -241,6 +253,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   pos-agent:
     <<: *ka2a_image
@@ -260,6 +273,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   pos-live-agent:
     <<: *ka2a_image
@@ -277,6 +291,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   pos-admin-agent:
     <<: *ka2a_image
@@ -294,6 +309,7 @@ services:
         "--processor",
         "langgraph-chat"
       ]
+    restart: unless-stopped
 
   gateway:
     <<: *ka2a_image
@@ -317,6 +333,7 @@ services:
     ports:
       - "7006:7006"
     command: ["gateway", "--default-agent", "host", "--host", "0.0.0.0", "--port", "7006"]
+    restart: unless-stopped
 
   a2a-proxy:
     <<: *ka2a_image
@@ -340,3 +357,4 @@ services:
     ports:
       - "7007:7007"
     command: ["proxy", "--agent-name", "host", "--host", "0.0.0.0", "--port", "7007"]
+    restart: unless-stopped
