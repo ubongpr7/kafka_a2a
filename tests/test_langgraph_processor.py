@@ -62,8 +62,8 @@ def test_render_tool_prompt_block_includes_relation_lookup_rules() -> None:
                 input_schema={"type": "object", "properties": {}, "required": []},
             ),
             ToolSpec(
-                name="inventory.create_inventory",
-                description="Create inventory.",
+                name="inventory.create_inventory_item",
+                description="Create inventory item.",
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -89,7 +89,7 @@ def test_render_tool_prompt_block_includes_relation_lookup_rules() -> None:
     assert "prefer list/get-all tools over search tools whenever both are available." in prompt
     assert "Do not tell the user the backend requires those parameters." in prompt
     assert "omit optional filters/null values" in prompt
-    assert "`inventory.create_inventory.payload.category_id`" in prompt
+    assert "`inventory.create_inventory_item.payload.category_id`" in prompt
     assert "`inventory.list_inventory_categories`" in prompt
 
 
@@ -177,8 +177,8 @@ def test_build_inventory_operation_prefers_relation_ids_in_nested_payload_schema
     operation = _build_inventory_operation(
         tool_specs=[
             ToolSpec(
-                name="inventory.create_inventory",
-                description="Create inventory.",
+                name="inventory.create_inventory_item",
+                description="Create inventory item.",
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -235,13 +235,13 @@ def test_select_router_delegation_agent_prefers_best_matching_subspecialist() ->
             },
             {
                 "name": "inventory_setup",
-                "description": "Focused inventory specialist for stock-location, inventory-category, and inventory-ledger setup and maintenance workflows.",
+                "description": "Focused inventory specialist for stock-location, inventory-category, and inventory-item setup and maintenance workflows.",
                 "skills": [
                     {
                         "name": "Inventory Setup Admin",
-                        "description": "Create and update stock locations, inventory categories, and inventory ledgers.",
+                        "description": "Create and update stock locations, inventory categories, and inventory items.",
                         "tags": ["inventory", "setup", "create", "categories"],
-                        "examples": ["Create the main inventory ledger for onboarding."],
+                        "examples": ["Create the main inventory item for onboarding."],
                     }
                 ],
             },
@@ -740,7 +740,7 @@ async def test_host_inventory_domain_picker_selection_delegates_to_inventory_rou
             {
                 "request": (
                     "The user selected Set Up Inventory from the Inventory Management menu. "
-                    "Help them create or configure stock locations, inventory categories, or inventory ledgers. "
+                    "Help them create or configure stock locations, inventory categories, or inventory items. "
                     "Start with a short structured choice or the next required setup step. "
                     "Never ask for raw internal ids when lookups or selections can be used instead."
                 ),
@@ -1339,7 +1339,7 @@ async def test_onboarding_agent_review_uses_relation_labels_from_wizard_selectio
             {
                 "id": "inventory",
                 "title": "Inventory Setup",
-                "description": "Define the first inventory ledger you want to create.",
+                "description": "Define the first inventory item you want to create.",
                 "fields": [
                     {
                         "name": "default_inventory_name",
@@ -1474,13 +1474,13 @@ async def test_onboarding_agent_review_confirmation_creates_inventory_setup_dire
         "inventory.create_inventory_category",
         "inventory.create_inventory_category",
         "inventory.create_inventory_category",
-        "inventory.create_inventory",
+        "inventory.create_inventory_item",
     ]
     assert not any(isinstance(event, Artifact) and event.name == "delegation" for event in events)
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == (
-        "Created 1 stock location, 3 inventory categories, and 1 inventory ledger for onboarding."
+        "Created 1 stock location, 3 inventory categories, and 1 inventory item for onboarding."
     )
     created_artifact = next(
         event for event in events if isinstance(event, Artifact) and event.name == "onboarding.created_operations"
@@ -1614,7 +1614,7 @@ async def test_onboarding_agent_partial_failures_prompt_for_retry(
         "inventory.create_inventory_category",
         "inventory.create_inventory_category",
         "inventory.create_inventory_category",
-        "inventory.create_inventory",
+        "inventory.create_inventory_item",
         "create_multiple_choice",
     ]
 

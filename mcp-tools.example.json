@@ -37,11 +37,11 @@
             "mode": "forward_bearer"
           },
           "tools": [
-            "search_inventories",
+            "search_inventory_items",
             "search_stock_locations",
             "list_inventory_categories",
             "create_inventory_category",
-            "create_inventory",
+            "create_inventory_item",
             "create_stock_location"
           ]
         }
@@ -155,9 +155,7 @@
             "mode": "forward_bearer"
           },
           "tools": [
-            "search_inventories",
-            "get_inventory_details",
-            "search_stock_items",
+            "search_inventory_items",
             "get_inventory_item_details",
             "get_inventory_alerts",
             "search_stock_locations",
@@ -186,7 +184,7 @@
             "dispatch_return_order",
             "complete_return_order",
             "cancel_return_order",
-            "adjust_inventory_stock",
+            "adjust_inventory_item_stock",
             "transfer_location_stock",
             "create_stock_reservation",
             "release_stock_reservation",
@@ -198,14 +196,14 @@
             "get_inventory_category_inventories",
             "create_inventory_category",
             "update_inventory_category",
-            "create_inventory",
-            "update_inventory",
+            "create_inventory_item",
+            "update_inventory_item",
             "create_stock_location",
             "update_stock_location",
-            "get_stock_item_tracking_history",
-            "update_stock_item_status",
-            "search_expiring_stock_items",
-            "search_low_stock_items",
+            "get_inventory_item_tracking_history",
+            "update_inventory_item_status",
+            "search_expiring_inventory_items",
+            "search_low_inventory_items",
             "list_purchase_order_line_items",
             "add_purchase_order_line_item",
             "update_purchase_order_line_item",

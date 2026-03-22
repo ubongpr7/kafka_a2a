@@ -103,7 +103,7 @@ def test_multi_mcp_config_resolves_multiple_specialists_without_cross_pollution(
                                 "id": "inventory",
                                 "serverUrl": "http://inventory-mcp:8000/mcp",
                                 "toolNamePrefix": "inventory.",
-                                "tools": ["search_inventories"],
+                                "tools": ["search_inventory_items"],
                             }
                         ]
                     },
@@ -163,7 +163,7 @@ def test_multi_mcp_config_supports_shared_server_references(tmp_path: Path) -> N
                         "servers": [
                             {
                                 "ref": "inventory",
-                                "tools": ["create_inventory", "create_stock_location"],
+                                "tools": ["create_inventory_item", "create_stock_location"],
                             },
                             {
                                 "ref": "products",
@@ -184,7 +184,7 @@ def test_multi_mcp_config_supports_shared_server_references(tmp_path: Path) -> N
     assert [server.id for server in cfg.servers] == ["inventory", "products"]
     assert cfg.servers[0].server_url == "http://inventory-mcp:8000/mcp"
     assert cfg.servers[0].tool_name_prefix == "inventory."
-    assert cfg.servers[0].tools == ["create_inventory", "create_stock_location"]
+    assert cfg.servers[0].tools == ["create_inventory_item", "create_stock_location"]
     assert cfg.servers[1].server_url == "http://products-mcp:8000/mcp"
     assert cfg.servers[1].tool_name_prefix == "product."
     assert cfg.servers[1].tools == ["create_product"]
@@ -208,7 +208,7 @@ def test_multi_mcp_config_does_not_apply_shared_servers_as_host_fallback(tmp_pat
                         "servers": [
                             {
                                 "ref": "inventory",
-                                "tools": ["search_inventories"],
+                                "tools": ["search_inventory_items"],
                             }
                         ]
                     }

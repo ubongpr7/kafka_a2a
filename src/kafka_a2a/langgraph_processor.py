@@ -365,7 +365,7 @@ HOST_DOMAIN_AREA_REQUESTS: dict[str, dict[str, str]] = {
     "inventory": {
         "inventory_setup": (
             "The user selected Set Up Inventory from the Inventory Management menu. "
-            "Help them create or configure stock locations, inventory categories, or inventory ledgers. "
+            "Help them create or configure stock locations, inventory categories, or inventory items. "
             "Start with a short structured choice or the next required setup step. "
             "Never ask for raw internal ids when lookups or selections can be used instead."
         ),
@@ -826,16 +826,16 @@ RELATION_LOOKUP_REGISTRY: dict[str, dict[str, Any]] = {
         "aliases": {"product", "productid"},
         "default_arguments": {"query": "", "limit": 25},
     },
-    "inventory.get_all_inventory": {
-        "label": "Inventory",
-        "model_tokens": {"inventory"},
-        "aliases": {"inventory", "inventoryid"},
-        "default_arguments": {"limit": 25},
+    "inventory.list_inventory_items": {
+        "label": "Inventory Item",
+        "model_tokens": {"inventory", "inventoryitem"},
+        "aliases": {"inventory", "inventoryid", "inventoryitem", "inventoryitemid"},
+        "default_arguments": {},
     },
-    "inventory.search_inventories": {
-        "label": "Inventory",
-        "model_tokens": {"inventory"},
-        "aliases": {"inventory", "inventoryid"},
+    "inventory.search_inventory_items": {
+        "label": "Inventory Item",
+        "model_tokens": {"inventory", "inventoryitem"},
+        "aliases": {"inventory", "inventoryid", "inventoryitem", "inventoryitemid"},
         "default_arguments": {"query": "", "limit": 25},
     },
 }
@@ -1087,7 +1087,7 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
             {
                 "id": "inventory",
                 "title": "Inventory Setup",
-                "description": "Define the first inventory ledger you want to create.",
+                "description": "Define the first inventory item you want to create.",
                 "fields": [
                     {
                         "name": "default_inventory_name",
@@ -1101,7 +1101,7 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
                         "type": "textarea",
                         "label": "Inventory Description",
                         "required": False,
-                        "placeholder": "Primary sellable stock ledger for the business.",
+                        "placeholder": "Primary sellable stock item for the business.",
                     },
                     {
                         "name": "related_stock_location_id",
@@ -1207,8 +1207,8 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
         },
         {
             "id": "inventory",
-            "title": "Inventory Ledger",
-            "description": "Define the first inventory ledger to create.",
+            "title": "Inventory Item",
+            "description": "Define the first inventory item to create.",
             "fields": [
                 {
                     "name": "default_inventory_name",
@@ -1222,7 +1222,7 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
                     "type": "textarea",
                     "label": "Inventory Description",
                     "required": False,
-                    "placeholder": "Primary sellable stock ledger for the business.",
+                    "placeholder": "Primary sellable stock item for the business.",
                 },
             ],
         },
@@ -1365,11 +1365,11 @@ def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
 
     inventory_name = str(flat.get("default_inventory_name") or "").strip()
     if inventory_name:
-        lines.append(f"Inventory ledger: {inventory_name}")
+        lines.append(f"Inventory item: {inventory_name}")
 
     inventory_description = str(flat.get("inventory_description") or "").strip()
     if inventory_description:
-        lines.append(f"Inventory note: {inventory_description}")
+        lines.append(f"Inventory description: {inventory_description}")
 
     related_location_name = (
         str(flat.get("related_stock_location_label") or "").strip()
@@ -1437,7 +1437,7 @@ def _onboarding_creation_request(scope: str, data: dict[str, Any]) -> str:
         )
     return (
         "Create the requested inventory foundation setup using the available inventory write tools if possible. "
-        "Create stock locations, inventory categories, and inventory ledgers as applicable to the collected data, "
+        "Create stock locations, inventory categories, and inventory items as applicable to the collected data, "
         "rather than only describing them. If any required detail is missing, ask one concise follow-up question.\n"
         f"Collected onboarding data JSON:\n{serialized}"
     )
@@ -1854,7 +1854,7 @@ def _onboarding_completed_text(created_operations: dict[str, Any]) -> str:
             f"{counts['inventory_category']} inventory categor" + ("ies" if counts["inventory_category"] != 1 else "y")
         )
     if counts["inventory"]:
-        parts.append(f"{counts['inventory']} inventory ledger" + ("s" if counts["inventory"] != 1 else ""))
+        parts.append(f"{counts['inventory']} inventory item" + ("s" if counts["inventory"] != 1 else ""))
     if counts["product"]:
         parts.append(f"{counts['product']} product" + ("s" if counts["product"] != 1 else ""))
 
@@ -1968,7 +1968,7 @@ def _build_inventory_operation(
     category_id: str | None,
     category_name: str | None,
 ) -> dict[str, Any]:
-    tool_name = "inventory.create_inventory"
+    tool_name = "inventory.create_inventory_item"
     spec = _tool_spec_by_name(tool_specs, tool_name)
     arguments = _company_context_arguments(spec, company_context)
     base_argument_keys = set(arguments)
@@ -2045,7 +2045,7 @@ def _build_inventory_operation(
             arguments["payload"] = payload_arguments
     return {
         "tool_name": tool_name,
-        "label": f"inventory ledger '{inventory_name}'",
+        "label": f"inventory item '{inventory_name}'",
         "operation_type": "inventory",
         "semantic_key": f"{tool_name}:{_normalize_operation_key(inventory_name)}",
         "arguments": _filtered_tool_arguments(spec, arguments),
@@ -2656,8 +2656,8 @@ def _relation_items_from_lookup_output(lookup_tool: str, output: Any) -> list[di
         "inventory.search_stock_locations",
         "product.get_product_categories",
         "product.search_products",
-        "inventory.get_all_inventory",
-        "inventory.search_inventories",
+        "inventory.list_inventory_items",
+        "inventory.search_inventory_items",
     }:
         results = output.get("results")
         if isinstance(results, list):
@@ -2753,8 +2753,8 @@ def _relation_option_from_item(lookup_tool: str, item: dict[str, Any]) -> dict[s
             description_parts.append(category)
         if sku:
             description_parts.append(f"SKU: {sku}")
-    elif lookup_tool in {"inventory.get_all_inventory", "inventory.search_inventories"}:
-        category = _first_string(item, ["category"])
+    elif lookup_tool in {"inventory.list_inventory_items", "inventory.search_inventory_items"}:
+        category = _first_string(item, ["inventory_category", "category"])
         if category:
             description_parts.append(category)
 

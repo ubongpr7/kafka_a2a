@@ -120,14 +120,14 @@ class FakeToolExecutor(ToolExecutor):
                 },
                 {
                     "name": "inventory_setup",
-                    "description": "Focused inventory specialist for stock-location, inventory-category, and inventory-ledger setup and maintenance workflows.",
+                    "description": "Focused inventory specialist for stock-location, inventory-category, and inventory-item setup and maintenance workflows.",
                     "skills": [
                         {
                             "id": "inventory_setup_admin",
                             "name": "Inventory Setup Admin",
-                            "description": "Create and update stock locations, inventory categories, and inventory ledgers.",
+                            "description": "Create and update stock locations, inventory categories, and inventory items.",
                             "tags": ["inventory", "setup", "locations", "categories", "create"],
-                            "examples": ["Create the main inventory ledger for onboarding."],
+                            "examples": ["Create the main inventory item for onboarding."],
                         }
                     ],
                 },
@@ -300,8 +300,8 @@ class FakeToolExecutor(ToolExecutor):
                     },
                 ),
                 ToolSpec(
-                    name="inventory.create_inventory",
-                    description="Create an inventory ledger.",
+                    name="inventory.create_inventory_item",
+                    description="Create an inventory item.",
                     input_schema={
                         "type": "object",
                         "properties": {
@@ -403,8 +403,8 @@ class FakeToolExecutor(ToolExecutor):
                 },
             ),
             ToolSpec(
-                name="inventory.create_inventory",
-                description="Create an inventory ledger.",
+                name="inventory.create_inventory_item",
+                description="Create an inventory item.",
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -540,11 +540,11 @@ class FakeToolExecutor(ToolExecutor):
                 return {
                     "selected_agent": "inventory",
                     "delegated_task_id": "delegated-inventory-onboarding",
-                    "response_text": "Created 1 stock location, 3 inventory categories, and 1 inventory ledger for onboarding.",
+                    "response_text": "Created 1 stock location, 3 inventory categories, and 1 inventory item for onboarding.",
                     "result_parts": [
                         {
                             "kind": "text",
-                            "text": "Created 1 stock location, 3 inventory categories, and 1 inventory ledger for onboarding.",
+                            "text": "Created 1 stock location, 3 inventory categories, and 1 inventory item for onboarding.",
                         }
                     ],
                     "artifacts": {},
@@ -561,7 +561,7 @@ class FakeToolExecutor(ToolExecutor):
                         },
                         {
                             "state": "completed",
-                            "message": "Created 1 stock location, 3 inventory categories, and 1 inventory ledger for onboarding.",
+                            "message": "Created 1 stock location, 3 inventory categories, and 1 inventory item for onboarding.",
                             "final": True,
                         },
                     ],
@@ -784,7 +784,7 @@ class FakeToolExecutor(ToolExecutor):
                 "id": f"inventory-category-{arguments.get('name','').lower().replace(' ', '-')}",
                 "name": arguments.get("name"),
             }
-        if name == "inventory.create_inventory":
+        if name == "inventory.create_inventory_item":
             return {
                 "id": f"inventory-{arguments.get('name','').lower().replace(' ', '-')}",
                 "name": arguments.get("name"),
@@ -819,8 +819,8 @@ class FakeWrappedLookupToolExecutor(FakeToolExecutor):
             "inventory.search_stock_locations",
             "inventory.list_inventory_categories",
             "product.get_product_categories",
-            "inventory.get_all_inventory",
-            "inventory.search_inventories",
+            "inventory.list_inventory_items",
+            "inventory.search_inventory_items",
         }:
             return result
         return {
