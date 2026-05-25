@@ -49,6 +49,8 @@ def clear_fernet_cache() -> None:
 
 def decrypt_fernet_secret(secret: EncryptedSecret) -> str:
     alg = (secret.alg or "fernet").strip().lower()
+    if alg in {"plain", "none"}:
+        return secret.ciphertext
     if alg and alg != "fernet":
         raise ValueError(f"Unsupported encrypted secret algorithm: {secret.alg}")
 
@@ -71,4 +73,3 @@ def decrypt_fernet_secret(secret: EncryptedSecret) -> str:
             continue
 
     raise ValueError("Unable to decrypt JWT encrypted secret with configured Fernet keys.") from last_error
-

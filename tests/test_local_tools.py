@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from kafka_a2a.local_tools import KafkaDelegationBackend, LocalInteractionToolExecutor, _score_card
+from kafka_a2a.local_tools import HybridDelegationBackend, KafkaDelegationBackend, LocalInteractionToolExecutor, _score_card
 from kafka_a2a.models import AgentCard, AgentSkill
 from kafka_a2a.tenancy import Principal
 from kafka_a2a.tools import ToolContext
@@ -246,3 +246,120 @@ async def test_kafka_delegation_backend_times_out_stuck_stream(monkeypatch: pyte
             agent_name="inventory_setup",
             ctx=ToolContext(),
         )
+
+
+@pytest.mark.asyncio
+async def test_kafka_delegation_backend_falls_back_to_control_plane_when_directory_is_empty() -> None:
+    backend = KafkaDelegationBackend(agent_name="host", runtime_agent_name="wa-p1-host-c6ff4c876a52")
+    backend._control_plane = type(
+        "_FakeControlPlane",
+        (),
+        {
+            "enabled": True,
+            "list_internal_runtime_registry": lambda self: {
+                "agents": [
+                    {
+                        "runtime_card_payload": {
+                            "protocolVersion": "0.3.0",
+                            "name": "wa-p1-host-c6ff4c876a52",
+                            "description": "Host",
+                            "url": "kafka://host",
+                            "preferredTransport": "kafka",
+                            "version": "0.1.0",
+                            "capabilities": {"streaming": True, "pushNotifications": True},
+                            "defaultInputModes": ["text"],
+                            "defaultOutputModes": ["text"],
+                            "supportsAuthenticatedExtendedCard": True,
+                            "metadata": {
+                                "ka2aRuntime": {
+                                    "runtimeName": "wa-p1-host-c6ff4c876a52",
+                                    "publicSlug": "host",
+                                    "profileId": "1",
+                                }
+                            },
+                        }
+                    },
+                    {
+                        "runtime_card_payload": {
+                            "protocolVersion": "0.3.0",
+                            "name": "wa-p1-inventory_fulfillment-f44699a94c87",
+                            "description": "Inventory fulfillment",
+                            "url": "kafka://inventory_fulfillment",
+                            "preferredTransport": "kafka",
+                            "version": "0.1.0",
+                            "capabilities": {"streaming": True, "pushNotifications": False},
+                            "defaultInputModes": ["text"],
+                            "defaultOutputModes": ["text"],
+                            "supportsAuthenticatedExtendedCard": True,
+                            "metadata": {
+                                "ka2aRuntime": {
+                                    "runtimeName": "wa-p1-inventory_fulfillment-f44699a94c87",
+                                    "publicSlug": "inventory_fulfillment",
+                                    "profileId": "1",
+                                }
+                            },
+                        }
+                    },
+                ]
+            },
+        },
+    )()
+
+    cards = await backend._list_control_plane_cards()
+
+    assert [card.name for card in cards] == ["wa-p1-inventory_fulfillment-f44699a94c87"]
+    visible = backend._visible_downstream_cards(cards)
+    assert [card.name for card in visible] == ["wa-p1-inventory_fulfillment-f44699a94c87"]
+
+
+@pytest.mark.asyncio
+async def test_hybrid_delegation_backend_uses_local_transport_for_local_agents() -> None:
+    delegated: list[tuple[str, str | None]] = []
+
+    async def _delegate_local(card: AgentCard, request: str, delegated_task_id: str | None, ctx: ToolContext) -> dict[str, object]:
+        _ = ctx
+        delegated.append((card.name, delegated_task_id))
+        return {
+            "selected_agent": card.name,
+            "delegated_task_id": delegated_task_id,
+            "response_text": f"local:{request}",
+            "result_parts": [{"kind": "text", "text": f"local:{request}"}],
+            "artifacts": {},
+            "status_updates": [],
+            "agent_card": {"name": card.name},
+            "transport": "local",
+        }
+
+    backend = HybridDelegationBackend(
+        agent_name="host",
+        delegate_local=_delegate_local,
+        is_local_agent=lambda agent_name: agent_name == "wa-p1-inventory_setup-123",
+    )
+
+    async def _list_registered_cards() -> list[AgentCard]:
+        return [
+            AgentCard(
+                name="wa-p1-inventory_setup-123",
+                description="Inventory setup",
+                url="local://wa-p1-inventory_setup-123",
+                preferred_transport="local",
+                version="0.1.0",
+                metadata={
+                    "ka2aRuntime": {
+                        "publicSlug": "inventory_setup",
+                    }
+                },
+            )
+        ]
+
+    backend._list_registered_cards = _list_registered_cards  # type: ignore[method-assign]
+
+    result = await backend.delegate(
+        request="configure stock locations",
+        agent_name="inventory_setup",
+        delegated_task_id="task-123",
+        ctx=ToolContext(),
+    )
+
+    assert result["transport"] == "local"
+    assert delegated == [("wa-p1-inventory_setup-123", "task-123")]

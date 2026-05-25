@@ -139,8 +139,10 @@ class Ka2aAgent:
             if card.name != config.agent_name:
                 raise ValueError("AgentCard.name must match Ka2aAgentConfig.agent_name")
             if not card.url:
-                card.url = config.url or f"kafka://{config.agent_name}"
-            card.preferred_transport = "kafka"
+                transport_name = (card.preferred_transport or "kafka").strip() or "kafka"
+                card.url = config.url or f"{transport_name}://{config.agent_name}"
+            if not card.preferred_transport:
+                card.preferred_transport = "kafka"
             card.capabilities.streaming = True
             card.capabilities.push_notifications = config.push_notifications
             exts = list(card.capabilities.extensions or [])
@@ -268,6 +270,135 @@ class Ka2aAgent:
             self._consumer_task = None
         await self._store.aclose()
         await self._transport.stop()
+
+    async def stream_message_local(
+        self,
+        *,
+        message: Message,
+        configuration: TaskConfiguration | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AsyncIterator[Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
+        request_metadata = metadata or {}
+        if self._cfg.tenant_isolation:
+            principal = self._require_principal(request_metadata)
+            request_metadata = with_principal(
+                request_metadata, principal, key=self._cfg.principal_metadata_key
+            )
+        if configuration and configuration.push_notification_config is not None:
+            if not self.card.capabilities.push_notifications:
+                raise A2AError(
+                    A2AErrorCode.PUSH_NOTIFICATION_NOT_SUPPORTED, "Push Notification is not supported"
+                )
+        stored_metadata = request_metadata
+        if not self._cfg.store_principal_secrets:
+            stored_metadata = strip_principal_secrets_for_storage(
+                metadata=request_metadata,
+                principal_metadata_key=self._cfg.principal_metadata_key,
+            ) or {}
+        task = await self._store.create_task(
+            initial_message=message,
+            context_id=message.context_id,
+            metadata=stored_metadata or None,
+        )
+        if configuration and configuration.push_notification_config is not None:
+            await self._store.set_push_notification_config(
+                task_id=task.id, config=configuration.push_notification_config
+            )
+        processor_metadata = await self._processor_metadata_for_request(
+            task=task,
+            configuration=configuration,
+            request_metadata=request_metadata or None,
+        )
+        self._start_processing(
+            task=task,
+            message=message,
+            configuration=configuration,
+            metadata=processor_metadata,
+        )
+        return self._iter_local_stream(task=task, after_sequence=0)
+
+    async def continue_task_stream_local(
+        self,
+        *,
+        task_id: str,
+        message: Message,
+        configuration: TaskConfiguration | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AsyncIterator[Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
+        task = await self._store.get_task(task_id)
+        if task is None:
+            raise A2AError(A2AErrorCode.TASK_NOT_FOUND, "Task not found", {"id": task_id})
+        if self._cfg.tenant_isolation:
+            principal = self._require_principal(metadata or {})
+            self._enforce_task_access(task, principal)
+        if task.status.state not in (TaskState.input_required, TaskState.auth_required):
+            raise A2AError(
+                A2AErrorCode.INVALID_PARAMS,
+                "Task is not waiting for user input",
+                {"id": task_id, "state": task.status.state.value},
+            )
+        proc = self._processing.get(task_id)
+        if proc is not None and not proc.done():
+            raise A2AError(A2AErrorCode.INVALID_PARAMS, "Task is already processing", {"id": task_id})
+
+        request_metadata = metadata or {}
+        if self._cfg.tenant_isolation:
+            principal = self._require_principal(request_metadata)
+            request_metadata = with_principal(
+                request_metadata, principal, key=self._cfg.principal_metadata_key
+            )
+
+        user_message = message
+        user_message.task_id = task.id
+        user_message.context_id = task.context_id
+        if not user_message.reference_task_ids:
+            user_message.reference_task_ids = [task.id]
+
+        resumed_event = await self._store.append_status(
+            task_id=task.id,
+            status=TaskStatus(
+                state=TaskState.submitted,
+                message=user_message,
+            ),
+        )
+        self._enqueue_push(task_id=task.id, event=resumed_event)
+        after_sequence = await self._store.latest_sequence(task.id)
+
+        processor_metadata = await self._processor_metadata_for_request(
+            task=task,
+            configuration=configuration,
+            request_metadata=request_metadata or None,
+        )
+        self._start_processing(
+            task=task,
+            message=user_message,
+            configuration=configuration,
+            metadata=processor_metadata,
+        )
+        updated = await self._store.get_task(task.id)
+        assert updated is not None
+        return self._iter_local_stream(task=updated, after_sequence=after_sequence)
+
+    def _iter_local_stream(
+        self,
+        *,
+        task: Task,
+        after_sequence: int,
+    ) -> AsyncIterator[Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
+        async def _iter() -> AsyncIterator[Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
+            yield task
+            async for record in self._store.iter_events(
+                task.id,
+                replay_history=True,
+                after_sequence=after_sequence,
+            ):
+                if isinstance(record.event, Task):
+                    continue
+                yield record.event
+                if isinstance(record.event, TaskStatusUpdateEvent) and record.event.final:
+                    break
+
+        return _iter()
 
     async def _dispatch_request(self, env: KafkaEnvelope) -> None:
         async with self._sem:

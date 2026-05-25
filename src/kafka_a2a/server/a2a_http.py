@@ -1,10 +1,13 @@
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 from pydantic import ValidationError
 
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
+from kafka_a2a.control_plane import ControlPlaneClient, ControlPlaneError
 from kafka_a2a.errors import A2AError
 from kafka_a2a.ops import ensure_trace_metadata, metrics_enabled, metrics_snapshot
 from kafka_a2a.protocol import (
@@ -76,16 +79,55 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
         transport=transport,
         config=Ka2aClientConfig(client_id=config.client_id, request_timeout_s=config.request_timeout_s),
     )
+    control_plane = ControlPlaneClient()
 
-    app = FastAPI(title=config.title, version=config.version)
-
-    @app.on_event("startup")
-    async def _startup() -> None:
+    @asynccontextmanager
+    async def _lifespan(_app):
         await client.start()
+        try:
+            yield
+        finally:
+            await client.stop()
 
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
-        await client.stop()
+    app = FastAPI(title=config.title, version=config.version, lifespan=_lifespan)
+
+    def _authorization_from_request(request: Request) -> str | None:
+        value = request.headers.get("authorization")
+        if value and value.strip():
+            return value.strip()
+        return None
+
+    async def _resolve_runtime_agent_name(request: Request) -> str:
+        if not control_plane.enabled:
+            return config.agent_name
+        authorization = _authorization_from_request(request)
+        if not authorization:
+            return config.agent_name
+        try:
+            payload = await asyncio.to_thread(
+                control_plane.get_workspace_agent_config,
+                slug=config.agent_name,
+                authorization=authorization,
+            )
+        except ControlPlaneError as exc:
+            raise RuntimeError(str(exc.payload or exc)) from exc
+        runtime_name = str(payload.get("runtime_name") or "").strip()
+        return runtime_name or config.agent_name
+
+    async def _resolve_public_card(request: Request) -> dict[str, Any] | None:
+        if not control_plane.enabled:
+            return None
+        authorization = _authorization_from_request(request)
+        if not authorization:
+            return None
+        try:
+            return await asyncio.to_thread(
+                control_plane.get_workspace_agent_card,
+                slug=config.agent_name,
+                authorization=authorization,
+            )
+        except ControlPlaneError as exc:
+            raise RuntimeError(str(exc.payload or exc)) from exc
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -107,7 +149,10 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                 return JSONResponse({"detail": str(exc)}, status_code=401)
             except RuntimeError as exc:  # pragma: no cover
                 return JSONResponse({"detail": str(exc)}, status_code=500)
-        card = await client.get_agent_card(agent_name=config.agent_name)
+        control_plane_card = await _resolve_public_card(request)
+        if control_plane_card is not None:
+            return JSONResponse(control_plane_card)
+        card = await client.get_agent_card(agent_name=await _resolve_runtime_agent_name(request))
         return JSONResponse(card)
 
     # Backward compatibility with older A2A implementations
@@ -121,7 +166,10 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                 return JSONResponse({"detail": str(exc)}, status_code=401)
             except RuntimeError as exc:  # pragma: no cover
                 return JSONResponse({"detail": str(exc)}, status_code=500)
-        card = await client.get_agent_card(agent_name=config.agent_name)
+        control_plane_card = await _resolve_public_card(request)
+        if control_plane_card is not None:
+            return JSONResponse(control_plane_card)
+        card = await client.get_agent_card(agent_name=await _resolve_runtime_agent_name(request))
         return JSONResponse(card)
 
     @app.post("/")
@@ -164,16 +212,18 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                 try:
                     if method == METHOD_MESSAGE_STREAM:
                         p = MessageSendParams.model_validate(params)
+                        runtime_agent_name = await _resolve_runtime_agent_name(request)
                         events = await client.stream_message(
-                            agent_name=config.agent_name,
+                            agent_name=runtime_agent_name,
                             message=p.message,
                             configuration=p.configuration,
                             metadata=_metadata(p.metadata),
                         )
                     elif method == METHOD_TASKS_CONTINUE_STREAM:
                         p = TaskContinueParams.model_validate(params)
+                        runtime_agent_name = await _resolve_runtime_agent_name(request)
                         events = await client.continue_task_stream(
-                            agent_name=config.agent_name,
+                            agent_name=runtime_agent_name,
                             task_id=p.id,
                             message=p.message,
                             configuration=p.configuration,
@@ -181,8 +231,9 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
                         )
                     else:
                         p = TaskIdParams.model_validate(params)
+                        runtime_agent_name = await _resolve_runtime_agent_name(request)
                         events = await client.subscribe_task(
-                            agent_name=config.agent_name,
+                            agent_name=runtime_agent_name,
                             task_id=p.id,
                             resubscribe=True,
                             metadata=_metadata(p.metadata),
@@ -214,8 +265,9 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
         try:
             if method == METHOD_MESSAGE_SEND:
                 p = MessageSendParams.model_validate(params)
+                runtime_agent_name = await _resolve_runtime_agent_name(request)
                 task = await client.send_message(
-                    agent_name=config.agent_name,
+                    agent_name=runtime_agent_name,
                     message=p.message,
                     configuration=p.configuration,
                     metadata=_metadata(p.metadata),
@@ -226,8 +278,9 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
 
             if method == METHOD_TASKS_GET:
                 p = TaskQueryParams.model_validate(params)
+                runtime_agent_name = await _resolve_runtime_agent_name(request)
                 task = await client.get_task(
-                    agent_name=config.agent_name,
+                    agent_name=runtime_agent_name,
                     task_id=p.id,
                     metadata=_metadata(p.metadata),
                 )
@@ -237,8 +290,9 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
 
             if method == METHOD_TASKS_CANCEL:
                 p = TaskIdParams.model_validate(params)
+                runtime_agent_name = await _resolve_runtime_agent_name(request)
                 task = await client.cancel_task(
-                    agent_name=config.agent_name,
+                    agent_name=runtime_agent_name,
                     task_id=p.id,
                     metadata=_metadata(p.metadata),
                 )
@@ -248,8 +302,9 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
 
             if method == METHOD_TASKS_CONTINUE:
                 p = TaskContinueParams.model_validate(params)
+                runtime_agent_name = await _resolve_runtime_agent_name(request)
                 task = await client.continue_task(
-                    agent_name=config.agent_name,
+                    agent_name=runtime_agent_name,
                     task_id=p.id,
                     message=p.message,
                     configuration=p.configuration,

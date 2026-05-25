@@ -29,6 +29,78 @@ class TavilySearchResult:
     published_date: str | None = None
 
 
+async def tavily_search_raw(
+    *,
+    api_key: str,
+    query: str,
+    max_results: int = 5,
+    search_depth: str = "basic",
+    include_answer: bool = False,
+    include_raw_content: bool = False,
+    include_images: bool = False,
+    include_image_descriptions: bool = False,
+    include_favicon: bool = False,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
+    topic: str | None = None,
+    country: str | None = None,
+    timeout_s: float = 30.0,
+    retry: RetryConfig | None = None,
+) -> dict[str, Any]:
+    query = (query or "").strip()
+    if not query:
+        return {}
+
+    payload: dict[str, Any] = {
+        "api_key": api_key,
+        "query": query,
+        "max_results": max(1, min(int(max_results), 10)),
+        "search_depth": (search_depth or "basic").strip(),
+        "include_answer": bool(include_answer),
+        "include_raw_content": bool(include_raw_content),
+        "include_images": bool(include_images),
+        "include_image_descriptions": bool(include_image_descriptions),
+        "include_favicon": bool(include_favicon),
+    }
+    if include_domains:
+        payload["include_domains"] = [item for item in include_domains if isinstance(item, str) and item.strip()]
+    if exclude_domains:
+        payload["exclude_domains"] = [item for item in exclude_domains if isinstance(item, str) and item.strip()]
+    if topic:
+        payload["topic"] = str(topic).strip()
+    if country:
+        payload["country"] = str(country).strip()
+
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = {"content-type": "application/json"}
+
+    def _post() -> dict[str, Any]:
+        req = Request(TAVILY_SEARCH_URL, data=body, headers=headers, method="POST")
+        try:
+            with urlopen(req, timeout=float(timeout_s)) as resp:  # noqa: S310
+                return json.loads(resp.read().decode("utf-8"))
+        except HTTPError as exc:
+            err_body = ""
+            try:
+                err_body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            raise TavilyHttpError(status=int(getattr(exc, "code", 0) or 0), body=err_body) from exc
+
+    cfg = retry or RetryConfig.from_env()
+    attempt = 0
+    while True:
+        try:
+            obj = await asyncio.to_thread(_post)
+            return obj if isinstance(obj, dict) else {}
+        except TavilyHttpError as exc:
+            retryable = exc.status in (408, 409, 425, 429, 500, 502, 503, 504)
+            if attempt >= max(0, cfg.max_retries) or not retryable:
+                raise RuntimeError(f"Tavily search failed ({exc.status}): {exc.body or str(exc)}") from exc
+            await asyncio.sleep(backoff_delay_s(attempt=attempt, cfg=cfg))
+            attempt += 1
+
+
 def _parse_results(obj: Any) -> list[TavilySearchResult]:
     if not isinstance(obj, dict):
         return []
@@ -85,40 +157,14 @@ async def tavily_search(
     if not query:
         return []
 
-    payload: dict[str, Any] = {
-        "api_key": api_key,
-        "query": query,
-        "max_results": max(1, min(int(max_results), 10)),
-        "search_depth": (search_depth or "basic").strip(),
-        "include_answer": bool(include_answer),
-        "include_raw_content": bool(include_raw_content),
-    }
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    headers = {"content-type": "application/json"}
-
-    def _post() -> dict[str, Any]:
-        req = Request(TAVILY_SEARCH_URL, data=body, headers=headers, method="POST")
-        try:
-            with urlopen(req, timeout=float(timeout_s)) as resp:  # noqa: S310
-                return json.loads(resp.read().decode("utf-8"))
-        except HTTPError as exc:
-            err_body = ""
-            try:
-                err_body = exc.read().decode("utf-8", errors="replace")
-            except Exception:
-                err_body = ""
-            raise TavilyHttpError(status=int(getattr(exc, "code", 0) or 0), body=err_body) from exc
-
-    cfg = retry or RetryConfig.from_env()
-    attempt = 0
-    while True:
-        try:
-            obj = await asyncio.to_thread(_post)
-            return _parse_results(obj)
-        except TavilyHttpError as exc:
-            retryable = exc.status in (408, 409, 425, 429, 500, 502, 503, 504)
-            if attempt >= max(0, cfg.max_retries) or not retryable:
-                raise RuntimeError(f"Tavily search failed ({exc.status}): {exc.body or str(exc)}") from exc
-            await asyncio.sleep(backoff_delay_s(attempt=attempt, cfg=cfg))
-            attempt += 1
-
+    obj = await tavily_search_raw(
+        api_key=api_key,
+        query=query,
+        max_results=max_results,
+        search_depth=search_depth,
+        include_answer=include_answer,
+        include_raw_content=include_raw_content,
+        timeout_s=timeout_s,
+        retry=retry,
+    )
+    return _parse_results(obj)

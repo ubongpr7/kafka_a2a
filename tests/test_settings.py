@@ -65,6 +65,14 @@ def test_resolve_llm_credentials_from_env_api_key_env_name() -> None:
     assert cred.api_key == "sk-test"
 
 
+def test_resolve_llm_credentials_from_env_chatgpt_uses_gpt_key() -> None:
+    env = {"KA2A_LLM_PROVIDER": "chatgpt", "GPT_KEY": "sk-chatgpt"}
+    cred = resolve_llm_credentials_from_env(env=env)
+    assert cred is not None
+    assert cred.provider == "chatgpt"
+    assert cred.api_key == "sk-chatgpt"
+
+
 def test_resolve_llm_credentials_from_env_requires_key_when_provider_set() -> None:
     with pytest.raises(ValueError):
         resolve_llm_credentials_from_env(env={"KA2A_LLM_PROVIDER": "openai"})
@@ -92,3 +100,23 @@ def test_settings_resolve_llm_credentials_jwt_requires_decrypt() -> None:
     with pytest.raises(ValueError):
         settings.resolve_llm_credentials(metadata=metadata)
 
+
+def test_settings_resolve_llm_credentials_auto_falls_back_to_env_when_claim_decrypt_fails() -> None:
+    settings = Ka2aSettings(llm_credentials_source="auto")
+    principal = Principal(
+        user_id="u1",
+        claims={
+            KA2A_JWT_CLAIM_KEY: {"v": 1, "llm": {"provider": "chatgpt", "apiKey": {"ciphertext": "ENC", "alg": "fernet"}}},
+        },
+    )
+    metadata = with_principal({}, principal)
+
+    cred = settings.resolve_llm_credentials(
+        metadata=metadata,
+        decrypt=lambda _: (_ for _ in ()).throw(ValueError("decrypt failed")),
+        env={"KA2A_LLM_PROVIDER": "chatgpt", "GPT_KEY": "sk-fallback"},
+    )
+
+    assert cred is not None
+    assert cred.provider == "chatgpt"
+    assert cred.api_key == "sk-fallback"

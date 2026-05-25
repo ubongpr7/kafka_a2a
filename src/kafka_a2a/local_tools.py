@@ -4,14 +4,15 @@ import asyncio
 import importlib
 import inspect
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Protocol, Union, get_args, get_origin
 from uuid import uuid4
 
-from kafka_a2a.agent_filter import filter_agent_cards
+from kafka_a2a.agent_filter import card_public_slug, filter_agent_cards
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
+from kafka_a2a.control_plane import ControlPlaneClient
 from kafka_a2a.models import (
     AgentCard,
     DataPart,
@@ -128,7 +129,7 @@ def _parse_timeout_s_with_default(*values: str | None, default: float) -> float:
 
 def _card_summary(card: AgentCard) -> dict[str, Any]:
     return {
-        "name": card.name,
+        "name": card_public_slug(card),
         "description": card.description,
         "skills": [
             {
@@ -170,6 +171,8 @@ def _card_matches_requested_agent(card: AgentCard, requested: str | None) -> boo
 
     if _normalize_agent_lookup(card.name) == normalized:
         return True
+    if _normalize_agent_lookup(card_public_slug(card)) == normalized:
+        return True
 
     for skill in card.skills or []:
         if _normalize_agent_lookup(skill.id) == normalized:
@@ -188,7 +191,8 @@ def _score_card(card: AgentCard, query: str) -> int:
     tokens = _query_tokens(q)
     score = 0
 
-    if card.name.lower() in q:
+    public_slug = card_public_slug(card).lower()
+    if card.name.lower() in q or public_slug in q:
         score += 10
     if card.description:
         desc = card.description.lower()
@@ -340,9 +344,29 @@ class _DelegationState:
 
 
 class KafkaDelegationBackend:
-    def __init__(self, *, agent_name: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        agent_name: str | None = None,
+        runtime_agent_name: str | None = None,
+        workspace_profile_id: str | int | None = None,
+        allowed_public_slugs: list[str] | set[str] | None = None,
+    ) -> None:
         self._bootstrap = os.getenv("KA2A_BOOTSTRAP_SERVERS", "localhost:9092")
         self._agent_name = (agent_name or os.getenv("KA2A_AGENT_NAME") or "host").strip() or "host"
+        self._runtime_agent_name = (
+            str(runtime_agent_name or os.getenv("KA2A_RUNTIME_AGENT_NAME") or self._agent_name).strip() or self._agent_name
+        )
+        self._workspace_profile_id = (
+            str(workspace_profile_id).strip()
+            if workspace_profile_id is not None
+            else (os.getenv("KA2A_WORKSPACE_PROFILE_ID") or "").strip() or None
+        )
+        self._allowed_public_slugs = {
+            str(item).strip()
+            for item in (allowed_public_slugs or [])
+            if str(item).strip()
+        }
         generic_delegator_client_id = (os.getenv("KA2A_DELEGATOR_CLIENT_ID") or "").strip() or None
         host_delegator_client_id = (os.getenv("KA2A_HOST_DELEGATOR_CLIENT_ID") or "").strip() or None
         self._delegator_client_id = (
@@ -351,15 +375,38 @@ class KafkaDelegationBackend:
             or f"{self._agent_name}-delegator"
         )
         self._reply_group_id = f"ka2a.client.{self._delegator_client_id}.{uuid4()}"
-        self._request_timeout_s = _parse_timeout_s_with_default(
+        timeout_values = (
             os.getenv("KA2A_DELEGATION_REQUEST_TIMEOUT_S"),
             os.getenv("KA2A_HOST_DELEGATION_REQUEST_TIMEOUT_S") if self._agent_name == "host" else None,
-            default=30.0,
         )
+        requested_timeout = _parse_optional_timeout_s(*timeout_values)
+        self._request_timeout_s = (
+            requested_timeout
+            if requested_timeout is not None
+            else _parse_timeout_s_with_default(
+                *timeout_values,
+                default=30.0,
+            )
+        )
+        if requested_timeout is None:
+            has_explicit_disable = False
+            for value in timeout_values:
+                raw = (value or "").strip()
+                if not raw:
+                    continue
+                try:
+                    if float(raw) <= 0:
+                        has_explicit_disable = True
+                        break
+                except Exception:
+                    continue
+            if has_explicit_disable:
+                self._request_timeout_s = None
         self._directory_ttl_s = float(os.getenv("KA2A_DIRECTORY_ENTRY_TTL_S") or "300")
         self._directory_offset_reset = (os.getenv("KA2A_DIRECTORY_AUTO_OFFSET_RESET") or "earliest").strip().lower()
         self._directory_warmup_timeout_s = float(os.getenv("KA2A_DIRECTORY_WARMUP_TIMEOUT_S") or "3.0")
         self._directory_warmup_settle_s = float(os.getenv("KA2A_DIRECTORY_WARMUP_SETTLE_S") or "0.5")
+        self._control_plane = ControlPlaneClient()
         self._state = _DelegationState()
 
     async def _ensure_started(self) -> None:
@@ -412,7 +459,9 @@ class KafkaDelegationBackend:
             cards_now = [
                 card
                 for card in self._state.directory.list()
-                if (card.name or "").strip() and card.name != self._agent_name
+                if (card.name or "").strip()
+                and card.name != self._runtime_agent_name
+                and card_public_slug(card) != self._agent_name
             ]
             cards_now.sort(key=lambda card: card.name)
             best = cards_now or best
@@ -423,14 +472,52 @@ class KafkaDelegationBackend:
                 settle_deadline = loop.time() + max(0.0, self._directory_warmup_settle_s)
 
             if names_now and settle_deadline is not None and loop.time() >= settle_deadline:
-                return cards_now
+                if cards_now:
+                    return cards_now
+                break
             if loop.time() >= deadline:
-                return best
+                break
 
             await asyncio.sleep(0.05)
 
+        if best:
+            return best
+        return await self._list_control_plane_cards()
+
+    async def _list_control_plane_cards(self) -> list[AgentCard]:
+        if not self._control_plane.enabled:
+            return []
+        payload = await asyncio.to_thread(self._control_plane.list_internal_runtime_registry)
+        agents = payload.get("agents")
+        if not isinstance(agents, list):
+            return []
+        cards: list[AgentCard] = []
+        for item in agents:
+            if not isinstance(item, dict):
+                continue
+            runtime_card_payload = item.get("runtime_card_payload")
+            if not isinstance(runtime_card_payload, dict):
+                continue
+            try:
+                card = AgentCard.model_validate(runtime_card_payload)
+            except Exception:
+                continue
+            if not (card.name or "").strip():
+                continue
+            if card.name == self._runtime_agent_name:
+                continue
+            if card_public_slug(card) == self._agent_name:
+                continue
+            cards.append(card)
+        cards.sort(key=lambda card: card.name)
+        return cards
+
     def _visible_downstream_cards(self, cards: list[AgentCard]) -> list[AgentCard]:
-        visible_cards = filter_agent_cards(cards)
+        visible_cards = filter_agent_cards(
+            cards,
+            required_profile_id=self._workspace_profile_id,
+            allowed_public_slugs=self._allowed_public_slugs or None,
+        )
         visible_cards.sort(key=lambda card: card.name)
         return visible_cards
 
@@ -555,11 +642,61 @@ class KafkaDelegationBackend:
             }
 
         try:
+            if self._request_timeout_s is None or self._request_timeout_s <= 0:
+                return await _run_delegation()
             return await asyncio.wait_for(_run_delegation(), timeout=self._request_timeout_s)
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"Timed out waiting for delegated response from '{selected.name}' after {self._request_timeout_s:.1f}s."
             ) from exc
+
+
+class HybridDelegationBackend(KafkaDelegationBackend):
+    def __init__(
+        self,
+        *,
+        delegate_local: Callable[[AgentCard, str, str | None, ToolContext], Awaitable[dict[str, Any]]],
+        is_local_agent: Callable[[str], bool | Awaitable[bool]],
+        agent_name: str | None = None,
+        runtime_agent_name: str | None = None,
+        workspace_profile_id: str | int | None = None,
+        allowed_public_slugs: list[str] | set[str] | None = None,
+    ) -> None:
+        super().__init__(
+            agent_name=agent_name,
+            runtime_agent_name=runtime_agent_name,
+            workspace_profile_id=workspace_profile_id,
+            allowed_public_slugs=allowed_public_slugs,
+        )
+        self._delegate_local = delegate_local
+        self._is_local_agent = is_local_agent
+
+    async def _agent_is_local(self, agent_name: str) -> bool:
+        result = self._is_local_agent(agent_name)
+        if inspect.isawaitable(result):
+            return bool(await result)
+        return bool(result)
+
+    async def delegate(
+        self,
+        *,
+        request: str,
+        agent_name: str | None,
+        delegated_task_id: str | None = None,
+        ctx: ToolContext,
+    ) -> dict[str, Any]:
+        registered_cards = await self._list_registered_cards()
+        visible_cards = self._visible_downstream_cards(registered_cards)
+        selected = self._select_agent(cards=visible_cards, request=request, agent_name=agent_name)
+        preferred_transport = str(selected.preferred_transport or "").strip().lower() or "kafka"
+        if preferred_transport in {"local", "direct", "inprocess", "in-process"} and await self._agent_is_local(selected.name):
+            return await self._delegate_local(selected, request, delegated_task_id, ctx)
+        return await super().delegate(
+            request=request,
+            agent_name=selected.name,
+            delegated_task_id=delegated_task_id,
+            ctx=ctx,
+        )
 
 
 DELEGATION_TOOL_SPECS: dict[str, ToolSpec] = {

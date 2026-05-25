@@ -1,0 +1,29 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "marketplace_sourcing",
+  "description": "Marketplace sourcing specialist for web product search, cross-marketplace price comparison, and shortlist generation across ecommerce platforms.",
+  "url": "kafka://marketplace_sourcing",
+  "preferredTransport": "kafka",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
+  "skills": [
+    {
+      "id": "marketplace_product_search",
+      "name": "Marketplace Product Search",
+      "description": "Search online marketplaces like Amazon, eBay, Alibaba, AliExpress, Temu, and DHgate and return normalized product cards.",
+      "tags": ["product", "marketplace", "supplier", "sourcing", "price-comparison", "amazon", "ebay", "alibaba"],
+      "examples": [
+        "Find wireless barcode scanners across Amazon and eBay.",
+        "Search Alibaba and AliExpress for acrylic display stand suppliers.",
+        "Compare cheap thermal label printers across Temu, DHgate, and eBay."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

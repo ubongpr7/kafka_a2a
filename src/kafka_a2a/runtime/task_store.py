@@ -56,7 +56,15 @@ class TaskStore(Protocol):
 
     async def append_artifact(self, *, task_id: str, artifact: Artifact) -> TaskArtifactUpdateEvent: ...
 
-    async def iter_events(self, task_id: str, *, replay_history: bool = True) -> AsyncIterator[TaskEventRecord]: ...
+    async def latest_sequence(self, task_id: str) -> int: ...
+
+    async def iter_events(
+        self,
+        task_id: str,
+        *,
+        replay_history: bool = True,
+        after_sequence: int | None = None,
+    ) -> AsyncIterator[TaskEventRecord]: ...
 
     async def aclose(self) -> None: ...
 
@@ -217,14 +225,29 @@ class InMemoryTaskStore:
             except ValueError:
                 return
 
-    async def iter_events(self, task_id: str, *, replay_history: bool = True) -> AsyncIterator[TaskEventRecord]:
+    async def latest_sequence(self, task_id: str) -> int:
+        async with self._lock:
+            records = self._events.get(task_id, [])
+            return records[-1].sequence if records else 0
+
+    async def iter_events(
+        self,
+        task_id: str,
+        *,
+        replay_history: bool = True,
+        after_sequence: int | None = None,
+    ) -> AsyncIterator[TaskEventRecord]:
         queue, history = await self.subscribe(task_id)
         try:
             if replay_history:
                 for record in history:
+                    if after_sequence is not None and record.sequence <= after_sequence:
+                        continue
                     yield record
             while True:
                 record = await queue.get()
+                if after_sequence is not None and record.sequence <= after_sequence:
+                    continue
                 yield record
         finally:
             await self.unsubscribe(task_id, queue)

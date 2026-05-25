@@ -62,7 +62,7 @@ services:
     environment:
       KA2A_SYSTEM_PROMPT_PATH: /app/prompts/product_agent.txt
       KA2A_TOOL_EXECUTOR: kafka_a2a.local_tools:build_interaction_tool_executor
-      KA2A_ALLOWED_DOWNSTREAM_AGENTS: product_discovery,product_catalog_admin,product_merchandising,product_pricing
+      KA2A_ALLOWED_DOWNSTREAM_AGENTS: product_discovery,marketplace_sourcing,product_catalog_admin,product_merchandising,product_pricing
     command:
       [
         "agent",
@@ -86,6 +86,25 @@ services:
         "agent",
         "--agent-card-path",
         "/app/agent_cards/product_discovery.agent-card.json",
+        "--processor",
+        "langgraph-chat"
+      ]
+    restart: unless-stopped
+
+  marketplace-sourcing-agent:
+    <<: *ka2a_image
+    volumes:
+      - ./agent_cards:/app/agent_cards:ro
+      - ./prompts:/app/prompts:ro
+      - ./mcp-tools.prod.json:/app/mcp-tools.prod.json:ro
+    environment:
+      KA2A_SYSTEM_PROMPT_PATH: /app/prompts/marketplace_sourcing_agent.txt
+      KA2A_TOOL_EXECUTOR: kafka_a2a.marketplace_tools:build_marketplace_sourcing_tool_executor
+    command:
+      [
+        "agent",
+        "--agent-card-path",
+        "/app/agent_cards/marketplace_sourcing.agent-card.json",
         "--processor",
         "langgraph-chat"
       ]
@@ -319,6 +338,7 @@ services:
       - users-agent
       - product-agent
       - product-discovery-agent
+      - marketplace-sourcing-agent
       - product-catalog-admin-agent
       - product-merchandising-agent
       - product-pricing-agent
@@ -343,6 +363,7 @@ services:
       - users-agent
       - product-agent
       - product-discovery-agent
+      - marketplace-sourcing-agent
       - product-catalog-admin-agent
       - product-merchandising-agent
       - product-pricing-agent

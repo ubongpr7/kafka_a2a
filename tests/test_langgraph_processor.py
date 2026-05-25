@@ -5,11 +5,14 @@ import pytest
 from tests import fake_langgraph_components
 from kafka_a2a.langgraph_processor import (
     _build_inventory_operation,
+    _build_stock_location_operation,
     _build_product_operation,
     _classify_failed_operation,
+    _created_result_ref,
     _interaction_payload_from_text,
     _is_host_capability_picker_query,
     _is_host_introspection_query,
+    _is_simple_greeting_query,
     _onboarding_operation_summary,
     _normalize_tool_call_payload,
     _render_tool_prompt_block,
@@ -53,6 +56,13 @@ def test_render_tool_prompt_block_discourages_tool_calls_for_plain_conversation(
     assert 'Never output bare tool names or pseudo-tool JSON such as {"kind":"list_available_agents"}' in prompt
 
 
+def test_is_simple_greeting_query_matches_plain_greetings() -> None:
+    assert _is_simple_greeting_query("hi")
+    assert _is_simple_greeting_query("hello there")
+    assert _is_simple_greeting_query("good evening")
+    assert not _is_simple_greeting_query("hi, create my inventory")
+
+
 def test_render_tool_prompt_block_includes_relation_lookup_rules() -> None:
     prompt = _render_tool_prompt_block(
         [
@@ -89,6 +99,8 @@ def test_render_tool_prompt_block_includes_relation_lookup_rules() -> None:
     assert "prefer list/get-all tools over search tools whenever both are available." in prompt
     assert "Do not tell the user the backend requires those parameters." in prompt
     assert "omit optional filters/null values" in prompt
+    assert "Do not mutate records until the required fields are known" in prompt
+    assert "gather-and-confirm flow" in prompt
     assert "`inventory.create_inventory_item.payload.category_id`" in prompt
     assert "`inventory.list_inventory_categories`" in prompt
 
@@ -212,6 +224,54 @@ def test_build_inventory_operation_prefers_relation_ids_in_nested_payload_schema
             "description": "Primary sellable stock ledger",
             "stock_location_id": "loc-1",
             "category_id": "cat-1",
+        }
+    }
+    assert operation["missing_required"] == []
+
+
+def test_build_stock_location_operation_supports_nested_payload_schema_and_parent_ref() -> None:
+    operation = _build_stock_location_operation(
+        tool_specs=[
+            ToolSpec(
+                name="inventory.create_stock_location",
+                description="Create stock location.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "location_type_name": {"type": "string"},
+                                "structural": {"type": "boolean"},
+                                "parent_id": {"type": "string"},
+                            },
+                            "required": ["name"],
+                        }
+                    },
+                    "required": ["payload"],
+                },
+            )
+        ],
+        company_context=None,
+        location_name="Returns Shelf",
+        location_type="shelf",
+        primary=False,
+        structural=False,
+        parent_location_ref=_created_result_ref("inventory.create_stock_location:main-warehouse", "location", "id"),
+    )
+
+    assert operation["arguments"] == {
+        "payload": {
+            "name": "Returns Shelf",
+            "location_type_name": "shelf",
+            "structural": False,
+            "parent_id": {
+                "__ka2a_created_ref__": {
+                    "semantic_key": "inventory.create_stock_location:main-warehouse",
+                    "path": ["location", "id"],
+                }
+            },
         }
     }
     assert operation["missing_required"] == []
@@ -354,11 +414,13 @@ Certainly! Please choose one:
 
 
 def test_host_introspection_detection_preserves_domain_requests() -> None:
-    assert _is_host_introspection_query("how can you help")
     assert _is_host_introspection_query("how many agents do you have?")
-    assert _is_host_introspection_query("hi there!")
-    assert _is_host_introspection_query("what can u do for me")
     assert _is_host_introspection_query("tell me the agents that you have currently that are register")
+    assert _is_host_introspection_query("list the specialist agents you can route to")
+    assert _is_host_introspection_query("is inventory fulfillment available to you?")
+    assert not _is_host_introspection_query("hi there!")
+    assert not _is_host_introspection_query("what can u do for me")
+    assert not _is_host_introspection_query("who are you")
     assert not _is_host_introspection_query("help me search for the product t-shirt")
 
 
@@ -1077,6 +1139,9 @@ async def test_onboarding_agent_scope_selection_opens_wizard() -> None:
 
     assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
         "create_wizard_flow",
+        "inventory.list_stock_locations",
+        "inventory.list_inventory_categories",
+        "product.get_product_categories",
         "users.get_active_company_profile",
     ]
     assert fake_langgraph_components.FAKE_TOOL_CALLS[0][1]["title"] == "Full Inventory Setup Wizard"
@@ -1133,7 +1198,7 @@ async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects
 
     assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
         "create_wizard_flow",
-        "inventory.search_stock_locations",
+        "inventory.list_stock_locations",
         "inventory.list_inventory_categories",
         "users.get_active_company_profile",
     ]
@@ -1152,6 +1217,96 @@ async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects
     assert fields["inventory_category_id"]["type"] == "select"
     assert fields["inventory_category_id"]["options"][0]["label"] == "Men's Clothes"
     assert fields["inventory_category_id"]["options"][0]["value"] == "cat-1"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_onboarding_agent_descriptive_request_opens_prefilled_wizard() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
+    task = Task(
+        id="task-onboarding-direct-prefill",
+        context_id="ctx-onboarding-direct-prefill",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[
+                    TextPart(
+                        text=(
+                            "I want to onboard a new inventory.\n"
+                            "Primary location: Main Warehouse\n"
+                            "Additional locations: Front Store, Returns Shelf\n"
+                            "Inventory categories: Men's Clothes, Shoes\n"
+                            "Inventory name: Fashion Master Inventory\n"
+                            "Inventory description: Primary stock ledger for apparel.\n"
+                            "Initial products: Oxford Shirt, Canvas Sneakers\n"
+                            "Product category: Footwear"
+                        )
+                    )
+                ],
+            ),
+        ),
+        history=[],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[
+            TextPart(
+                text=(
+                    "I want to onboard a new inventory.\n"
+                    "Primary location: Main Warehouse\n"
+                    "Additional locations: Front Store, Returns Shelf\n"
+                    "Inventory categories: Men's Clothes, Shoes\n"
+                    "Inventory name: Fashion Master Inventory\n"
+                    "Inventory description: Primary stock ledger for apparel.\n"
+                    "Initial products: Oxford Shirt, Canvas Sneakers\n"
+                    "Product category: Footwear"
+                )
+            )
+        ],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "users.get_active_company_profile",
+        "create_wizard_flow",
+        "inventory.list_stock_locations",
+        "inventory.list_inventory_categories",
+        "product.get_product_categories",
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["interaction_type"] == "wizard_flow"
+    assert payload["workflow_stage"] == "wizard"
+    assert payload["onboarding_scope"] == "full_setup"
+    assert payload["description"].startswith("I prefilled this setup from your message.")
+
+    existing_responses = payload["existing_responses"]
+    assert existing_responses["step_0"] == {
+        "primary_location_mode": "new",
+        "primary_location_name": "Main Warehouse",
+        "primary_location_type": "warehouse",
+        "additional_locations": "Front Store\nReturns Shelf",
+    }
+    assert existing_responses["step_1"] == {
+        "category_names": "Men's Clothes\nShoes",
+    }
+    assert existing_responses["step_2"] == {
+        "default_inventory_name": "Fashion Master Inventory",
+        "inventory_description": "Primary stock ledger for apparel.",
+        "related_stock_location_id": "loc-1",
+        "inventory_category_id": "cat-1",
+    }
+    assert existing_responses["step_3"] == {
+        "continue_to_product_onboarding": True,
+        "initial_product_names": "Oxford Shirt\nCanvas Sneakers",
+        "product_category_id": "prod-cat-2",
+    }
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.input_required
@@ -1275,6 +1430,59 @@ async def test_onboarding_agent_inventory_setup_scope_populates_category_options
     assert fields["inventory_category_id"]["type"] == "select"
     assert fields["inventory_category_id"]["options"][0]["label"] == "Men's Clothes"
     assert fields["inventory_category_id"]["options"][0]["value"] == "cat-1"
+
+
+@pytest.mark.asyncio
+async def test_relation_uuid_tool_error_returns_select_options_instead_of_asking_for_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_LLM_FACTORY", "tests.fake_langgraph_components:fake_uuid_failure_llm_factory")
+    monkeypatch.setenv("KA2A_TOOL_EXECUTOR", "tests.fake_langgraph_components:build_fake_tool_executor_with_uuid_failure")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    form_payload = {
+        "interaction_type": "dynamic_form",
+        "title": "Create Inventory Item",
+        "description": "Confirm the inventory details before I create anything.",
+        "fields": [],
+        "workflow": "inventory_setup_mutation",
+        "workflow_stage": "form",
+        "mutation_action": "create_inventory_item",
+    }
+    form_response = (
+        '{"type":"form_response","data":{"default_inventory_name":"Fashion Master Inventory",'
+        '"inventory_description":"Primary stock ledger for apparel.","inventory_category_id":"not-a-uuid"},'
+        '"message":"Form submitted successfully"}'
+    )
+    task = Task(
+        id="task-inventory-uuid-recovery",
+        context_id="ctx-inventory-uuid-recovery",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=form_response)]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="create the first inventory item")]),
+            Message(role=Role.agent, parts=[DataPart(data=form_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=form_response)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    fields = {field["name"]: field for field in payload["fields"]}
+
+    assert payload["interaction_type"] == "dynamic_form"
+    assert "raw IDs" not in payload["description"].lower()
+    assert "category_id" in fields
+    assert fields["category_id"]["type"] == "select"
+    assert fields["category_id"]["options"][0]["label"] == "Men's Clothes"
+    assert fields["category_id"]["options"][0]["value"] == "cat-1"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
 
 
 @pytest.mark.asyncio
@@ -1438,6 +1646,7 @@ async def test_onboarding_agent_review_confirmation_creates_inventory_setup_dire
             "flat": {
                 "primary_location_name": "Main Warehouse",
                 "primary_location_type": "warehouse",
+                "additional_locations": "Front Store\nReturns Shelf",
                 "category_names": "Beverages\nSnacks\nCleaning Supplies",
                 "default_inventory_name": "Main Inventory",
                 "continue_to_product_onboarding": True,
@@ -1471,21 +1680,36 @@ async def test_onboarding_agent_review_confirmation_creates_inventory_setup_dire
     assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
         "users.get_active_company_profile",
         "inventory.create_stock_location",
+        "inventory.create_stock_location",
+        "inventory.create_stock_location",
         "inventory.create_inventory_category",
         "inventory.create_inventory_category",
         "inventory.create_inventory_category",
         "inventory.create_inventory_item",
     ]
+    first_location_args = fake_langgraph_components.FAKE_TOOL_CALLS[1][1]["payload"]
+    second_location_args = fake_langgraph_components.FAKE_TOOL_CALLS[2][1]["payload"]
+    first_category_args = fake_langgraph_components.FAKE_TOOL_CALLS[4][1]["payload"]
+    inventory_args = fake_langgraph_components.FAKE_TOOL_CALLS[7][1]["payload"]
+
+    assert first_location_args == {
+        "name": "Main Warehouse",
+        "location_type_name": "warehouse",
+        "structural": True,
+    }
+    assert second_location_args["parent_id"] == "stock-location-main-warehouse"
+    assert first_category_args["default_location_id"] == "stock-location-main-warehouse"
+    assert inventory_args["inventory_category_id"] == "inventory-category-beverages"
     assert not any(isinstance(event, Artifact) and event.name == "delegation" for event in events)
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == (
-        "Created 1 stock location, 3 inventory categories, and 1 inventory item for onboarding."
+        "Created 3 stock locations, 3 inventory categories, and 1 inventory item for onboarding."
     )
     created_artifact = next(
         event for event in events if isinstance(event, Artifact) and event.name == "onboarding.created_operations"
     )
-    assert len(created_artifact.parts[0].data["operations"]) == 5
+    assert len(created_artifact.parts[0].data["operations"]) == 7
 
 
 @pytest.mark.asyncio
@@ -1614,15 +1838,14 @@ async def test_onboarding_agent_partial_failures_prompt_for_retry(
         "inventory.create_inventory_category",
         "inventory.create_inventory_category",
         "inventory.create_inventory_category",
-        "inventory.create_inventory_item",
         "create_multiple_choice",
     ]
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
     assert result_artifact.parts[0].data["workflow_stage"] == "retry"
-    assert len(result_artifact.parts[0].data["created_operations"]) == 2
-    assert len(result_artifact.parts[0].data["failed_operations"]) == 3
+    assert len(result_artifact.parts[0].data["created_operations"]) == 1
+    assert len(result_artifact.parts[0].data["failed_operations"]) == 4
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.input_required
@@ -1846,6 +2069,114 @@ async def test_host_propagates_input_required_from_specialist() -> None:
 
 
 @pytest.mark.asyncio
+async def test_host_multi_domain_request_prompts_to_continue_with_next_specialist() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    request = "Set up inventory locations and then create products"
+    task = Task(
+        id="task-host-multidomain",
+        context_id="ctx-host-multidomain",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        ("delegate_to_agent", {"request": request, "agent_name": "inventory"}),
+        (
+            "create_multiple_choice",
+            {
+                "title": "Continue Workflow",
+                "description": (
+                    "Inventory Management finished the current step.\n\n"
+                    "Latest result: Inventory locations created successfully.\n\n"
+                    "Continue with Product Management now?"
+                ),
+                "options": [
+                    {"value": "continue_next", "label": "Continue to Product Management"},
+                    {"value": "stop_here", "label": "Stop Here"},
+                ],
+                "multiple": False,
+                "allow_input": False,
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["workflow"] == "host_orchestration"
+    assert payload["workflow_stage"] == "continue_prompt"
+    assert payload["next_agent"] == "product"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_host_multi_domain_continue_response_delegates_next_specialist() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    seed_request = "Set up inventory locations and then create products"
+    seed_task = Task(
+        id="task-host-multidomain-seed",
+        context_id="ctx-host-multidomain-continue",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=seed_request)]),
+        ),
+    )
+    seed_message = Message(role=Role.user, parts=[TextPart(text=seed_request)])
+    seed_events = [event async for event in processor(seed_task, seed_message, None, None)]
+    prompt_payload = next(
+        event for event in seed_events if isinstance(event, Artifact) and event.name == "result"
+    ).parts[0].data
+    fake_langgraph_components.reset_fake_components()
+
+    form_response = '{"type":"multiple_choice_response","selected":"continue_next","additional_input":null}'
+    task = Task(
+        id="task-host-multidomain-continue",
+        context_id="ctx-host-multidomain-continue",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=form_response)]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text=seed_request)]),
+            Message(role=Role.agent, parts=[DataPart(data=prompt_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=form_response)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "Continue the user's multi-domain workflow.\n"
+                    "Original user request: Set up inventory locations and then create products\n"
+                    "Completed steps so far: Inventory Management.\n"
+                    "Latest completed step result: Inventory locations created successfully.\n"
+                    "Focus now on the Product Management part of the workflow.\n"
+                    "Use structured interactions if more information is still required."
+                ),
+                "agent_name": "product",
+            },
+        ),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "product"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == "Initial products created successfully."
+
+
+@pytest.mark.asyncio
 async def test_inventory_router_auto_delegates_to_inventory_setup_subspecialist() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="inventory")
     task = Task(
@@ -1895,26 +2226,622 @@ async def test_inventory_setup_rewrites_relation_text_fields_to_select_options(
 
     events = [event async for event in processor(task, message, None, None)]
 
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
     assert fake_langgraph_components.FAKE_TOOL_CALLS == [
         ("inventory.list_inventory_categories", {"query": "", "limit": 25}),
-        ("inventory.search_stock_locations", {"query": "", "limit": 25}),
+        (
+            "create_dynamic_form",
+            {
+                "title": "Create Inventory Item",
+                "description": "I translated your request into an inventory setup form. Confirm or edit the details before I create anything. Category is optional and will be left blank unless you choose one.",
+                "fields": [
+                    {
+                        "name": "default_inventory_name",
+                        "type": "text",
+                        "label": "Inventory Name",
+                        "required": True,
+                        "placeholder": "Main Inventory",
+                    },
+                    {
+                        "name": "inventory_description",
+                        "type": "textarea",
+                        "label": "Inventory Description",
+                        "required": False,
+                        "placeholder": "Primary stock ledger for the business.",
+                    },
+                    {
+                        "name": "inventory_category_id",
+                        "type": "select",
+                        "label": "Inventory Category",
+                        "required": False,
+                        "options": [
+                            {"value": "cat-1", "label": "Men's Clothes", "description": "Menswear"},
+                            {"value": "cat-2", "label": "Shoes", "description": "Footwear"},
+                        ],
+                        "placeholder": "Select a category if this inventory should belong to one",
+                    },
+                ],
+            },
+        ),
     ]
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     payload = result_artifact.parts[0].data
     assert payload["interaction_type"] == "dynamic_form"
+    assert payload["mutation_action"] == "create_inventory_item"
     assert "IDs" not in payload["description"]
 
     fields = {field["name"]: field for field in payload["fields"]}
-    assert fields["inventory_category"]["type"] == "select"
-    assert fields["inventory_category"]["options"][0]["label"] == "Men's Clothes"
-    assert fields["inventory_category"]["options"][0]["value"] == "cat-1"
-    assert fields["stock_location"]["type"] == "select"
-    assert fields["stock_location"]["options"][0]["label"] == "Main Warehouse"
-    assert fields["stock_location"]["options"][0]["value"] == "loc-1"
+    assert fields["inventory_category_id"]["type"] == "select"
+    assert fields["inventory_category_id"]["options"][0]["label"] == "Men's Clothes"
+    assert fields["inventory_category_id"]["options"][0]["value"] == "cat-1"
 
+
+@pytest.mark.asyncio
+async def test_inventory_setup_descriptive_create_request_opens_prefilled_dynamic_form() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    task = Task(
+        id="task-inventory-setup-create-form",
+        context_id="ctx-inventory-setup-create-form",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[
+                    TextPart(
+                        text=(
+                            "Create a new inventory.\n"
+                            "Inventory name: Fashion Master Inventory\n"
+                            "Description: Primary stock ledger for apparel.\n"
+                            "Inventory category: Men's Clothes"
+                        )
+                    )
+                ],
+            ),
+        ),
+    )
+    message = Message(
+        role=Role.user,
+        parts=[
+            TextPart(
+                text=(
+                    "Create a new inventory.\n"
+                    "Inventory name: Fashion Master Inventory\n"
+                    "Description: Primary stock ledger for apparel.\n"
+                    "Inventory category: Men's Clothes"
+                )
+            )
+        ],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "inventory.list_inventory_categories",
+        "create_dynamic_form",
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["interaction_type"] == "dynamic_form"
+    assert payload["workflow"] == "inventory_setup_mutation"
+    assert payload["workflow_stage"] == "form"
+    assert payload["mutation_action"] == "create_inventory_item"
+    assert payload["current_values"] == {
+        "default_inventory_name": "Fashion Master Inventory",
+        "inventory_description": "Primary stock ledger for apparel.",
+        "inventory_category_id": "cat-1",
+    }
+
+    fields = {field["name"]: field for field in payload["fields"]}
+    assert fields["inventory_category_id"]["type"] == "select"
+    assert fields["inventory_category_id"]["options"][0]["label"] == "Men's Clothes"
+
+
+@pytest.mark.asyncio
+async def test_inventory_setup_form_response_executes_inventory_create() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    form_payload = {
+        "interaction_type": "dynamic_form",
+        "title": "Create Inventory Item",
+        "description": "Confirm the inventory details before I create anything.",
+        "fields": [],
+        "workflow": "inventory_setup_mutation",
+        "workflow_stage": "form",
+        "mutation_action": "create_inventory_item",
+    }
+    form_response = (
+        '{"type":"form_response","data":{"default_inventory_name":"Fashion Master Inventory",'
+        '"inventory_description":"Primary stock ledger for apparel.","inventory_category_id":"cat-1"},'
+        '"message":"Form submitted successfully"}'
+    )
+    task = Task(
+        id="task-inventory-setup-form-submit",
+        context_id="ctx-inventory-setup-form-submit",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=form_response)]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="Create a new inventory")]),
+            Message(role=Role.agent, parts=[DataPart(data=form_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=form_response)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "inventory.create_inventory_item",
+            {
+                "payload": {
+                    "name": "Fashion Master Inventory",
+                    "description": "Primary stock ledger for apparel.",
+                    "category_id": "cat-1",
+                }
+            },
+        )
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].text == "Inventory item created successfully."
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.completed
+
+
+@pytest.mark.asyncio
+async def test_inventory_setup_parent_update_request_opens_prefilled_form() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    task = Task(
+        id="task-inventory-setup-parent-form",
+        context_id="ctx-inventory-setup-parent-form",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text="Set parent of Front Store to Main Warehouse")],
+            ),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="Set parent of Front Store to Main Warehouse")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "inventory.list_stock_locations",
+        "create_dynamic_form",
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["mutation_action"] == "update_stock_location_parent"
+    assert payload["current_values"] == {
+        "location_id": "loc-2",
+        "parent_id": "loc-1",
+    }
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_product_catalog_admin_descriptive_create_request_opens_prefilled_form() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="product_catalog_admin")
+    request = (
+        "Create a new product.\n"
+        "Product name: Men's Oxford Shirt\n"
+        "Description: Long-sleeve formal shirt.\n"
+        "Category: Apparel\n"
+        "Base price: 25000\n"
+        "Enable quick sale"
+    )
+    task = Task(
+        id="task-product-create-form",
+        context_id="ctx-product-create-form",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=request)])),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "product.get_product_categories",
+        "product.search_products",
+        "create_dynamic_form",
+    ]
+    payload = next(event for event in events if isinstance(event, Artifact) and event.name == "result").parts[0].data
+    assert payload["workflow"] == "product_catalog_admin_mutation"
+    assert payload["mutation_action"] == "create_product"
+    assert payload["current_values"] == {
+        "name": "Men's Oxford Shirt",
+        "description": "Long-sleeve formal shirt.",
+        "category_ref_id": "prod-cat-1",
+        "base_price": "25000",
+        "quick_sale": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_product_catalog_admin_form_response_executes_update_product() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="product_catalog_admin")
+    form_payload = {
+        "interaction_type": "dynamic_form",
+        "workflow": "product_catalog_admin_mutation",
+        "workflow_stage": "form",
+        "mutation_action": "update_product",
+    }
+    form_response = (
+        '{"type":"form_response","data":{"product_id":"prod-1","name":"Men\'s Oxford Shirt","category_ref_id":"prod-cat-1","base_price":"26000","quick_sale":true},'
+        '"message":"Form submitted successfully"}'
+    )
+    task = Task(
+        id="task-product-update-form-submit",
+        context_id="ctx-product-update-form-submit",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=form_response)])),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="Update the Men's Oxford Shirt product")]),
+            Message(role=Role.agent, parts=[DataPart(data=form_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=form_response)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "product.update_product",
+            {
+                "product_id": "prod-1",
+                "payload": {
+                    "name": "Men's Oxford Shirt",
+                    "category_ref_id": "prod-cat-1",
+                    "base_price": "26000",
+                    "quick_sale": True,
+                },
+            },
+        )
+    ]
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].text == "Product updated successfully."
+
+
+@pytest.mark.asyncio
+async def test_inventory_fulfillment_transfer_request_opens_prefilled_form() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_fulfillment")
+    request = "Transfer Men's Oxford Shirt Inventory from Main Warehouse to Front Store quantity 12"
+    task = Task(
+        id="task-fulfillment-transfer-form",
+        context_id="ctx-fulfillment-transfer-form",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=request)])),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "inventory.list_stock_locations",
+        "inventory.list_inventory_items",
+        "create_dynamic_form",
+    ]
+    payload = next(event for event in events if isinstance(event, Artifact) and event.name == "result").parts[0].data
+    assert payload["workflow"] == "inventory_fulfillment_mutation"
+    assert payload["mutation_action"] == "transfer_location_stock"
+    assert payload["current_values"] == {
+        "inventory_item_id": "inv-1",
+        "from_location_id": "loc-1",
+        "to_location_id": "loc-2",
+        "quantity": "12",
+    }
+
+
+@pytest.mark.asyncio
+async def test_inventory_fulfillment_form_response_executes_adjustment() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_fulfillment")
+    form_payload = {
+        "interaction_type": "dynamic_form",
+        "workflow": "inventory_fulfillment_mutation",
+        "workflow_stage": "form",
+        "mutation_action": "adjust_inventory_item_stock",
+    }
+    form_response = (
+        '{"type":"form_response","data":{"inventory_item_id":"inv-1","stock_location_id":"loc-1","quantity":"5","adjustment_type":"add","reason":"Cycle count","notes":"Top-up after count"},'
+        '"message":"Form submitted successfully"}'
+    )
+    task = Task(
+        id="task-fulfillment-adjust-form-submit",
+        context_id="ctx-fulfillment-adjust-form-submit",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=form_response)])),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="Add 5 units to Men's Oxford Shirt Inventory at Main Warehouse")]),
+            Message(role=Role.agent, parts=[DataPart(data=form_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=form_response)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "inventory.adjust_inventory_item_stock",
+            {
+                "inventory_item_id": "inv-1",
+                "payload": {
+                    "adjustments": [
+                        {
+                            "inventory_item_id": "inv-1",
+                            "stock_location_id": "loc-1",
+                            "quantity": "5",
+                            "adjustment_type": "add",
+                            "notes": "Top-up after count",
+                        }
+                    ],
+                    "reason": "Cycle count",
+                    "notes": "Top-up after count",
+                },
+            },
+        )
+    ]
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].text == "Inventory adjustment completed successfully."
+
+
+@pytest.mark.asyncio
+async def test_inventory_procurement_request_opens_prefilled_form() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_procurement")
+    request = (
+        "Add Men's Oxford Shirt Inventory to purchase order PO-1001\n"
+        "Quantity: 20\n"
+        "Unit price: 15000"
+    )
+    task = Task(
+        id="task-procurement-line-item-form",
+        context_id="ctx-procurement-line-item-form",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=request)])),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "inventory.search_purchase_orders",
+        "inventory.list_inventory_items",
+        "create_dynamic_form",
+    ]
+    payload = next(event for event in events if isinstance(event, Artifact) and event.name == "result").parts[0].data
+    assert payload["workflow"] == "inventory_procurement_mutation"
+    assert payload["mutation_action"] == "add_purchase_order_line_item"
+    assert payload["current_values"] == {
+        "purchase_order_id": "po-1",
+        "inventory_item_id": "inv-1",
+        "quantity": "20",
+        "unit_price": "15000",
+    }
+
+
+@pytest.mark.asyncio
+async def test_inventory_procurement_form_response_executes_line_item_addition() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_procurement")
+    form_payload = {
+        "interaction_type": "dynamic_form",
+        "workflow": "inventory_procurement_mutation",
+        "workflow_stage": "form",
+        "mutation_action": "add_purchase_order_line_item",
+    }
+    form_response = (
+        '{"type":"form_response","data":{"purchase_order_id":"po-1","inventory_item_id":"inv-1","quantity":"20","unit_price":"15000","description":"Opening buy"},'
+        '"message":"Form submitted successfully"}'
+    )
+    task = Task(
+        id="task-procurement-line-item-submit",
+        context_id="ctx-procurement-line-item-submit",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=form_response)])),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="Add a line item to PO-1001")]),
+            Message(role=Role.agent, parts=[DataPart(data=form_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=form_response)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "inventory.add_purchase_order_line_item",
+            {
+                "purchase_order_id": "po-1",
+                "payload": {
+                    "inventory_item_id": "inv-1",
+                    "quantity": "20",
+                    "unit_price": "15000",
+                    "description": "Opening buy",
+                },
+            },
+        )
+    ]
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].text == "Purchase-order line item added successfully."
+
+
+@pytest.mark.asyncio
+async def test_product_merchandising_request_opens_prefilled_form() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="product_merchandising")
+    request = (
+        "Update merchandising for product Men's Oxford Shirt\n"
+        "Category: Apparel\n"
+        "Enable quick sale\n"
+        "Mark as featured\n"
+        "POS Category: Clothing"
+    )
+    task = Task(
+        id="task-product-merchandising-form",
+        context_id="ctx-product-merchandising-form",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=request)])),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "product.search_products",
+        "product.get_product_categories",
+        "create_dynamic_form",
+    ]
+    payload = next(event for event in events if isinstance(event, Artifact) and event.name == "result").parts[0].data
+    assert payload["workflow"] == "product_merchandising_mutation"
+    assert payload["mutation_action"] == "update_product_merchandising"
+    assert payload["current_values"] == {
+        "product_id": "prod-1",
+        "category_ref_id": "prod-cat-1",
+        "quick_sale": True,
+        "is_featured": True,
+        "pos_category": "Clothing",
+    }
+
+
+@pytest.mark.asyncio
+async def test_product_merchandising_form_response_executes_update() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="product_merchandising")
+    form_payload = {
+        "interaction_type": "dynamic_form",
+        "workflow": "product_merchandising_mutation",
+        "workflow_stage": "form",
+        "mutation_action": "update_product_merchandising",
+    }
+    form_response = (
+        '{"type":"form_response","data":{"product_id":"prod-1","category_ref_id":"prod-cat-1","quick_sale":true,"is_featured":true,"pos_category":"Clothing"},'
+        '"message":"Form submitted successfully"}'
+    )
+    task = Task(
+        id="task-product-merchandising-submit",
+        context_id="ctx-product-merchandising-submit",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=form_response)])),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="Update the product merchandising")]),
+            Message(role=Role.agent, parts=[DataPart(data=form_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=form_response)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "product.update_product",
+            {
+                "product_id": "prod-1",
+                "payload": {
+                    "category_ref_id": "prod-cat-1",
+                    "quick_sale": True,
+                    "is_featured": True,
+                    "pos_category": "Clothing",
+                },
+            },
+        )
+    ]
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].text == "Product merchandising updated successfully."
+
+
+@pytest.mark.asyncio
+async def test_product_pricing_strategy_request_opens_prefilled_form() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="product_pricing")
+    request = (
+        "Strategy name: Fashion Margin Strategy\n"
+        "Product: Men's Oxford Shirt\n"
+        "Margin: 25"
+    )
+    task = Task(
+        id="task-product-pricing-strategy-form",
+        context_id="ctx-product-pricing-strategy-form",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=request)])),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "product.search_products",
+        "product.get_product_categories",
+        "create_dynamic_form",
+    ]
+    payload = next(event for event in events if isinstance(event, Artifact) and event.name == "result").parts[0].data
+    assert payload["workflow"] == "product_pricing_mutation"
+    assert payload["mutation_action"] == "create_pricing_strategy"
+    assert payload["current_values"] == {
+        "name": "Fashion Margin Strategy",
+        "strategy": "margin",
+        "product_id": "prod-1",
+        "margin_percentage": "25",
+    }
+
+
+@pytest.mark.asyncio
+async def test_product_pricing_rule_form_response_executes_create_rule() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="product_pricing")
+    form_payload = {
+        "interaction_type": "dynamic_form",
+        "workflow": "product_pricing_mutation",
+        "workflow_stage": "form",
+        "mutation_action": "create_pricing_rule",
+    }
+    form_response = (
+        '{"type":"form_response","data":{"name":"Weekend Promo","rule_type":"PROMO","product_id":"prod-1","category_ref_id":"prod-cat-1","discount_type":"PERCENTAGE","value":"10","description":"Weekend markdown"},'
+        '"message":"Form submitted successfully"}'
+    )
+    task = Task(
+        id="task-product-pricing-rule-submit",
+        context_id="ctx-product-pricing-rule-submit",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=form_response)])),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="Create a pricing rule")]),
+            Message(role=Role.agent, parts=[DataPart(data=form_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=form_response)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "product.create_pricing_rule",
+            {
+                "payload": {
+                    "name": "Weekend Promo",
+                    "rule_type": "PROMO",
+                    "product_id": "prod-1",
+                    "category_ref_id": "prod-cat-1",
+                    "discount_type": "PERCENTAGE",
+                    "value": "10",
+                    "description": "Weekend markdown",
+                },
+            },
+        )
+    ]
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].text == "Pricing rule created successfully."
+
+
+@pytest.mark.asyncio
+async def test_inventory_agent_greeting_short_circuits_tool_and_llm_work() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory")
+    task = Task(
+        id="task-greeting-inventory",
+        context_id="ctx-greeting-inventory",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="hello there")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="hello there")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == []
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].text == "I’m your Inventory Management agent. What can I help you with?"
 
 
 @pytest.mark.asyncio
@@ -1963,6 +2890,7 @@ async def test_specialist_tool_loop_passes_tool_specs_to_model() -> None:
         "delegate_to_agent",
         "create_multiple_choice",
         "create_wizard_flow",
+        "create_dynamic_form",
     }
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")

@@ -12,6 +12,7 @@ import pytest
 from kafka_a2a.mcp_tools import (
     CompositeToolExecutor,
     McpServerAuthConfig,
+    McpRuntimeConnectionConfig,
     McpServerConfig,
     MultiMcpToolExecutor,
     MultiMcpToolExecutorConfig,
@@ -260,7 +261,7 @@ def test_prod_config_splits_heavy_domains_into_focused_subagents() -> None:
         "inventory_visibility": ("inventory", 18),
         "inventory_setup": ("inventory", 18),
         "inventory_procurement": ("inventory", 18),
-        "inventory_fulfillment": ("inventory", 25),
+        "inventory_fulfillment": ("inventory", 27),
         "pos_live": ("pos", 30),
         "pos_admin": ("pos", 20),
     }
@@ -439,6 +440,144 @@ async def test_multi_mcp_executor_omits_none_arguments_before_remote_call(
 
 
 @pytest.mark.asyncio
+async def test_multi_mcp_executor_prefers_user_runtime_connection_and_server_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = timeout_s, operation, remote_tool, argument_keys
+        call = {"server_url": server_url, "headers": dict(headers)}
+        calls.append(call)
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "search_orders", "description": "Search orders"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"server_url": server_url, "headers": dict(headers), "tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="shopify",
+                    server_url="https://fallback.shopify.example/mcp",
+                    tool_name_prefix="shopify.",
+                    auth=McpServerAuthConfig(mode="oauth_user"),
+                    runtime_connections=[
+                        McpRuntimeConnectionConfig(
+                            id="workspace-1",
+                            connection_scope="workspace",
+                            auth_type="oauth_workspace",
+                            status="connected",
+                            headers={"authorization": "Bearer workspace-token"},
+                            server_url_override="https://workspace.shopify.example/mcp",
+                        ),
+                        McpRuntimeConnectionConfig(
+                            id="user-1",
+                            connection_scope="user",
+                            owner_user_id="user-1",
+                            auth_type="oauth_user",
+                            status="connected",
+                            headers={"authorization": "Bearer user-token"},
+                            server_url_override="https://user.shopify.example/mcp",
+                        ),
+                    ],
+                )
+            ]
+        )
+    )
+
+    ctx = ToolContext(principal=Principal(user_id="user-1", tenant_id="profile-1"))
+    tools = await executor.list_tools(ctx=ctx)
+
+    assert [item.name for item in tools] == ["shopify.search_orders"]
+    assert calls[0]["server_url"] == "https://user.shopify.example/mcp"
+    assert calls[0]["headers"]["authorization"] == "Bearer user-token"
+
+    result = await executor.call_tool(name="shopify.search_orders", arguments={"query": "open"}, ctx=ctx)
+    assert result["server_url"] == "https://user.shopify.example/mcp"
+    assert result["headers"]["authorization"] == "Bearer user-token"
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_falls_back_to_workspace_runtime_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "search_orders", "description": "Search orders"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"server_url": server_url, "headers": dict(headers), "tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="shopify",
+                    server_url="https://fallback.shopify.example/mcp",
+                    tool_name_prefix="shopify.",
+                    auth=McpServerAuthConfig(mode="api_key_header"),
+                    runtime_connections=[
+                        McpRuntimeConnectionConfig(
+                            id="workspace-1",
+                            connection_scope="workspace",
+                            auth_type="api_key_header",
+                            status="connected",
+                            headers={"x-api-key": "workspace-key"},
+                        )
+                    ],
+                )
+            ]
+        )
+    )
+
+    result = await executor.call_tool(
+        name="shopify.search_orders",
+        arguments={"query": "open"},
+        ctx=ToolContext(principal=Principal(user_id="user-9", tenant_id="profile-1")),
+    )
+
+    assert result["server_url"] == "https://fallback.shopify.example/mcp"
+    assert result["headers"]["x-api-key"] == "workspace-key"
+
+
+@pytest.mark.asyncio
 async def test_multi_mcp_executor_unwraps_structured_content_from_remote_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -514,6 +653,85 @@ async def test_multi_mcp_executor_unwraps_structured_content_from_remote_call(
         "results": [
             {"id": "loc-1", "name": "Main Warehouse"},
         ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_extracts_wrapped_json_from_remote_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "list_inventory_categories", "description": "List inventory categories"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                _ = name, arguments
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Inventory categories lookup result:\n```json\n"
+                                + json.dumps(
+                                    {
+                                        "profile_id": 1,
+                                        "category": {
+                                            "count": 1,
+                                            "results": [{"id": "cat-1", "name": "Men's Clothes"}],
+                                        },
+                                    }
+                                )
+                                + "\n```"
+                            ),
+                        }
+                    ],
+                    "isError": False,
+                }
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["list_inventory_categories"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    result = await executor.call_tool(
+        name="inventory.list_inventory_categories",
+        arguments={"query": "", "limit": 25},
+        ctx=ToolContext(),
+    )
+
+    assert result == {
+        "profile_id": 1,
+        "category": {
+            "count": 1,
+            "results": [{"id": "cat-1", "name": "Men's Clothes"}],
+        },
     }
 
 

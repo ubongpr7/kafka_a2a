@@ -58,7 +58,9 @@
           "tools": [
             "search_inventory_items",
             "list_inventory_items",
+            "list_stock_locations",
             "search_stock_locations",
+            "list_stock_location_types",
             "list_inventory_categories",
             "create_inventory_category",
             "create_inventory_item",
@@ -98,17 +100,18 @@
           "ref": "products",
           "tools": [
             "search_products",
-            "get_product_details",
-            "search_product_variants",
-            "get_product_analytics",
-            "get_product_variant_details",
-            "get_product_attributes",
-            "get_product_attribute_values",
-            "get_product_categories",
-            "get_product_dashboard_stats",
-            "get_product_stock_alerts"
-          ]
-        }
+          "get_product_details",
+          "get_product_categories",
+          "update_product",
+          "search_product_variants",
+          "get_product_analytics",
+          "get_product_variant_details",
+          "get_product_attributes",
+          "get_product_attribute_values",
+          "get_product_dashboard_stats",
+          "get_product_stock_alerts"
+        ]
+      }
       ]
     },
     "product_catalog_admin": {
@@ -173,6 +176,7 @@
           "tools": [
             "search_products",
             "get_product_details",
+            "get_product_categories",
             "search_product_variants",
             "get_product_variant_details",
             "get_product_price_history",
@@ -204,6 +208,7 @@
             "search_inventory_items",
             "get_inventory_item_details",
             "get_inventory_alerts",
+            "list_stock_locations",
             "search_stock_locations",
             "get_stock_location_summary",
             "search_stock_balances",
@@ -227,7 +232,9 @@
             "search_inventory_items",
             "list_inventory_items",
             "get_inventory_item_details",
+            "list_stock_locations",
             "search_stock_locations",
+            "list_stock_location_types",
             "list_inventory_categories",
             "get_inventory_category_tree",
             "get_inventory_category_details",
@@ -257,6 +264,8 @@
             "complete_purchase_order",
             "cancel_purchase_order",
             "create_purchase_return_order",
+            "search_inventory_items",
+            "list_inventory_items",
             "list_purchase_order_line_items",
             "add_purchase_order_line_item",
             "update_purchase_order_line_item",
@@ -286,6 +295,7 @@
             "cancel_return_order",
             "adjust_inventory_item_stock",
             "transfer_location_stock",
+            "list_stock_locations",
             "search_stock_balances",
             "search_stock_lots",
             "search_stock_serials",

@@ -129,10 +129,12 @@ class Ka2aSettings:
             return resolve_llm_credentials_from_metadata(metadata=metadata, decrypt=decrypt)
         if self.llm_credentials_source == "auto":
             if decrypt is not None:
-                resolved = resolve_llm_credentials_from_metadata(metadata=metadata, decrypt=decrypt)
+                try:
+                    resolved = resolve_llm_credentials_from_metadata(metadata=metadata, decrypt=decrypt)
+                except Exception:
+                    resolved = None
                 if resolved is not None:
                     return resolved
             return resolve_llm_credentials_from_env(env=env)
 
         raise AssertionError(f"Unhandled credentials source: {self.llm_credentials_source}")
-

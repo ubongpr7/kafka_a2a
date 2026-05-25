@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from kafka_a2a.agent_filter import filter_agent_cards
+from kafka_a2a.agent_filter import card_public_slug, filter_agent_cards
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.models import (
     AgentCard,
@@ -57,7 +57,7 @@ def _parse_bool(value: str | None, *, default: bool = False) -> bool:
 
 def _card_summary(card: AgentCard) -> dict[str, object]:
     return {
-        "name": card.name,
+        "name": card_public_slug(card),
         "description": card.description,
         "skills": [
             {
@@ -79,7 +79,7 @@ def _score_card(card: AgentCard, query: str) -> int:
     if not q:
         return 0
     score = 0
-    if card.name.lower() in q:
+    if card.name.lower() in q or card_public_slug(card).lower() in q:
         score += 10
     if card.description and any(tok in card.description.lower() for tok in q.split()[:6]):
         score += 1

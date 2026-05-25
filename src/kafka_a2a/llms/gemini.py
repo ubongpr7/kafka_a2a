@@ -122,9 +122,116 @@ def _to_gemini_contents(messages: Iterable[Any]) -> tuple[str | None, list[dict[
     return system_text, contents
 
 
-def _json_schema_to_gemini_schema(schema: dict[str, Any] | None) -> dict[str, Any] | None:
+def _resolve_local_json_ref(root: dict[str, Any], ref: str) -> dict[str, Any] | None:
+    raw = (ref or "").strip()
+    if not raw.startswith("#/"):
+        return None
+
+    current: Any = root
+    for part in raw[2:].split("/"):
+        key = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+        if current is None:
+            return None
+
+    return current if isinstance(current, dict) else None
+
+
+def _json_schema_to_gemini_schema(
+    schema: dict[str, Any] | None,
+    *,
+    root: dict[str, Any] | None = None,
+    seen_refs: set[str] | None = None,
+) -> dict[str, Any] | None:
     if not isinstance(schema, dict):
         return None
+
+    root_schema = root or schema
+    seen = seen_refs or set()
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.strip():
+        ref_key = ref.strip()
+        if ref_key in seen:
+            return None
+        resolved = _resolve_local_json_ref(root_schema, ref_key)
+        if resolved is None:
+            return None
+        merged = dict(resolved)
+        for key, value in schema.items():
+            if key == "$ref":
+                continue
+            merged[key] = value
+        return _json_schema_to_gemini_schema(
+            merged,
+            root=root_schema,
+            seen_refs={*seen, ref_key},
+        )
+
+    for union_key in ("anyOf", "oneOf"):
+        union_items = schema.get(union_key)
+        if not isinstance(union_items, list) or not union_items:
+            continue
+        non_null_candidates = [
+            item
+            for item in union_items
+            if isinstance(item, dict) and str(item.get("type") or "").strip().lower() != "null"
+        ]
+        for candidate in non_null_candidates:
+            converted = _json_schema_to_gemini_schema(candidate, root=root_schema, seen_refs=seen)
+            if not converted:
+                continue
+            if "description" not in converted:
+                description = schema.get("description")
+                if isinstance(description, str) and description.strip():
+                    converted["description"] = description.strip()
+            return converted
+
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list) and all_of:
+        merged_schema: dict[str, Any] = {}
+        merged_properties: dict[str, Any] = {}
+        merged_required: list[str] = []
+        for item in all_of:
+            converted = _json_schema_to_gemini_schema(item, root=root_schema, seen_refs=seen)
+            if not converted:
+                continue
+            if not merged_schema.get("type") and converted.get("type"):
+                merged_schema["type"] = converted["type"]
+            if not merged_schema.get("description") and converted.get("description"):
+                merged_schema["description"] = converted["description"]
+            if isinstance(converted.get("properties"), dict):
+                merged_properties.update(converted["properties"])
+            if isinstance(converted.get("required"), list):
+                for name in converted["required"]:
+                    if isinstance(name, str) and name not in merged_required:
+                        merged_required.append(name)
+
+        overlay = dict(schema)
+        overlay.pop("allOf", None)
+        converted_overlay = _json_schema_to_gemini_schema(overlay, root=root_schema, seen_refs=seen)
+        if isinstance(converted_overlay, dict):
+            if not merged_schema.get("type") and converted_overlay.get("type"):
+                merged_schema["type"] = converted_overlay["type"]
+            if not merged_schema.get("description") and converted_overlay.get("description"):
+                merged_schema["description"] = converted_overlay["description"]
+            if isinstance(converted_overlay.get("properties"), dict):
+                merged_properties.update(converted_overlay["properties"])
+            if isinstance(converted_overlay.get("required"), list):
+                for name in converted_overlay["required"]:
+                    if isinstance(name, str) and name not in merged_required:
+                        merged_required.append(name)
+
+        if merged_properties:
+            merged_schema["properties"] = merged_properties
+            merged_schema.setdefault("type", "OBJECT")
+        if merged_required:
+            valid_required = [name for name in merged_required if name in merged_properties]
+            if valid_required:
+                merged_schema["required"] = valid_required
+        return merged_schema or None
 
     type_map = {
         "object": "OBJECT",
@@ -148,15 +255,17 @@ def _json_schema_to_gemini_schema(schema: dict[str, Any] | None) -> dict[str, An
     if isinstance(enum_values, list) and enum_values:
         out["enum"] = [value for value in enum_values if isinstance(value, (str, int, float, bool))]
 
+    converted_property_names: set[str] = set()
     properties = schema.get("properties")
     if isinstance(properties, dict) and properties:
         converted_properties: dict[str, Any] = {}
         for key, value in properties.items():
             if not isinstance(key, str) or not isinstance(value, dict):
                 continue
-            converted = _json_schema_to_gemini_schema(value)
+            converted = _json_schema_to_gemini_schema(value, root=root_schema, seen_refs=seen)
             if converted:
                 converted_properties[key] = converted
+                converted_property_names.add(key)
         if converted_properties:
             out["properties"] = converted_properties
             out.setdefault("type", "OBJECT")
@@ -164,12 +273,14 @@ def _json_schema_to_gemini_schema(schema: dict[str, Any] | None) -> dict[str, An
     required = schema.get("required")
     if isinstance(required, list):
         required_fields = [item for item in required if isinstance(item, str) and item.strip()]
+        if converted_property_names:
+            required_fields = [item for item in required_fields if item in converted_property_names]
         if required_fields:
             out["required"] = required_fields
 
     items = schema.get("items")
     if isinstance(items, dict):
-        converted_items = _json_schema_to_gemini_schema(items)
+        converted_items = _json_schema_to_gemini_schema(items, root=root_schema, seen_refs=seen)
         if converted_items:
             out["items"] = converted_items
             out.setdefault("type", "ARRAY")

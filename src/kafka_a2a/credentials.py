@@ -282,8 +282,8 @@ def resolve_llm_credentials_from_env(
     if not api_key:
         provider_lower = provider.lower()
         fallback_env_vars: list[str] = []
-        if provider_lower in ("openai", "openai_compat", "openai-compatible", "openai-compatible-api"):
-            fallback_env_vars = ["OPENAI_API_KEY"]
+        if provider_lower in ("chatgpt", "openai", "openai_compat", "openai-compatible", "openai-compatible-api"):
+            fallback_env_vars = ["OPENAI_API_KEY", "GPT_KEY"]
         elif provider_lower in ("gemini", "google", "google_genai", "google-genai"):
             fallback_env_vars = ["GOOGLE_API_KEY", "GEMINI_API_KEY"]
         elif provider_lower in ("anthropic",):

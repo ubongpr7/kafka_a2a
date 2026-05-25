@@ -281,11 +281,30 @@ class RedisTaskStore:
         await pipe.execute()
         return event
 
-    async def iter_events(self, task_id: str, *, replay_history: bool = True) -> AsyncIterator[TaskEventRecord]:
+    async def latest_sequence(self, task_id: str) -> int:
+        raw = await self._redis.get(self._seq_key(task_id))
+        try:
+            return int(raw or "0")
+        except Exception:
+            return 0
+
+    async def iter_events(
+        self,
+        task_id: str,
+        *,
+        replay_history: bool = True,
+        after_sequence: int | None = None,
+    ) -> AsyncIterator[TaskEventRecord]:
         stream = self._events_key(task_id)
         last_id = "0-0" if replay_history else "$"
         while True:
-            items = await self._redis.xread({stream: last_id}, block=self._cfg.block_ms, count=self._cfg.read_count)
+            try:
+                items = await self._redis.xread({stream: last_id}, block=self._cfg.block_ms, count=self._cfg.read_count)
+            except Exception as exc:
+                if exc.__class__.__name__ != "ConnectionError":
+                    raise
+                await asyncio.sleep(0.25)
+                continue
             if not items:
                 await asyncio.sleep(0)
                 continue
@@ -297,6 +316,8 @@ class RedisTaskStore:
                         event_raw = fields.get("event") or ""
                         event = _parse_task_event(event_raw)
                     except Exception:
+                        continue
+                    if after_sequence is not None and seq <= after_sequence:
                         continue
                     yield TaskEventRecord(sequence=seq, event=event)
 

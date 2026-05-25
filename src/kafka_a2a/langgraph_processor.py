@@ -282,6 +282,9 @@ QUERY_TOKEN_STOPWORDS: set[str] = {
 }
 
 
+_TOOL_EXECUTOR_SENTINEL = object()
+
+
 def _query_tokens(value: str, *, max_tokens: int = 12) -> list[str]:
     tokens: list[str] = []
     for token in re.findall(r"[a-z0-9][a-z0-9_-]*", _normalize_user_text(value)):
@@ -306,6 +309,30 @@ HOST_AGENT_LABELS: dict[str, str] = {
 
 ROUTER_AGENT_NAMES: set[str] = {"product", "inventory", "pos"}
 
+SIMPLE_GREETING_QUERIES: set[str] = {
+    "hello",
+    "hello there",
+    "hey",
+    "hey there",
+    "hi",
+    "hi there",
+    "good morning",
+    "good afternoon",
+    "good evening",
+}
+
+
+def _is_simple_greeting_query(value: str) -> bool:
+    text = _normalize_user_text(value)
+    return text in SIMPLE_GREETING_QUERIES
+
+
+def _agent_intro_text(agent_name: str | None) -> str:
+    normalized = str(agent_name or "").strip().lower()
+    if normalized == "host":
+        return "I’m your workspace host agent. What can I help you with?"
+    return f"I’m your {_friendly_agent_label(normalized or 'assistant')} agent. What can I help you with?"
+
 
 HOST_DOMAIN_AREA_PICKERS: dict[str, dict[str, Any]] = {
     "product": {
@@ -313,6 +340,7 @@ HOST_DOMAIN_AREA_PICKERS: dict[str, dict[str, Any]] = {
         "description": "Choose the product area you want help with. You can also type a specific product question.",
         "options": [
             {"value": "product_discovery", "label": "Search and Product Discovery"},
+            {"value": "marketplace_sourcing", "label": "Marketplace Sourcing"},
             {"value": "product_catalog_admin", "label": "Create or Update Products"},
             {"value": "product_merchandising", "label": "Merchandising and Attributes"},
             {"value": "product_pricing", "label": "Pricing and Price Rules"},
@@ -345,6 +373,11 @@ HOST_DOMAIN_AREA_REQUESTS: dict[str, dict[str, str]] = {
             "The user selected Search and Product Discovery from the Product Management menu. "
             "Help them search the catalog, inspect product details, or review product analytics. "
             "Start with a short structured choice only if the next step is still ambiguous."
+        ),
+        "marketplace_sourcing": (
+            "The user selected Marketplace Sourcing from the Product Management menu. "
+            "Help them search online marketplaces, compare supplier offers, and shortlist products. "
+            "Start by searching marketplaces or by asking a concise clarifying question about the product they want."
         ),
         "product_catalog_admin": (
             "The user selected Create or Update Products from the Product Management menu. "
@@ -527,20 +560,6 @@ def _is_host_introspection_query(value: str) -> bool:
     if not text:
         return False
 
-    if text in {"help", "thanks", "thank you"}:
-        return True
-
-    greeting_prefixes = (
-        "hi",
-        "hello",
-        "hey",
-        "good morning",
-        "good afternoon",
-        "good evening",
-    )
-    if any(text == greeting or text.startswith(f"{greeting} ") for greeting in greeting_prefixes):
-        return True
-
     phrases = (
         "what agents",
         "what agents do you have",
@@ -554,11 +573,21 @@ def _is_host_introspection_query(value: str) -> bool:
         "how many agents",
         "list agents",
         "show agents",
-        "how can you help",
-        "what can you do",
-        "who are you",
-        "what do you do",
-        "your capabilities",
+        "what specialists",
+        "which specialists",
+        "available specialists",
+        "registered specialists",
+        "which specialist agents",
+        "what specialist agents",
+        "who can you route to",
+        "which agent can you route to",
+        "which agents can you route to",
+        "what agents can you route to",
+        "is the",
+        "is onboarding",
+        "is inventory",
+        "is pos",
+        "is product",
     )
     return any(phrase in text for phrase in phrases)
 
@@ -733,6 +762,81 @@ def _host_follow_up_request_for_agent(agent_name: str) -> str:
     )
 
 
+def _is_host_orchestration_payload(payload: dict[str, Any] | None, *, stage: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return (
+        str(payload.get("interaction_type") or "").strip().lower() == "multiple_choice"
+        and str(payload.get("workflow") or "").strip().lower() == "host_orchestration"
+        and str(payload.get("workflow_stage") or "").strip().lower() == stage
+    )
+
+
+def _host_orchestration_plan(query: str, agent_summaries: list[dict[str, Any]] | None) -> list[str]:
+    text = _normalize_user_text(query)
+    if not text:
+        return []
+    available_names = _available_agent_names(agent_summaries)
+    candidates: list[tuple[str, int]] = []
+    for agent_name, keywords in HOST_DOMAIN_KEYWORDS.items():
+        if agent_name == "host":
+            continue
+        if available_names and agent_name not in available_names:
+            continue
+        score = sum(1 for keyword in keywords if keyword in text)
+        if score > 0:
+            candidates.append((agent_name, score))
+    if not candidates:
+        return []
+    non_onboarding = [(name, score) for name, score in candidates if name != "onboarding"]
+    if non_onboarding:
+        candidates = non_onboarding
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    plan: list[str] = []
+    for name, _score in candidates:
+        if name not in plan:
+            plan.append(name)
+    return plan
+
+
+def _host_orchestration_continue_arguments(workflow_state: dict[str, Any]) -> dict[str, Any]:
+    remaining = workflow_state.get("remaining_agents") if isinstance(workflow_state.get("remaining_agents"), list) else []
+    next_agent = str(remaining[0] if remaining else "").strip()
+    current_agent = str(workflow_state.get("current_agent") or "").strip()
+    last_response_text = str(workflow_state.get("last_response_text") or "").strip()
+    description = f"{_friendly_agent_label(current_agent)} finished the current step."
+    if last_response_text:
+        description = f"{description}\n\nLatest result: {last_response_text}"
+    if next_agent:
+        description = f"{description}\n\nContinue with {_friendly_agent_label(next_agent)} now?"
+    return {
+        "title": "Continue Workflow",
+        "description": description,
+        "options": [
+            {"value": "continue_next", "label": f"Continue to {_friendly_agent_label(next_agent)}" if next_agent else "Continue"},
+            {"value": "stop_here", "label": "Stop Here"},
+        ],
+        "multiple": False,
+        "allow_input": False,
+    }
+
+
+def _host_orchestration_next_request(workflow_state: dict[str, Any], next_agent: str) -> str:
+    original_request = str(workflow_state.get("original_request") or "").strip()
+    completed_agents = workflow_state.get("completed_agents") if isinstance(workflow_state.get("completed_agents"), list) else []
+    last_response_text = str(workflow_state.get("last_response_text") or "").strip()
+    completed_labels = ", ".join(_friendly_agent_label(str(name)) for name in completed_agents if str(name).strip())
+    blocks = [
+        "Continue the user's multi-domain workflow.",
+        f"Original user request: {original_request}" if original_request else "",
+        f"Completed steps so far: {completed_labels}." if completed_labels else "",
+        f"Latest completed step result: {last_response_text}" if last_response_text else "",
+        f"Focus now on the {_friendly_agent_label(next_agent)} part of the workflow.",
+        "Use structured interactions if more information is still required.",
+    ]
+    return "\n".join(block for block in blocks if block)
+
+
 def _host_unavailable_agent_text(
     *,
     agent_name: str,
@@ -794,13 +898,34 @@ RELATION_LOOKUP_REGISTRY: dict[str, dict[str, Any]] = {
         },
         "default_arguments": {"query": "", "limit": 25},
     },
+    "inventory.list_stock_locations": {
+        "label": "Stock Location",
+        "model_tokens": {"stocklocation"},
+        "aliases": {
+            "defaultlocation",
+            "defaultlocationid",
+            "existinglocation",
+            "existinglocationid",
+            "fromlocationid",
+            "primarylocation",
+            "primarylocationid",
+            "stocklocation",
+            "stocklocationid",
+            "tolocationid",
+        },
+        "default_arguments": {"limit": 25},
+    },
     "inventory.search_stock_locations": {
         "label": "Stock Location",
         "model_tokens": {"stocklocation"},
         "aliases": {
             "defaultlocation",
             "defaultlocationid",
+            "existinglocation",
+            "existinglocationid",
             "fromlocationid",
+            "primarylocation",
+            "primarylocationid",
             "stocklocation",
             "stocklocationid",
             "tolocationid",
@@ -836,6 +961,12 @@ RELATION_LOOKUP_REGISTRY: dict[str, dict[str, Any]] = {
         "label": "Inventory Item",
         "model_tokens": {"inventory", "inventoryitem"},
         "aliases": {"inventory", "inventoryid", "inventoryitem", "inventoryitemid"},
+        "default_arguments": {"query": "", "limit": 25},
+    },
+    "inventory.search_purchase_orders": {
+        "label": "Purchase Order",
+        "model_tokens": {"purchaseorder"},
+        "aliases": {"purchaseorder", "purchaseorderid", "po", "poid", "order", "orderid"},
         "default_arguments": {"query": "", "limit": 25},
     },
 }
@@ -979,6 +1110,8 @@ def _render_relation_prompt_block(tools: list[ToolSpec]) -> str:
         "- When loading selectable reference data for the current tenant, prefer list/get-all tools over search tools whenever both are available.",
         "- If a list/get-all tool exposes optional query, limit, or filter arguments, treat those as internal defaults for the agent to supply. Do not tell the user the backend requires those parameters.",
         "- If only a search-style lookup tool exists, call it with an empty string and omit optional filters/null values instead of asking the user for a search term.",
+        "- For create, update, move, or transfer workflows, gather enough information first. Do not mutate records until the required fields are known or the user has confirmed the proposed selections.",
+        "- Prefer a conversational gather-and-confirm flow: understand the request, fetch any missing backend options, present a form or selection when needed, then execute the write once the user confirms.",
     ]
     for tool_name, field_path, lookup_tool in hints:
         lines.append(
@@ -1034,17 +1167,40 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
                 "description": "Tell me how you want your stock locations organized.",
                 "fields": [
                     {
+                        "name": "primary_location_mode",
+                        "type": "select",
+                        "label": "Primary Location Source",
+                        "required": True,
+                        "options": _select_options(
+                            [
+                                ("new", "Create a New Primary Location"),
+                                ("existing", "Use an Existing Location"),
+                            ]
+                        ),
+                        "placeholder": "Choose how to set the primary location",
+                    },
+                    {
+                        "name": "primary_location_id",
+                        "type": "select",
+                        "label": "Existing Primary Location",
+                        "required": False,
+                        "options": [],
+                        "placeholder": "Select an existing stock location",
+                        "show_when": {"field": "primary_location_mode", "equals": "existing"},
+                    },
+                    {
                         "name": "primary_location_name",
                         "type": "text",
                         "label": "Primary Location Name",
-                        "required": True,
+                        "required": False,
                         "placeholder": "Main Warehouse",
+                        "show_when": {"field": "primary_location_mode", "equals": "new"},
                     },
                     {
                         "name": "primary_location_type",
                         "type": "select",
                         "label": "Primary Location Type",
-                        "required": True,
+                        "required": False,
                         "options": _select_options(
                             [
                                 ("warehouse", "Warehouse"),
@@ -1054,6 +1210,7 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
                                 ("other", "Other"),
                             ]
                         ),
+                        "show_when": {"field": "primary_location_mode", "equals": "new"},
                     },
                     {
                         "name": "additional_locations",
@@ -1161,17 +1318,40 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
             "description": "Set up the main places where stock will live.",
             "fields": [
                 {
+                    "name": "primary_location_mode",
+                    "type": "select",
+                    "label": "Primary Location Source",
+                    "required": True,
+                    "options": _select_options(
+                        [
+                            ("new", "Create a New Primary Location"),
+                            ("existing", "Use an Existing Location"),
+                        ]
+                    ),
+                    "placeholder": "Choose how to set the primary location",
+                },
+                {
+                    "name": "primary_location_id",
+                    "type": "select",
+                    "label": "Existing Primary Location",
+                    "required": False,
+                    "options": [],
+                    "placeholder": "Select an existing stock location",
+                    "show_when": {"field": "primary_location_mode", "equals": "existing"},
+                },
+                {
                     "name": "primary_location_name",
                     "type": "text",
                     "label": "Primary Location Name",
-                    "required": True,
+                    "required": False,
                     "placeholder": "Main Warehouse",
+                    "show_when": {"field": "primary_location_mode", "equals": "new"},
                 },
                 {
                     "name": "primary_location_type",
                     "type": "select",
                     "label": "Primary Location Type",
-                    "required": True,
+                    "required": False,
                     "options": _select_options(
                         [
                             ("warehouse", "Warehouse"),
@@ -1181,6 +1361,7 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
                             ("other", "Other"),
                         ]
                     ),
+                    "show_when": {"field": "primary_location_mode", "equals": "new"},
                 },
                 {
                     "name": "additional_locations",
@@ -1224,6 +1405,22 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
                     "required": False,
                     "placeholder": "Primary sellable stock item for the business.",
                 },
+                {
+                    "name": "related_stock_location_id",
+                    "type": "select",
+                    "label": "Primary Location for This Inventory",
+                    "required": False,
+                    "options": [],
+                    "placeholder": "Select a stock location",
+                },
+                {
+                    "name": "inventory_category_id",
+                    "type": "select",
+                    "label": "Default Category",
+                    "required": False,
+                    "options": [],
+                    "placeholder": "Select an inventory category",
+                },
             ],
         },
         {
@@ -1244,6 +1441,20 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
                     "required": False,
                     "placeholder": "Coca-Cola 50cl\nFanta 50cl",
                 },
+                {
+                    "name": "product_category_id",
+                    "type": "select",
+                    "label": "Default Product Category",
+                    "required": False,
+                    "options": [],
+                    "placeholder": "Select a product category",
+                },
+                {
+                    "name": "pos_ready",
+                    "type": "boolean",
+                    "label": "Make These Products POS-Ready",
+                    "required": False,
+                },
             ],
         },
     ]
@@ -1258,6 +1469,316 @@ def _onboarding_wizard_arguments(scope: str) -> dict[str, Any]:
         "allow_back": True,
         "show_progress": True,
     }
+
+
+def _split_inline_list_values(value: str) -> list[str]:
+    entries: list[str] = []
+    for raw in re.split(r"[\n,;]+|\band\b", value, flags=re.IGNORECASE):
+        cleaned = raw.strip().strip("-").strip()
+        if cleaned:
+            entries.append(cleaned)
+    return entries
+
+
+def _dedupe_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        key = re.sub(r"\s+", " ", value.strip().lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(value.strip())
+    return unique
+
+
+def _normalize_location_type_value(value: str | None) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if "warehouse" in text:
+        return "warehouse"
+    if "store" in text or "showroom" in text or "shop" in text:
+        return "store"
+    if "backroom" in text or "back room" in text:
+        return "backroom"
+    if "fulfillment" in text:
+        return "fulfillment"
+    return "other"
+
+
+def _extract_named_text_list(text: str, patterns: tuple[str, ...]) -> list[str]:
+    items: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.MULTILINE):
+            value = str(match.group("value") or "").strip()
+            if value:
+                items.extend(_split_inline_list_values(value))
+    return _dedupe_preserving_order(items)
+
+
+def _extract_first_named_value(text: str, patterns: tuple[str, ...]) -> str | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        value = str(match.group("value") or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _infer_onboarding_scope_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    has_location = any(token in normalized for token in ("warehouse", "location", "store", "backroom", "fulfillment"))
+    has_category = "categor" in normalized
+    has_inventory = "inventory" in normalized or "stock ledger" in normalized
+    has_product = "product" in normalized or "sku" in normalized
+    if sum(bool(flag) for flag in (has_location, has_category, has_inventory, has_product)) >= 2:
+        return "full_setup"
+    if has_location:
+        return "stock_locations"
+    if has_category:
+        return "inventory_categories"
+    if has_inventory:
+        return "inventory_setup"
+    if has_product:
+        return "product_onboarding"
+    if "onboarding" in normalized or "set up" in normalized or "setup" in normalized:
+        return "full_setup"
+    return None
+
+
+def _parse_onboarding_prefill_from_text(scope: str, text: str) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    stripped = text.strip()
+    if not stripped:
+        return parsed
+
+    primary_location_name = _extract_first_named_value(
+        stripped,
+        (
+            r"(?:^|\n)\s*(?:primary|main)\s+location(?:\s+name)?\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"(?:^|\n)\s*main\s+warehouse\s*[:=-]\s*(?P<value>[^\n]+)",
+        ),
+    )
+    if not primary_location_name:
+        location_phrase = re.search(
+            r"\b(?P<value>(?:main|primary)\s+[a-z0-9][a-z0-9&'()/ -]{1,80}?(?:warehouse|store|shop|showroom|backroom|back room|fulfillment(?: center)?))\b",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        if location_phrase:
+            primary_location_name = str(location_phrase.group("value") or "").strip()
+    if primary_location_name:
+        parsed["primary_location_name"] = primary_location_name
+        parsed["primary_location_type"] = _normalize_location_type_value(primary_location_name)
+        parsed["primary_location_mode"] = "new"
+
+    normalized = _normalize_user_text(stripped)
+    if primary_location_name and ("existing" in normalized or "already have" in normalized or "use current" in normalized):
+        parsed["primary_location_mode"] = "existing"
+
+    explicit_location_type = _extract_first_named_value(
+        stripped,
+        (
+            r"(?:^|\n)\s*(?:primary\s+)?location\s+type\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"(?:^|\n)\s*(?:primary\s+)?warehouse\s+type\s*[:=-]\s*(?P<value>[^\n]+)",
+        ),
+    )
+    normalized_location_type = _normalize_location_type_value(explicit_location_type)
+    if normalized_location_type:
+        parsed["primary_location_type"] = normalized_location_type
+
+    additional_locations = _extract_named_text_list(
+        stripped,
+        (
+            r"(?:^|\n)\s*(?:additional|other|secondary)\s+locations?\s*[:=-]\s*(?P<value>[^\n]+(?:\n(?!\s*[A-Za-z][A-Za-z /'-]{0,40}\s*[:=-]).+)*)",
+            r"(?:^|\n)\s*locations?\s*[:=-]\s*(?P<value>[^\n]+(?:\n(?!\s*[A-Za-z][A-Za-z /'-]{0,40}\s*[:=-]).+)*)",
+        ),
+    )
+    if additional_locations and parsed.get("primary_location_name"):
+        normalized_primary = re.sub(r"\s+", " ", str(parsed["primary_location_name"]).strip().lower())
+        additional_locations = [
+            item
+            for item in additional_locations
+            if re.sub(r"\s+", " ", item.strip().lower()) != normalized_primary
+        ]
+    if additional_locations:
+        parsed["additional_locations"] = "\n".join(_dedupe_preserving_order(additional_locations))
+
+    category_names = _extract_named_text_list(
+        stripped,
+        (
+            r"(?:^|\n)\s*(?:inventory\s+)?categories?\s*[:=-]\s*(?P<value>[^\n]+(?:\n(?!\s*[A-Za-z][A-Za-z /'-]{0,40}\s*[:=-]).+)*)",
+            r"\bcategories?\s+(?:are|like|such as)\s+(?P<value>[^.]+)",
+        ),
+    )
+    if category_names:
+        multiline_categories = "\n".join(_dedupe_preserving_order(category_names))
+        parsed["category_names"] = multiline_categories
+        parsed["inventory_category_name"] = _dedupe_preserving_order(category_names)[0]
+
+    inventory_name = _extract_first_named_value(
+        stripped,
+        (
+            r"(?:^|\n)\s*(?:inventory|stock\s+ledger)\s+name\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"(?:^|\n)\s*inventory\s*[:=-]\s*(?P<value>[^\n]+)",
+        ),
+    )
+    if inventory_name:
+        parsed["default_inventory_name"] = inventory_name
+
+    inventory_description = _extract_first_named_value(
+        stripped,
+        (
+            r"(?:^|\n)\s*(?:inventory\s+)?description\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"\bdescribe(?:d)?\s+as\s+(?P<value>[^.]+)",
+        ),
+    )
+    if inventory_description:
+        parsed["inventory_description"] = inventory_description
+
+    related_location_name = _extract_first_named_value(
+        stripped,
+        (
+            r"(?:^|\n)\s*(?:inventory|default|ledger)\s+location\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"(?:^|\n)\s*(?:primary\s+location\s+for\s+inventory)\s*[:=-]\s*(?P<value>[^\n]+)",
+        ),
+    )
+    if related_location_name:
+        parsed["related_stock_location_name"] = related_location_name
+
+    product_names = _extract_named_text_list(
+        stripped,
+        (
+            r"(?:^|\n)\s*(?:initial\s+)?products?\s*[:=-]\s*(?P<value>[^\n]+(?:\n(?!\s*[A-Za-z][A-Za-z /'-]{0,40}\s*[:=-]).+)*)",
+            r"\bproducts?\s+(?:are|like|such as)\s+(?P<value>[^.]+)",
+        ),
+    )
+    if product_names:
+        parsed["initial_product_names"] = "\n".join(_dedupe_preserving_order(product_names))
+        parsed["continue_to_product_onboarding"] = True
+
+    product_category_name = _extract_first_named_value(
+        stripped,
+        (
+            r"(?:^|\n)\s*product\s+category\s*[:=-]\s*(?P<value>[^\n]+)",
+        ),
+    )
+    if product_category_name:
+        parsed["product_category_name"] = product_category_name
+
+    if "pos-ready" in normalized or "pos ready" in normalized:
+        parsed["pos_ready"] = True
+    if "do not add products" in normalized or "don't add products" in normalized:
+        parsed["continue_to_product_onboarding"] = False
+
+    if scope == "stock_locations":
+        return {
+            key: value
+            for key, value in parsed.items()
+            if key in {"primary_location_mode", "primary_location_name", "primary_location_type", "additional_locations"}
+        }
+    if scope == "inventory_categories":
+        return {key: value for key, value in parsed.items() if key in {"category_names"}}
+    if scope == "inventory_setup":
+        return {
+            key: value
+            for key, value in parsed.items()
+            if key
+            in {
+                "default_inventory_name",
+                "inventory_description",
+                "related_stock_location_name",
+                "inventory_category_name",
+            }
+        }
+    if scope == "product_onboarding":
+        return {
+            key: value
+            for key, value in parsed.items()
+            if key in {"initial_product_names", "product_category_name", "pos_ready"}
+        }
+    return parsed
+
+
+def _prefill_match_option_value(field: dict[str, Any], desired_text: str) -> Any:
+    desired = re.sub(r"\s+", " ", desired_text.strip().lower())
+    options = field.get("options")
+    if not desired or not isinstance(options, list):
+        return None
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        option_label = re.sub(r"\s+", " ", str(option.get("label") or "").strip().lower())
+        option_value_text = re.sub(r"\s+", " ", str(option.get("value") or "").strip().lower())
+        if desired == option_label or desired == option_value_text or desired in option_label:
+            return option.get("value")
+    return None
+
+
+def _prefill_value_for_wizard_field(field: dict[str, Any], prefill_data: dict[str, Any]) -> Any:
+    field_name = str(field.get("name") or "").strip()
+    if not field_name:
+        return None
+    if field_name in prefill_data:
+        return prefill_data[field_name]
+
+    desired_text: str | None = None
+    if field_name == "related_stock_location_id":
+        desired_text = (
+            str(prefill_data.get("related_stock_location_name") or "").strip()
+            or str(prefill_data.get("related_location_name") or "").strip()
+            or str(prefill_data.get("primary_location_name") or "").strip()
+        )
+    elif field_name == "primary_location_id":
+        if str(prefill_data.get("primary_location_mode") or "").strip().lower() == "existing":
+            desired_text = str(prefill_data.get("primary_location_name") or "").strip()
+    elif field_name == "inventory_category_id":
+        desired_text = (
+            str(prefill_data.get("inventory_category_name") or "").strip()
+            or str(prefill_data.get("category_name") or "").strip()
+        )
+    elif field_name == "product_category_id":
+        desired_text = (
+            str(prefill_data.get("product_category_name") or "").strip()
+            or str(prefill_data.get("category_name") or "").strip()
+        )
+    if desired_text:
+        return _prefill_match_option_value(field, desired_text)
+    return None
+
+
+def _build_onboarding_existing_responses(
+    scope: str,
+    *,
+    wizard_payload: dict[str, Any],
+    prefill_data: dict[str, Any],
+) -> dict[str, Any]:
+    steps = wizard_payload.get("steps")
+    if not isinstance(steps, list):
+        steps = _onboarding_wizard_steps(scope)
+    existing_responses: dict[str, Any] = {}
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        fields = step.get("fields")
+        if not isinstance(fields, list):
+            continue
+        step_response: dict[str, Any] = {}
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            value = _prefill_value_for_wizard_field(field, prefill_data)
+            if value in ("", None, [], {}):
+                continue
+            step_response[str(field.get("name") or "").strip()] = value
+        if step_response:
+            existing_responses[f"step_{index}"] = step_response
+    return existing_responses
 
 
 def _wizard_label_field_name(field_name: str) -> str | None:
@@ -1344,7 +1865,11 @@ def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
     flat = data.get("flat") if isinstance(data.get("flat"), dict) else {}
     lines = [f"Scope: {ONBOARDING_SCOPE_LABELS.get(scope, scope.replace('_', ' ').title())}"]
 
-    primary_location = str(flat.get("primary_location_name") or "").strip()
+    primary_location_mode = str(flat.get("primary_location_mode_label") or flat.get("primary_location_mode") or "").strip().lower()
+    primary_location = (
+        str(flat.get("primary_location_label") or "").strip()
+        or str(flat.get("primary_location_name") or "").strip()
+    )
     primary_location_type = (
         str(flat.get("primary_location_type_label") or "").strip()
         or str(flat.get("primary_location_type") or "").strip()
@@ -1353,7 +1878,8 @@ def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
         label = primary_location
         if primary_location_type:
             label = f"{label} ({primary_location_type})"
-        lines.append(f"Primary location: {label}")
+        prefix = "Existing primary location" if primary_location_mode == "existing" else "Primary location"
+        lines.append(f"{prefix}: {label}")
 
     additional_locations = _split_multiline_values(flat.get("additional_locations"))
     if additional_locations:
@@ -1441,6 +1967,1184 @@ def _onboarding_creation_request(scope: str, data: dict[str, Any]) -> str:
         "rather than only describing them. If any required detail is missing, ask one concise follow-up question.\n"
         f"Collected onboarding data JSON:\n{serialized}"
     )
+
+
+def _is_inventory_setup_payload(payload: dict[str, Any] | None, *, stage: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return (
+        str(payload.get("workflow") or "").strip().lower() == "inventory_setup_mutation"
+        and str(payload.get("workflow_stage") or "").strip().lower() == stage
+    )
+
+
+def _inventory_setup_action_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if any(token in normalized for token in ("parent of", "child of", "as parent of", "assign as parent", "set parent of")):
+        return "update_stock_location_parent"
+    if "location" in normalized and any(token in normalized for token in ("create", "add", "new", "set up", "setup")):
+        return "create_stock_location"
+    if "inventory" in normalized and any(token in normalized for token in ("create", "add", "new", "set up", "setup")):
+        return "create_inventory_item"
+    return None
+
+
+def _inventory_setup_action_label(action: str) -> str:
+    mapping = {
+        "create_inventory_item": "Create Inventory Item",
+        "create_stock_location": "Create Stock Location",
+        "update_stock_location_parent": "Update Stock Location Parent",
+    }
+    return mapping.get(action, action.replace("_", " ").title())
+
+
+def _clean_extracted_phrase(value: str | None) -> str | None:
+    text = str(value or "").strip().strip(".").strip()
+    if not text:
+        return None
+    return text
+
+
+def _parse_inventory_setup_prefill_from_text(action: str, text: str) -> dict[str, Any]:
+    prefill: dict[str, Any] = {}
+    if action == "create_inventory_item":
+        prefill.update(_parse_onboarding_prefill_from_text("inventory_setup", text))
+        direct_category = _extract_first_named_value(
+            text,
+            (
+                r"(?:^|\n)\s*(?:inventory\s+)?category\s*[:=-]\s*(?P<value>[^\n]+)",
+                r"\bcategory\s+(?:is|should be|as)\s+(?P<value>[^.]+)",
+            ),
+        )
+        if direct_category:
+            prefill["inventory_category_name"] = direct_category
+        return prefill
+
+    if action == "create_stock_location":
+        name = _extract_first_named_value(
+            text,
+            (
+                r"(?:^|\n)\s*(?:stock\s+)?location\s+name\s*[:=-]\s*(?P<value>[^\n]+)",
+                r"\b(?:create|add|new)\s+(?:a\s+)?(?:stock\s+)?location\s+(?:called|named)\s+(?P<value>[^,\n.]+)",
+            ),
+        )
+        if name:
+            prefill["location_name"] = name
+            prefill["location_type_name"] = _normalize_location_type_value(name)
+        location_type = _extract_first_named_value(
+            text,
+            (
+                r"(?:^|\n)\s*location\s+type\s*[:=-]\s*(?P<value>[^\n]+)",
+                r"\btype\s+(?:is|should be|as)\s+(?P<value>[^,\n.]+)",
+            ),
+        )
+        if location_type:
+            prefill["location_type_name"] = location_type
+        parent_name = _extract_first_named_value(
+            text,
+            (
+                r"(?:^|\n)\s*parent\s+location\s*[:=-]\s*(?P<value>[^\n]+)",
+                r"\bunder\s+(?P<value>[^,\n.]+)",
+            ),
+        )
+        if parent_name:
+            prefill["parent_location_name"] = parent_name
+        return prefill
+
+    if action == "update_stock_location_parent":
+        patterns = (
+            r"\bmake\s+(?P<child>.+?)\s+child\s+of\s+(?P<parent>[^.]+)",
+            r"\bset\s+parent\s+of\s+(?P<child>.+?)\s+to\s+(?P<parent>[^.]+)",
+            r"\bassign\s+(?P<parent>.+?)\s+as\s+parent\s+of\s+(?P<child>[^.]+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            child_name = _clean_extracted_phrase(match.group("child"))
+            parent_name = _clean_extracted_phrase(match.group("parent"))
+            if child_name:
+                prefill["location_name"] = child_name
+            if parent_name:
+                prefill["parent_location_name"] = parent_name
+            if prefill:
+                return prefill
+        return prefill
+
+    return prefill
+
+
+async def _load_lookup_options_by_tool_name(
+    lookup_tool: str,
+    *,
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> list[dict[str, Any]]:
+    relation_spec = next(
+        (item for item in _relation_lookup_specs(tool_specs) if item.get("lookup_tool") == lookup_tool),
+        None,
+    )
+    if relation_spec is None:
+        return []
+    return await _load_relation_options(
+        relation_spec,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+        cache={},
+    )
+
+
+async def _load_stock_location_type_options(
+    *,
+    tool_names: set[str],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> list[dict[str, Any]]:
+    if "inventory.list_stock_location_types" not in tool_names:
+        return []
+    try:
+        output = await tool_executor.call_tool(
+            name="inventory.list_stock_location_types",
+            arguments={"limit": 25},
+            ctx=tool_ctx,
+        )
+    except Exception:
+        return []
+    coerced = _coerce_mapping_from_tool_output(output)
+    if not isinstance(coerced, dict):
+        return []
+    results = coerced.get("results")
+    if not isinstance(results, list):
+        return []
+    options: list[dict[str, Any]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        name = _first_string(item, ["name", "label"])
+        if not name:
+            continue
+        options.append({"value": name, "label": name})
+    return options
+
+
+def _inventory_setup_prefill_option_value(options: list[dict[str, Any]], desired_name: str | None) -> Any:
+    desired = re.sub(r"\s+", " ", str(desired_name or "").strip().lower())
+    if not desired:
+        return None
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        label = re.sub(r"\s+", " ", str(option.get("label") or "").strip().lower())
+        value = re.sub(r"\s+", " ", str(option.get("value") or "").strip().lower())
+        if desired == label or desired == value or desired in label:
+            return option.get("value")
+    return None
+
+
+async def _inventory_setup_dynamic_form_payload(
+    *,
+    action: str,
+    text: str,
+    tool_names: set[str],
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any] | None:
+    prefill = _parse_inventory_setup_prefill_from_text(action, text)
+    stock_location_options: list[dict[str, Any]] = []
+    inventory_category_options: list[dict[str, Any]] = []
+    location_type_options: list[dict[str, Any]] = []
+
+    if action in {"create_stock_location", "update_stock_location_parent"}:
+        stock_location_options = await _load_lookup_options_by_tool_name(
+            "inventory.list_stock_locations" if "inventory.list_stock_locations" in tool_names else "inventory.search_stock_locations",
+            tool_specs=tool_specs,
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+        )
+    if action == "create_inventory_item":
+        inventory_category_options = await _load_lookup_options_by_tool_name(
+            "inventory.list_inventory_categories",
+            tool_specs=tool_specs,
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+        )
+    if action == "create_stock_location":
+        location_type_options = await _load_stock_location_type_options(
+            tool_names=tool_names,
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+        )
+
+    if action == "create_inventory_item":
+        fields = [
+            {
+                "name": "default_inventory_name",
+                "type": "text",
+                "label": "Inventory Name",
+                "required": True,
+                "placeholder": "Main Inventory",
+            },
+            {
+                "name": "inventory_description",
+                "type": "textarea",
+                "label": "Inventory Description",
+                "required": False,
+                "placeholder": "Primary stock ledger for the business.",
+            },
+            {
+                "name": "inventory_category_id",
+                "type": "select",
+                "label": "Inventory Category",
+                "required": False,
+                "options": inventory_category_options,
+                "placeholder": "Select a category if this inventory should belong to one",
+            },
+        ]
+        current_values = {
+            "default_inventory_name": prefill.get("default_inventory_name"),
+            "inventory_description": prefill.get("inventory_description"),
+            "inventory_category_id": _inventory_setup_prefill_option_value(
+                inventory_category_options,
+                str(prefill.get("inventory_category_name") or "").strip() or None,
+            ),
+        }
+        description = (
+            "I translated your request into an inventory setup form. Confirm or edit the details before I create anything. "
+            "Category is optional and will be left blank unless you choose one."
+        )
+    elif action == "create_stock_location":
+        fields = [
+            {
+                "name": "location_name",
+                "type": "text",
+                "label": "Location Name",
+                "required": True,
+                "placeholder": "Returns Rack",
+            },
+            {
+                "name": "location_type_name",
+                "type": "select",
+                "label": "Location Type",
+                "required": False,
+                "options": location_type_options,
+                "placeholder": "Select a location type",
+            },
+            {
+                "name": "parent_id",
+                "type": "select",
+                "label": "Parent Location",
+                "required": False,
+                "options": stock_location_options,
+                "placeholder": "Select a parent location",
+            },
+            {
+                "name": "structural",
+                "type": "boolean",
+                "label": "Structural Location",
+                "required": False,
+            },
+        ]
+        current_values = {
+            "location_name": prefill.get("location_name"),
+            "location_type_name": str(prefill.get("location_type_name") or "").strip() or None,
+            "parent_id": _inventory_setup_prefill_option_value(
+                stock_location_options,
+                str(prefill.get("parent_location_name") or "").strip() or None,
+            ),
+        }
+        description = "Confirm the stock location details before I create it."
+    elif action == "update_stock_location_parent":
+        fields = [
+            {
+                "name": "location_id",
+                "type": "select",
+                "label": "Location to Update",
+                "required": True,
+                "options": stock_location_options,
+                "placeholder": "Select the location you want to update",
+            },
+            {
+                "name": "parent_id",
+                "type": "select",
+                "label": "New Parent Location",
+                "required": True,
+                "options": stock_location_options,
+                "placeholder": "Select the new parent location",
+            },
+        ]
+        current_values = {
+            "location_id": _inventory_setup_prefill_option_value(
+                stock_location_options,
+                str(prefill.get("location_name") or "").strip() or None,
+            ),
+            "parent_id": _inventory_setup_prefill_option_value(
+                stock_location_options,
+                str(prefill.get("parent_location_name") or "").strip() or None,
+            ),
+        }
+        description = "Choose the child location and the parent location, then I will apply the relationship update."
+    else:
+        return None
+
+    current_values = {
+        key: value
+        for key, value in current_values.items()
+        if value not in (None, "", [], {})
+    }
+    payload = {
+        "interaction_type": "dynamic_form",
+        "title": _inventory_setup_action_label(action),
+        "description": description,
+        "fields": fields,
+        "current_values": current_values,
+    }
+    return _with_interaction_metadata(
+        payload,
+        workflow="inventory_setup_mutation",
+        workflow_stage="form",
+        mutation_action=action,
+    )
+
+
+def _inventory_setup_form_response_data(response: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        return {}
+    data = response.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _inventory_setup_execute_action(
+    *,
+    action: str,
+    form_data: dict[str, Any],
+    tool_specs: list[ToolSpec],
+) -> tuple[str, dict[str, Any], list[str]]:
+    if action == "create_inventory_item":
+        operation = _build_inventory_operation(
+            tool_specs=tool_specs,
+            company_context=None,
+            inventory_name=str(form_data.get("default_inventory_name") or "").strip(),
+            inventory_description=str(form_data.get("inventory_description") or "").strip() or None,
+            related_location_id=None,
+            related_location_name=None,
+            category_id=str(form_data.get("inventory_category_id") or "").strip() or None,
+            category_name=None,
+            category_ref=None,
+        )
+        return operation["tool_name"], operation["arguments"], list(operation.get("missing_required") or [])
+
+    if action == "create_stock_location":
+        operation = _build_stock_location_operation(
+            tool_specs=tool_specs,
+            company_context=None,
+            location_name=str(form_data.get("location_name") or "").strip(),
+            location_type=str(form_data.get("location_type_name") or "").strip() or None,
+            primary=False,
+            structural=bool(form_data.get("structural")),
+            parent_location_id=str(form_data.get("parent_id") or "").strip() or None,
+        )
+        return operation["tool_name"], operation["arguments"], list(operation.get("missing_required") or [])
+
+    if action == "update_stock_location_parent":
+        spec = _tool_spec_by_name(tool_specs, "inventory.update_stock_location")
+        payload_spec = _nested_object_tool_spec(spec, "payload")
+        arguments: dict[str, Any] = {}
+        _set_schema_arg(arguments, spec, ["location_id", "locationId"], str(form_data.get("location_id") or "").strip() or None)
+        payload_arguments: dict[str, Any] = {}
+        _set_schema_arg(payload_arguments, payload_spec, ["parent_id", "parentId"], str(form_data.get("parent_id") or "").strip() or None)
+        if payload_arguments:
+            arguments["payload"] = payload_arguments
+        filtered = _filtered_tool_arguments(spec, arguments)
+        return "inventory.update_stock_location", filtered, _missing_required_arguments(spec, filtered)
+
+    return "", {}, ["unsupported_action"]
+
+
+def _product_catalog_admin_action_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if "product" in normalized and any(token in normalized for token in ("update", "edit", "rename", "change")):
+        return "update_product"
+    if "product" in normalized and any(token in normalized for token in ("create", "add", "new", "set up", "setup")):
+        return "create_product"
+    return None
+
+
+def _inventory_fulfillment_action_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if any(token in normalized for token in ("transfer", "move stock", "move inventory", "relocate")):
+        return "transfer_location_stock"
+    if any(token in normalized for token in ("adjust", "increase stock", "decrease stock", "remove stock", "add stock")):
+        return "adjust_inventory_item_stock"
+    return None
+
+
+def _product_catalog_admin_action_label(action: str) -> str:
+    mapping = {
+        "create_product": "Create Product",
+        "update_product": "Update Product",
+    }
+    return mapping.get(action, action.replace("_", " ").title())
+
+
+def _inventory_fulfillment_action_label(action: str) -> str:
+    mapping = {
+        "adjust_inventory_item_stock": "Adjust Inventory Stock",
+        "transfer_location_stock": "Transfer Stock",
+    }
+    return mapping.get(action, action.replace("_", " ").title())
+
+
+def _extract_decimal_text(text: str) -> str | None:
+    match = re.search(r"\b(\d+(?:\.\d+)?)\b", text)
+    return match.group(1) if match else None
+
+
+def _parse_product_catalog_admin_prefill_from_text(action: str, text: str) -> dict[str, Any]:
+    prefill: dict[str, Any] = {}
+    name = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*product\s+name\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"\b(?:create|add|new|update|edit)\s+(?:a\s+)?product\s+(?:called|named)?\s*(?P<value>[^,\n.]+)",
+            r"\b(?:for|of)\s+product\s+(?P<value>[^,\n.]+)",
+        ),
+    )
+    if name:
+        prefill["name"] = name
+    category_name = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*(?:product\s+)?category\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"\bcategory\s+(?:is|should be|as)\s+(?P<value>[^,\n.]+)",
+        ),
+    )
+    if category_name:
+        prefill["category_name"] = category_name
+    description = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*description\s*[:=-]\s*(?P<value>[^\n]+)",
+        ),
+    )
+    if description:
+        prefill["description"] = description
+    price = _extract_decimal_text(text)
+    if price and any(token in _normalize_user_text(text) for token in ("price", "base price", "sell for", "selling price")):
+        prefill["base_price"] = price
+    if "quick sale" in _normalize_user_text(text):
+        prefill["quick_sale"] = True
+    return prefill
+
+
+def _parse_inventory_fulfillment_prefill_from_text(action: str, text: str) -> dict[str, Any]:
+    prefill: dict[str, Any] = {}
+    item_name = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*(?:inventory\s+)?item\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"\b(?:transfer|adjust|move)\s+(?P<value>[^,\n]+?)\s+(?:from|to|by|into)\b",
+        ),
+    )
+    if item_name:
+        prefill["inventory_item_name"] = item_name
+    from_location = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*from\s+location\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"\bfrom\s+(?P<value>.+?)\s+to\b",
+        ),
+    )
+    if from_location:
+        prefill["from_location_name"] = from_location
+    to_location = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*to\s+location\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"\bto\s+(?P<value>.+?)(?:\s+quantity\b|$|[.,])",
+        ),
+    )
+    if to_location:
+        prefill["to_location_name"] = to_location
+    quantity = _extract_decimal_text(text)
+    if quantity:
+        prefill["quantity"] = quantity
+    normalized = _normalize_user_text(text)
+    if action == "adjust_inventory_item_stock":
+        if any(token in normalized for token in ("remove", "decrease", "reduce", "deduct")):
+            prefill["adjustment_type"] = "remove"
+        elif any(token in normalized for token in ("add", "increase", "restock")):
+            prefill["adjustment_type"] = "add"
+    return prefill
+
+
+async def _product_catalog_admin_dynamic_form_payload(
+    *,
+    action: str,
+    text: str,
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any] | None:
+    prefill = _parse_product_catalog_admin_prefill_from_text(action, text)
+    category_options = await _load_lookup_options_by_tool_name(
+        "product.get_product_categories",
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    product_options = await _load_lookup_options_by_tool_name(
+        "product.search_products",
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    common_fields = [
+        {"name": "name", "type": "text", "label": "Product Name", "required": True, "placeholder": "Men's Oxford Shirt"},
+        {"name": "description", "type": "textarea", "label": "Description", "required": False, "placeholder": "Short product description"},
+        {"name": "category_ref_id", "type": "select", "label": "Product Category", "required": False, "options": category_options, "placeholder": "Select a category"},
+        {"name": "base_price", "type": "text", "label": "Base Price", "required": False, "placeholder": "25000"},
+        {"name": "quick_sale", "type": "boolean", "label": "Quick Sale", "required": False},
+        {"name": "pos_category", "type": "text", "label": "POS Category", "required": False, "placeholder": "Clothing"},
+    ]
+    current_values = {
+        "name": prefill.get("name"),
+        "description": prefill.get("description"),
+        "category_ref_id": _inventory_setup_prefill_option_value(category_options, prefill.get("category_name")),
+        "base_price": prefill.get("base_price"),
+        "quick_sale": prefill.get("quick_sale"),
+    }
+    if action == "update_product":
+        fields = [
+            {"name": "product_id", "type": "select", "label": "Product to Update", "required": True, "options": product_options, "placeholder": "Select a product"},
+            *common_fields,
+        ]
+        current_values["product_id"] = _inventory_setup_prefill_option_value(product_options, prefill.get("name"))
+        description = "Confirm the product changes before I update it."
+    elif action == "create_product":
+        fields = common_fields
+        description = "I translated your request into a product form. Confirm or edit it before I create anything."
+    else:
+        return None
+    return _with_interaction_metadata(
+        {
+            "interaction_type": "dynamic_form",
+            "title": _product_catalog_admin_action_label(action),
+            "description": description,
+            "fields": fields,
+            "current_values": {key: value for key, value in current_values.items() if value not in (None, "", [], {})},
+        },
+        workflow="product_catalog_admin_mutation",
+        workflow_stage="form",
+        mutation_action=action,
+    )
+
+
+def _product_catalog_admin_execute_action(
+    *,
+    action: str,
+    form_data: dict[str, Any],
+    tool_specs: list[ToolSpec],
+) -> tuple[str, dict[str, Any], list[str]]:
+    tool_name = "product.create_product" if action == "create_product" else "product.update_product"
+    spec = _tool_spec_by_name(tool_specs, tool_name)
+    payload_spec = _nested_object_tool_spec(spec, "payload")
+    arguments: dict[str, Any] = {}
+    if action == "update_product":
+        _set_schema_arg(arguments, spec, ["product_id", "productId"], str(form_data.get("product_id") or "").strip() or None)
+    payload_arguments: dict[str, Any] = {}
+    _set_schema_arg(payload_arguments, payload_spec, ["name"], str(form_data.get("name") or "").strip() or None)
+    _set_schema_arg(payload_arguments, payload_spec, ["description"], str(form_data.get("description") or "").strip() or None)
+    _set_schema_arg(payload_arguments, payload_spec, ["category_ref_id", "categoryRefId"], str(form_data.get("category_ref_id") or "").strip() or None)
+    _set_schema_arg(payload_arguments, payload_spec, ["base_price", "basePrice"], str(form_data.get("base_price") or "").strip() or None)
+    if "quick_sale" in form_data:
+        _set_schema_arg(payload_arguments, payload_spec, ["quick_sale", "quickSale"], bool(form_data.get("quick_sale")))
+    _set_schema_arg(payload_arguments, payload_spec, ["pos_category", "posCategory"], str(form_data.get("pos_category") or "").strip() or None)
+    if payload_arguments:
+        arguments["payload"] = payload_arguments
+    filtered = _filtered_tool_arguments(spec, arguments)
+    return tool_name, filtered, _missing_required_arguments(spec, filtered)
+
+
+async def _inventory_fulfillment_dynamic_form_payload(
+    *,
+    action: str,
+    text: str,
+    tool_names: set[str],
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any] | None:
+    prefill = _parse_inventory_fulfillment_prefill_from_text(action, text)
+    stock_location_lookup = "inventory.list_stock_locations" if "inventory.list_stock_locations" in tool_names else "inventory.search_stock_locations"
+    inventory_item_lookup = "inventory.list_inventory_items" if "inventory.list_inventory_items" in tool_names else "inventory.search_inventory_items"
+    location_options = await _load_lookup_options_by_tool_name(
+        stock_location_lookup,
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    inventory_item_options = await _load_lookup_options_by_tool_name(
+        inventory_item_lookup,
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    if action == "transfer_location_stock":
+        fields = [
+            {"name": "inventory_item_id", "type": "select", "label": "Inventory Item", "required": True, "options": inventory_item_options, "placeholder": "Select an inventory item"},
+            {"name": "from_location_id", "type": "select", "label": "Source Location", "required": True, "options": location_options, "placeholder": "Select the source location"},
+            {"name": "to_location_id", "type": "select", "label": "Destination Location", "required": True, "options": location_options, "placeholder": "Select the destination location"},
+            {"name": "quantity", "type": "text", "label": "Quantity", "required": True, "placeholder": "10"},
+            {"name": "reason", "type": "text", "label": "Reason", "required": False, "placeholder": "Rebalancing stock"},
+            {"name": "notes", "type": "textarea", "label": "Notes", "required": False, "placeholder": "Optional transfer notes"},
+        ]
+        current_values = {
+            "inventory_item_id": _inventory_setup_prefill_option_value(inventory_item_options, prefill.get("inventory_item_name")),
+            "from_location_id": _inventory_setup_prefill_option_value(location_options, prefill.get("from_location_name")),
+            "to_location_id": _inventory_setup_prefill_option_value(location_options, prefill.get("to_location_name")),
+            "quantity": prefill.get("quantity"),
+        }
+        description = "Confirm the stock transfer details before I move anything."
+    elif action == "adjust_inventory_item_stock":
+        fields = [
+            {"name": "inventory_item_id", "type": "select", "label": "Inventory Item", "required": True, "options": inventory_item_options, "placeholder": "Select an inventory item"},
+            {"name": "stock_location_id", "type": "select", "label": "Stock Location", "required": False, "options": location_options, "placeholder": "Select a location if the adjustment is location-specific"},
+            {"name": "quantity", "type": "text", "label": "Quantity Change", "required": True, "placeholder": "5"},
+            {"name": "adjustment_type", "type": "select", "label": "Adjustment Type", "required": True, "options": [{"value": "add", "label": "Add"}, {"value": "remove", "label": "Remove"}], "placeholder": "Select adjustment type"},
+            {"name": "reason", "type": "text", "label": "Reason", "required": False, "placeholder": "Cycle count correction"},
+            {"name": "notes", "type": "textarea", "label": "Notes", "required": False, "placeholder": "Optional adjustment notes"},
+        ]
+        current_values = {
+            "inventory_item_id": _inventory_setup_prefill_option_value(inventory_item_options, prefill.get("inventory_item_name")),
+            "stock_location_id": _inventory_setup_prefill_option_value(location_options, prefill.get("from_location_name")),
+            "quantity": prefill.get("quantity"),
+            "adjustment_type": prefill.get("adjustment_type"),
+        }
+        description = "Confirm the stock adjustment details before I apply it."
+    else:
+        return None
+    return _with_interaction_metadata(
+        {
+            "interaction_type": "dynamic_form",
+            "title": _inventory_fulfillment_action_label(action),
+            "description": description,
+            "fields": fields,
+            "current_values": {key: value for key, value in current_values.items() if value not in (None, "", [], {})},
+        },
+        workflow="inventory_fulfillment_mutation",
+        workflow_stage="form",
+        mutation_action=action,
+    )
+
+
+def _inventory_fulfillment_execute_action(
+    *,
+    action: str,
+    form_data: dict[str, Any],
+    tool_specs: list[ToolSpec],
+) -> tuple[str, dict[str, Any], list[str]]:
+    if action == "transfer_location_stock":
+        spec = _tool_spec_by_name(tool_specs, "inventory.transfer_location_stock")
+        payload_spec = _nested_object_tool_spec(spec, "payload")
+        arguments: dict[str, Any] = {}
+        from_location_id = str(form_data.get("from_location_id") or "").strip() or None
+        _set_schema_arg(arguments, spec, ["location_id", "locationId"], from_location_id)
+        payload_arguments: dict[str, Any] = {}
+        transfer_line = {
+            "inventory_item_id": str(form_data.get("inventory_item_id") or "").strip() or None,
+            "from_location_id": from_location_id,
+            "to_location_id": str(form_data.get("to_location_id") or "").strip() or None,
+            "quantity": str(form_data.get("quantity") or "").strip() or None,
+            "notes": str(form_data.get("notes") or "").strip() or None,
+        }
+        _set_schema_arg(payload_arguments, payload_spec, ["transfers"], [transfer_line])
+        _set_schema_arg(payload_arguments, payload_spec, ["reason"], str(form_data.get("reason") or "").strip() or None)
+        _set_schema_arg(payload_arguments, payload_spec, ["notes"], str(form_data.get("notes") or "").strip() or None)
+        if payload_arguments:
+            arguments["payload"] = payload_arguments
+        filtered = _filtered_tool_arguments(spec, arguments)
+        return "inventory.transfer_location_stock", filtered, _missing_required_arguments(spec, filtered)
+
+    if action == "adjust_inventory_item_stock":
+        spec = _tool_spec_by_name(tool_specs, "inventory.adjust_inventory_item_stock")
+        payload_spec = _nested_object_tool_spec(spec, "payload")
+        arguments: dict[str, Any] = {}
+        _set_schema_arg(arguments, spec, ["inventory_item_id", "inventoryItemId"], str(form_data.get("inventory_item_id") or "").strip() or None)
+        payload_arguments: dict[str, Any] = {}
+        adjustment_line = {
+            "inventory_item_id": str(form_data.get("inventory_item_id") or "").strip() or None,
+            "stock_location_id": str(form_data.get("stock_location_id") or "").strip() or None,
+            "quantity": str(form_data.get("quantity") or "").strip() or None,
+            "adjustment_type": str(form_data.get("adjustment_type") or "").strip() or None,
+            "notes": str(form_data.get("notes") or "").strip() or None,
+        }
+        _set_schema_arg(payload_arguments, payload_spec, ["adjustments"], [adjustment_line])
+        _set_schema_arg(payload_arguments, payload_spec, ["reason"], str(form_data.get("reason") or "").strip() or None)
+        _set_schema_arg(payload_arguments, payload_spec, ["notes"], str(form_data.get("notes") or "").strip() or None)
+        if payload_arguments:
+            arguments["payload"] = payload_arguments
+        filtered = _filtered_tool_arguments(spec, arguments)
+        return "inventory.adjust_inventory_item_stock", filtered, _missing_required_arguments(spec, filtered)
+
+    return "", {}, ["unsupported_action"]
+
+
+def _inventory_procurement_action_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if "purchase order" in normalized and (
+        any(token in normalized for token in ("add item", "add line item", "add inventory", "add sku", "add product"))
+        or ("add " in normalized and " to purchase order" in normalized)
+    ):
+        return "add_purchase_order_line_item"
+    return None
+
+
+def _product_merchandising_action_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if any(
+        token in normalized
+        for token in ("quick sale", "featured", "merchandis", "pos category", "product category")
+    ):
+        return "update_product_merchandising"
+    return None
+
+
+def _product_pricing_action_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if "pricing strategy" in normalized or "margin strategy" in normalized or "price strategy" in normalized:
+        return "create_pricing_strategy"
+    if "pricing rule" in normalized or "discount rule" in normalized or "promo rule" in normalized:
+        return "create_pricing_rule"
+    return None
+
+
+def _inventory_procurement_action_label(action: str) -> str:
+    mapping = {
+        "add_purchase_order_line_item": "Add Purchase Order Line Item",
+    }
+    return mapping.get(action, action.replace("_", " ").title())
+
+
+def _product_merchandising_action_label(action: str) -> str:
+    mapping = {
+        "update_product_merchandising": "Update Product Merchandising",
+    }
+    return mapping.get(action, action.replace("_", " ").title())
+
+
+def _product_pricing_action_label(action: str) -> str:
+    mapping = {
+        "create_pricing_strategy": "Create Pricing Strategy",
+        "create_pricing_rule": "Create Pricing Rule",
+    }
+    return mapping.get(action, action.replace("_", " ").title())
+
+
+def _parse_inventory_procurement_prefill_from_text(action: str, text: str) -> dict[str, Any]:
+    _ = action
+    prefill: dict[str, Any] = {}
+    order_name = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*(?:purchase\s+order|po)\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"\bto\s+purchase\s+order\s+(?P<value>[^,\n.]+)",
+        ),
+    )
+    if order_name:
+        prefill["purchase_order_name"] = order_name
+    item_name = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*(?:inventory\s+item|item|sku)\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"\badd\s+(?P<value>.+?)\s+to\s+purchase\s+order\b",
+        ),
+    )
+    if item_name:
+        prefill["inventory_item_name"] = item_name
+    quantity = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*quantity\s*[:=-]?\s*(?P<value>\d+(?:\.\d+)?)",
+            r"\bqty\s*[:=-]?\s*(?P<value>\d+(?:\.\d+)?)",
+        ),
+    )
+    if not quantity:
+        quantity = _extract_decimal_text(text)
+    if quantity:
+        prefill["quantity"] = quantity
+    unit_price = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*(?:unit\s+price|price)\s*[:=-]\s*(?P<value>[^\n]+)",
+        ),
+    )
+    if unit_price:
+        prefill["unit_price"] = _clean_extracted_phrase(unit_price)
+    return prefill
+
+
+def _parse_product_merchandising_prefill_from_text(action: str, text: str) -> dict[str, Any]:
+    _ = action
+    prefill = _parse_product_catalog_admin_prefill_from_text("update_product", text)
+    normalized = _normalize_user_text(text)
+    if "quick sale" in normalized:
+        if any(token in normalized for token in ("disable", "turn off", "remove", "not")):
+            prefill["quick_sale"] = False
+        else:
+            prefill["quick_sale"] = True
+    if "featured" in normalized:
+        if any(token in normalized for token in ("unfeature", "disable", "remove", "not featured")):
+            prefill["is_featured"] = False
+        else:
+            prefill["is_featured"] = True
+    pos_category = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*pos\s+category\s*[:=-]\s*(?P<value>[^\n]+)",
+        ),
+    )
+    if pos_category:
+        prefill["pos_category"] = pos_category
+    return prefill
+
+
+def _parse_product_pricing_prefill_from_text(action: str, text: str) -> dict[str, Any]:
+    prefill: dict[str, Any] = {}
+    name = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*(?:strategy|rule)\s+name\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"\b(?:create|add)\s+(?:a\s+)?(?:pricing\s+strategy|pricing\s+rule)\s+(?:called|named)?\s*(?P<value>[^,\n.]+)",
+        ),
+    )
+    if name:
+        prefill["name"] = name
+    if action == "create_pricing_strategy":
+        normalized = _normalize_user_text(text)
+        if "margin" in normalized:
+            prefill["strategy"] = "margin"
+        elif "multiplier" in normalized:
+            prefill["strategy"] = "multiplier"
+        elif "fixed" in normalized:
+            prefill["strategy"] = "fixed"
+        elif "tier" in normalized:
+            prefill["strategy"] = "tiered"
+        elif "dynamic" in normalized:
+            prefill["strategy"] = "dynamic"
+        margin = _extract_first_named_value(text, (r"(?:margin|margin percentage)\s*[:=-]?\s*(?P<value>\d+(?:\.\d+)?)",))
+        if margin:
+            prefill["margin_percentage"] = margin
+    else:
+        normalized = _normalize_user_text(text)
+        if "promo" in normalized:
+            prefill["rule_type"] = "PROMO"
+        elif "season" in normalized:
+            prefill["rule_type"] = "SEASONAL"
+        elif "volume" in normalized:
+            prefill["rule_type"] = "VOLUME"
+        elif "clearance" in normalized:
+            prefill["rule_type"] = "CLEARANCE"
+        elif "bundle" in normalized:
+            prefill["rule_type"] = "BUNDLE"
+        else:
+            prefill["rule_type"] = "PROMO"
+        value = _extract_first_named_value(text, (r"(?:discount|value)\s*[:=-]?\s*(?P<value>\d+(?:\.\d+)?)",))
+        if value:
+            prefill["value"] = value
+        category_name = _extract_first_named_value(
+            text,
+            (
+                r"(?:^|\n)\s*(?:product\s+)?category\s*[:=-]\s*(?P<value>[^\n]+)",
+            ),
+        )
+        if category_name:
+            prefill["category_name"] = category_name
+    product_name = _extract_first_named_value(
+        text,
+        (
+            r"(?:^|\n)\s*product\s*[:=-]\s*(?P<value>[^\n]+)",
+            r"\bfor\s+product\s+(?P<value>[^,\n.]+)",
+        ),
+    )
+    if product_name:
+        prefill["product_name"] = product_name
+    return prefill
+
+
+async def _inventory_procurement_dynamic_form_payload(
+    *,
+    action: str,
+    text: str,
+    tool_names: set[str],
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any] | None:
+    prefill = _parse_inventory_procurement_prefill_from_text(action, text)
+    po_options = await _load_lookup_options_by_tool_name(
+        "inventory.search_purchase_orders",
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    inventory_item_lookup = "inventory.list_inventory_items" if "inventory.list_inventory_items" in tool_names else "inventory.search_inventory_items"
+    inventory_item_options = await _load_lookup_options_by_tool_name(
+        inventory_item_lookup,
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    if action != "add_purchase_order_line_item":
+        return None
+    return _with_interaction_metadata(
+        {
+            "interaction_type": "dynamic_form",
+            "title": _inventory_procurement_action_label(action),
+            "description": "Confirm the purchase-order line item details before I add it.",
+            "fields": [
+                {"name": "purchase_order_id", "type": "select", "label": "Purchase Order", "required": True, "options": po_options, "placeholder": "Select a purchase order"},
+                {"name": "inventory_item_id", "type": "select", "label": "Inventory Item", "required": True, "options": inventory_item_options, "placeholder": "Select an inventory item"},
+                {"name": "quantity", "type": "text", "label": "Quantity", "required": True, "placeholder": "20"},
+                {"name": "unit_price", "type": "text", "label": "Unit Price", "required": True, "placeholder": "15000"},
+                {"name": "description", "type": "textarea", "label": "Description", "required": False, "placeholder": "Optional line-item description"},
+            ],
+            "current_values": {
+                key: value
+                for key, value in {
+                    "purchase_order_id": _inventory_setup_prefill_option_value(po_options, prefill.get("purchase_order_name")),
+                    "inventory_item_id": _inventory_setup_prefill_option_value(inventory_item_options, prefill.get("inventory_item_name")),
+                    "quantity": prefill.get("quantity"),
+                    "unit_price": prefill.get("unit_price"),
+                }.items()
+                if value not in (None, "", [], {})
+            },
+        },
+        workflow="inventory_procurement_mutation",
+        workflow_stage="form",
+        mutation_action=action,
+    )
+
+
+def _inventory_procurement_execute_action(
+    *,
+    action: str,
+    form_data: dict[str, Any],
+    tool_specs: list[ToolSpec],
+) -> tuple[str, dict[str, Any], list[str]]:
+    if action != "add_purchase_order_line_item":
+        return "", {}, ["unsupported_action"]
+    spec = _tool_spec_by_name(tool_specs, "inventory.add_purchase_order_line_item")
+    payload_spec = _nested_object_tool_spec(spec, "payload")
+    arguments: dict[str, Any] = {}
+    _set_schema_arg(arguments, spec, ["purchase_order_id", "purchaseOrderId"], str(form_data.get("purchase_order_id") or "").strip() or None)
+    payload_arguments: dict[str, Any] = {}
+    _set_schema_arg(payload_arguments, payload_spec, ["inventory_item_id", "inventoryItemId"], str(form_data.get("inventory_item_id") or "").strip() or None)
+    _set_schema_arg(payload_arguments, payload_spec, ["quantity"], str(form_data.get("quantity") or "").strip() or None)
+    _set_schema_arg(payload_arguments, payload_spec, ["unit_price", "unitPrice"], str(form_data.get("unit_price") or "").strip() or None)
+    _set_schema_arg(payload_arguments, payload_spec, ["description"], str(form_data.get("description") or "").strip() or None)
+    if payload_arguments:
+        arguments["payload"] = payload_arguments
+    filtered = _filtered_tool_arguments(spec, arguments)
+    return "inventory.add_purchase_order_line_item", filtered, _missing_required_arguments(spec, filtered)
+
+
+async def _product_merchandising_dynamic_form_payload(
+    *,
+    action: str,
+    text: str,
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any] | None:
+    prefill = _parse_product_merchandising_prefill_from_text(action, text)
+    product_options = await _load_lookup_options_by_tool_name(
+        "product.search_products",
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    category_options = await _load_lookup_options_by_tool_name(
+        "product.get_product_categories",
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    if action != "update_product_merchandising":
+        return None
+    return _with_interaction_metadata(
+        {
+            "interaction_type": "dynamic_form",
+            "title": _product_merchandising_action_label(action),
+            "description": "Confirm the merchandising changes before I update the product.",
+            "fields": [
+                {"name": "product_id", "type": "select", "label": "Product", "required": True, "options": product_options, "placeholder": "Select a product"},
+                {"name": "category_ref_id", "type": "select", "label": "Product Category", "required": False, "options": category_options, "placeholder": "Select a category"},
+                {"name": "quick_sale", "type": "boolean", "label": "Quick Sale", "required": False},
+                {"name": "is_featured", "type": "boolean", "label": "Featured", "required": False},
+                {"name": "pos_category", "type": "text", "label": "POS Category", "required": False, "placeholder": "Clothing"},
+            ],
+            "current_values": {
+                key: value
+                for key, value in {
+                    "product_id": _inventory_setup_prefill_option_value(product_options, prefill.get("name")),
+                    "category_ref_id": _inventory_setup_prefill_option_value(category_options, prefill.get("category_name")),
+                    "quick_sale": prefill.get("quick_sale"),
+                    "is_featured": prefill.get("is_featured"),
+                    "pos_category": prefill.get("pos_category"),
+                }.items()
+                if value not in (None, "", [], {})
+            },
+        },
+        workflow="product_merchandising_mutation",
+        workflow_stage="form",
+        mutation_action=action,
+    )
+
+
+def _product_merchandising_execute_action(
+    *,
+    action: str,
+    form_data: dict[str, Any],
+    tool_specs: list[ToolSpec],
+) -> tuple[str, dict[str, Any], list[str]]:
+    if action != "update_product_merchandising":
+        return "", {}, ["unsupported_action"]
+    spec = _tool_spec_by_name(tool_specs, "product.update_product")
+    payload_spec = _nested_object_tool_spec(spec, "payload")
+    arguments: dict[str, Any] = {}
+    _set_schema_arg(arguments, spec, ["product_id", "productId"], str(form_data.get("product_id") or "").strip() or None)
+    payload_arguments: dict[str, Any] = {}
+    _set_schema_arg(payload_arguments, payload_spec, ["category_ref_id", "categoryRefId"], str(form_data.get("category_ref_id") or "").strip() or None)
+    if "quick_sale" in form_data:
+        _set_schema_arg(payload_arguments, payload_spec, ["quick_sale", "quickSale"], bool(form_data.get("quick_sale")))
+    if "is_featured" in form_data:
+        _set_schema_arg(payload_arguments, payload_spec, ["is_featured", "isFeatured"], bool(form_data.get("is_featured")))
+    _set_schema_arg(payload_arguments, payload_spec, ["pos_category", "posCategory"], str(form_data.get("pos_category") or "").strip() or None)
+    if payload_arguments:
+        arguments["payload"] = payload_arguments
+    filtered = _filtered_tool_arguments(spec, arguments)
+    return "product.update_product", filtered, _missing_required_arguments(spec, filtered)
+
+
+async def _product_pricing_dynamic_form_payload(
+    *,
+    action: str,
+    text: str,
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any] | None:
+    prefill = _parse_product_pricing_prefill_from_text(action, text)
+    product_options = await _load_lookup_options_by_tool_name(
+        "product.search_products",
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    category_options = await _load_lookup_options_by_tool_name(
+        "product.get_product_categories",
+        tool_specs=tool_specs,
+        tool_executor=tool_executor,
+        tool_ctx=tool_ctx,
+    )
+    if action == "create_pricing_strategy":
+        return _with_interaction_metadata(
+            {
+                "interaction_type": "dynamic_form",
+                "title": _product_pricing_action_label(action),
+                "description": "Confirm the pricing strategy details before I create it.",
+                "fields": [
+                    {"name": "name", "type": "text", "label": "Strategy Name", "required": True, "placeholder": "Fashion Margin Strategy"},
+                    {"name": "strategy", "type": "select", "label": "Strategy Type", "required": True, "options": [{"value": "margin", "label": "Margin"}, {"value": "multiplier", "label": "Multiplier"}, {"value": "fixed", "label": "Fixed"}, {"value": "dynamic", "label": "Dynamic"}, {"value": "tiered", "label": "Tiered"}], "placeholder": "Select a strategy"},
+                    {"name": "product_id", "type": "select", "label": "Product", "required": False, "options": product_options, "placeholder": "Select a product"},
+                    {"name": "margin_percentage", "type": "text", "label": "Margin Percentage", "required": False, "placeholder": "25"},
+                    {"name": "market_multiplier", "type": "text", "label": "Market Multiplier", "required": False, "placeholder": "1.2"},
+                    {"name": "min_price", "type": "text", "label": "Minimum Price", "required": False, "placeholder": "10000"},
+                    {"name": "max_price", "type": "text", "label": "Maximum Price", "required": False, "placeholder": "50000"},
+                ],
+                "current_values": {
+                    key: value
+                    for key, value in {
+                        "name": prefill.get("name"),
+                        "strategy": prefill.get("strategy"),
+                        "product_id": _inventory_setup_prefill_option_value(product_options, prefill.get("product_name")),
+                        "margin_percentage": prefill.get("margin_percentage"),
+                    }.items()
+                    if value not in (None, "", [], {})
+                },
+            },
+            workflow="product_pricing_mutation",
+            workflow_stage="form",
+            mutation_action=action,
+        )
+    if action == "create_pricing_rule":
+        return _with_interaction_metadata(
+            {
+                "interaction_type": "dynamic_form",
+                "title": _product_pricing_action_label(action),
+                "description": "Confirm the pricing rule details before I create it.",
+                "fields": [
+                    {"name": "name", "type": "text", "label": "Rule Name", "required": True, "placeholder": "Weekend Promo"},
+                    {"name": "rule_type", "type": "select", "label": "Rule Type", "required": True, "options": [{"value": "PROMO", "label": "Promo"}, {"value": "SEASONAL", "label": "Seasonal"}, {"value": "VOLUME", "label": "Volume"}, {"value": "CLEARANCE", "label": "Clearance"}, {"value": "BUNDLE", "label": "Bundle"}], "placeholder": "Select a rule type"},
+                    {"name": "product_id", "type": "select", "label": "Product", "required": False, "options": product_options, "placeholder": "Select a product"},
+                    {"name": "category_ref_id", "type": "select", "label": "Product Category", "required": False, "options": category_options, "placeholder": "Select a category"},
+                    {"name": "discount_type", "type": "select", "label": "Discount Type", "required": True, "options": [{"value": "PERCENTAGE", "label": "Percentage"}, {"value": "FIXED_AMOUNT", "label": "Fixed Amount"}, {"value": "FIXED_PRICE", "label": "Fixed Price"}], "placeholder": "Select a discount type"},
+                    {"name": "value", "type": "text", "label": "Discount Value", "required": True, "placeholder": "10"},
+                    {"name": "description", "type": "textarea", "label": "Description", "required": False, "placeholder": "Optional rule description"},
+                ],
+                "current_values": {
+                    key: value
+                    for key, value in {
+                        "name": prefill.get("name"),
+                        "rule_type": prefill.get("rule_type"),
+                        "product_id": _inventory_setup_prefill_option_value(product_options, prefill.get("product_name")),
+                        "category_ref_id": _inventory_setup_prefill_option_value(category_options, prefill.get("category_name")),
+                        "value": prefill.get("value"),
+                        "discount_type": "PERCENTAGE",
+                    }.items()
+                    if value not in (None, "", [], {})
+                },
+            },
+            workflow="product_pricing_mutation",
+            workflow_stage="form",
+            mutation_action=action,
+        )
+    return None
+
+
+def _product_pricing_execute_action(
+    *,
+    action: str,
+    form_data: dict[str, Any],
+    tool_specs: list[ToolSpec],
+) -> tuple[str, dict[str, Any], list[str]]:
+    tool_name = "product.create_pricing_strategy" if action == "create_pricing_strategy" else "product.create_pricing_rule"
+    spec = _tool_spec_by_name(tool_specs, tool_name)
+    payload_spec = _nested_object_tool_spec(spec, "payload")
+    payload_arguments: dict[str, Any] = {}
+    if action == "create_pricing_strategy":
+        for key in ("name", "strategy", "product_id", "margin_percentage", "market_multiplier", "min_price", "max_price"):
+            _set_schema_arg(payload_arguments, payload_spec, [key], str(form_data.get(key) or "").strip() or None)
+    else:
+        for key in ("name", "rule_type", "product_id", "category_ref_id", "discount_type", "value", "description"):
+            _set_schema_arg(payload_arguments, payload_spec, [key], str(form_data.get(key) or "").strip() or None)
+    arguments = {"payload": payload_arguments} if payload_arguments else {}
+    filtered = _filtered_tool_arguments(spec, arguments)
+    return tool_name, filtered, _missing_required_arguments(spec, filtered)
 
 
 def _normalize_operation_key(value: str) -> str:
@@ -1913,6 +3617,62 @@ def _annotate_failed_operation(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _created_result_ref(semantic_key: str, *path: str) -> dict[str, Any]:
+    return {
+        "__ka2a_created_ref__": {
+            "semantic_key": semantic_key,
+            "path": list(path),
+        }
+    }
+
+
+def _extract_created_result_value(payload: Any, path: list[str]) -> Any:
+    current = payload
+    for part in path:
+        if not isinstance(current, dict):
+            current = None
+            break
+        current = current.get(part)
+        if current in (None, "", [], {}):
+            break
+    if current not in (None, "", [], {}):
+        return current
+
+    if path and path[-1] == "id" and isinstance(payload, dict):
+        direct_id = payload.get("id")
+        if direct_id not in (None, "", [], {}):
+            return direct_id
+    return None
+
+
+def _resolve_created_result_ref_value(ref: dict[str, Any], created_map: dict[str, dict[str, Any]]) -> Any:
+    meta = ref.get("__ka2a_created_ref__")
+    if not isinstance(meta, dict):
+        return ref
+    semantic_key = str(meta.get("semantic_key") or "").strip()
+    if not semantic_key:
+        raise ValueError("Missing semantic_key for created-result reference.")
+    created_entry = created_map.get(semantic_key)
+    if not isinstance(created_entry, dict):
+        raise KeyError(f"Missing created operation dependency: {semantic_key}")
+    result_payload = created_entry.get("result")
+    path = [str(item).strip() for item in meta.get("path") or [] if str(item).strip()]
+    resolved = _extract_created_result_value(result_payload, path) if path else result_payload
+    if resolved in (None, "", [], {}):
+        raise KeyError(f"Unable to resolve dependency output for {semantic_key}")
+    return resolved
+
+
+def _resolve_created_result_refs(value: Any, created_map: dict[str, dict[str, Any]]) -> Any:
+    if isinstance(value, dict):
+        if "__ka2a_created_ref__" in value:
+            return _resolve_created_result_ref_value(value, created_map)
+        return {key: _resolve_created_result_refs(item, created_map) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_created_result_refs(item, created_map) for item in value]
+    return value
+
+
 def _build_stock_location_operation(
     *,
     tool_specs: list[ToolSpec],
@@ -1920,13 +3680,55 @@ def _build_stock_location_operation(
     location_name: str,
     location_type: str | None,
     primary: bool,
+    structural: bool | None = None,
+    parent_location_id: str | None = None,
+    parent_location_ref: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     tool_name = "inventory.create_stock_location"
     spec = _tool_spec_by_name(tool_specs, tool_name)
     arguments = _company_context_arguments(spec, company_context)
+    base_argument_keys = set(arguments)
+    structural_value = primary if structural is None else structural
+    parent_value: Any = parent_location_id
+    if parent_value in (None, "", [], {}) and parent_location_ref is not None:
+        parent_value = parent_location_ref
     _set_schema_arg(arguments, spec, ["name", "location_name", "locationName", "stock_location_name", "stockLocationName"], location_name)
     _set_schema_arg(arguments, spec, ["type", "location_type", "locationType", "stock_location_type", "stockLocationType"], location_type)
     _set_schema_arg(arguments, spec, ["is_primary", "isPrimary", "primary"], primary)
+    _set_schema_arg(arguments, spec, ["structural", "is_structural", "isStructural"], structural_value)
+    parent_id_key = _match_schema_key(spec, ["parent_id", "parentId"])
+    if parent_id_key and parent_value not in (None, "", [], {}):
+        arguments[parent_id_key] = parent_value
+    location_type_name_key = _match_schema_key(spec, ["location_type_name", "locationTypeName"])
+    if location_type_name_key and location_type not in (None, "", [], {}):
+        arguments[location_type_name_key] = location_type
+
+    payload_spec = _nested_object_tool_spec(spec, "payload")
+    payload_required = "payload" in _tool_schema_required(spec)
+    top_level_args_added = bool(set(arguments) - base_argument_keys)
+    if payload_spec is not None and (payload_required or not top_level_args_added):
+        payload_arguments: dict[str, Any] = {}
+        _set_schema_arg(
+            payload_arguments,
+            payload_spec,
+            ["name", "location_name", "locationName", "stock_location_name", "stockLocationName"],
+            location_name,
+        )
+        _set_schema_arg(
+            payload_arguments,
+            payload_spec,
+            ["type", "location_type", "locationType", "stock_location_type", "stockLocationType"],
+            location_type,
+        )
+        _set_schema_arg(payload_arguments, payload_spec, ["structural", "is_structural", "isStructural"], structural_value)
+        payload_parent_id_key = _match_schema_key(payload_spec, ["parent_id", "parentId"])
+        if payload_parent_id_key and parent_value not in (None, "", [], {}):
+            payload_arguments[payload_parent_id_key] = parent_value
+        payload_location_type_name_key = _match_schema_key(payload_spec, ["location_type_name", "locationTypeName"])
+        if payload_location_type_name_key and location_type not in (None, "", [], {}):
+            payload_arguments[payload_location_type_name_key] = location_type
+        if payload_arguments:
+            arguments["payload"] = payload_arguments
     return {
         "tool_name": tool_name,
         "label": f"stock location '{location_name}'",
@@ -1942,11 +3744,38 @@ def _build_inventory_category_operation(
     tool_specs: list[ToolSpec],
     company_context: dict[str, Any] | None,
     category_name: str,
+    default_location_id: str | None = None,
+    default_location_ref: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     tool_name = "inventory.create_inventory_category"
     spec = _tool_spec_by_name(tool_specs, tool_name)
     arguments = _company_context_arguments(spec, company_context)
+    base_argument_keys = set(arguments)
+    location_value: Any = default_location_id
+    if location_value in (None, "", [], {}) and default_location_ref is not None:
+        location_value = default_location_ref
     _set_schema_arg(arguments, spec, ["name", "category_name", "categoryName", "title"], category_name)
+    default_location_key = _match_schema_key(
+        spec,
+        ["default_location_id", "defaultLocationId", "stock_location_id", "stockLocationId"],
+    )
+    if default_location_key and location_value not in (None, "", [], {}):
+        arguments[default_location_key] = location_value
+
+    payload_spec = _nested_object_tool_spec(spec, "payload")
+    payload_required = "payload" in _tool_schema_required(spec)
+    top_level_args_added = bool(set(arguments) - base_argument_keys)
+    if payload_spec is not None and (payload_required or not top_level_args_added):
+        payload_arguments: dict[str, Any] = {}
+        _set_schema_arg(payload_arguments, payload_spec, ["name", "category_name", "categoryName", "title"], category_name)
+        payload_location_key = _match_schema_key(
+            payload_spec,
+            ["default_location_id", "defaultLocationId", "stock_location_id", "stockLocationId"],
+        )
+        if payload_location_key and location_value not in (None, "", [], {}):
+            payload_arguments[payload_location_key] = location_value
+        if payload_arguments:
+            arguments["payload"] = payload_arguments
     return {
         "tool_name": tool_name,
         "label": f"inventory category '{category_name}'",
@@ -1967,12 +3796,16 @@ def _build_inventory_operation(
     related_location_name: str | None,
     category_id: str | None,
     category_name: str | None,
+    category_ref: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     tool_name = "inventory.create_inventory_item"
     spec = _tool_spec_by_name(tool_specs, tool_name)
     arguments = _company_context_arguments(spec, company_context)
     base_argument_keys = set(arguments)
-    _set_schema_arg(arguments, spec, ["name", "inventory_name", "inventoryName", "title"], inventory_name)
+    resolved_category_id: Any = category_id
+    if resolved_category_id in (None, "", [], {}) and category_ref is not None:
+        resolved_category_id = category_ref
+    _set_schema_arg(arguments, spec, ["name", "name_snapshot", "inventory_name", "inventoryName", "nameSnapshot", "title"], inventory_name)
     _set_schema_arg(arguments, spec, ["description", "inventory_description", "inventoryDescription", "notes"], inventory_description)
 
     location_id_key = _match_schema_key(
@@ -1993,8 +3826,8 @@ def _build_inventory_operation(
         spec,
         ["category_id", "categoryId", "inventory_category_id", "inventoryCategoryId", "default_category_id", "defaultCategoryId"],
     )
-    if category_id_key and category_id not in (None, "", [], {}):
-        arguments[category_id_key] = category_id
+    if category_id_key and resolved_category_id not in (None, "", [], {}):
+        arguments[category_id_key] = resolved_category_id
     else:
         _set_schema_arg(
             arguments,
@@ -2008,7 +3841,12 @@ def _build_inventory_operation(
     top_level_inventory_args_added = bool(set(arguments) - base_argument_keys)
     if payload_spec is not None and (payload_required or not top_level_inventory_args_added):
         payload_arguments: dict[str, Any] = {}
-        _set_schema_arg(payload_arguments, payload_spec, ["name", "inventory_name", "inventoryName", "title"], inventory_name)
+        _set_schema_arg(
+            payload_arguments,
+            payload_spec,
+            ["name", "name_snapshot", "inventory_name", "inventoryName", "nameSnapshot", "title"],
+            inventory_name,
+        )
         _set_schema_arg(
             payload_arguments,
             payload_spec,
@@ -2032,8 +3870,8 @@ def _build_inventory_operation(
             payload_spec,
             ["category_id", "categoryId", "inventory_category_id", "inventoryCategoryId", "default_category_id", "defaultCategoryId"],
         )
-        if payload_category_id_key and category_id not in (None, "", [], {}):
-            payload_arguments[payload_category_id_key] = category_id
+        if payload_category_id_key and resolved_category_id not in (None, "", [], {}):
+            payload_arguments[payload_category_id_key] = resolved_category_id
         else:
             _set_schema_arg(
                 payload_arguments,
@@ -2122,41 +3960,56 @@ def _onboarding_plan_operations(
 ) -> list[dict[str, Any]]:
     flat = onboarding_data.get("flat") if isinstance(onboarding_data.get("flat"), dict) else {}
     operations: list[dict[str, Any]] = []
+    primary_location_ref: dict[str, Any] | None = None
+    first_category_ref: dict[str, Any] | None = None
+    primary_location_id = str(flat.get("primary_location_id") or "").strip() or None
+    primary_location_name = str(flat.get("primary_location_name") or "").strip()
+    primary_location_type = str(flat.get("primary_location_type") or "").strip() or None
+    primary_location_mode = str(flat.get("primary_location_mode") or "").strip().lower() or (
+        "existing" if primary_location_id else "new"
+    )
 
     if scope in {"stock_locations", "full_setup"}:
-        primary_location_name = str(flat.get("primary_location_name") or "").strip()
-        primary_location_type = str(flat.get("primary_location_type") or "").strip() or None
-        if primary_location_name:
-            operations.append(
-                _build_stock_location_operation(
-                    tool_specs=tool_specs,
-                    company_context=company_context,
-                    location_name=primary_location_name,
-                    location_type=primary_location_type,
-                    primary=True,
-                )
+        if primary_location_mode == "existing" and primary_location_id:
+            primary_location_ref = primary_location_id
+        elif primary_location_name:
+            primary_operation = _build_stock_location_operation(
+                tool_specs=tool_specs,
+                company_context=company_context,
+                location_name=primary_location_name,
+                location_type=primary_location_type,
+                primary=True,
+                structural=True,
             )
+            operations.append(primary_operation)
+            primary_location_ref = _created_result_ref(primary_operation["semantic_key"], "location", "id")
         for location_name in _split_multiline_values(flat.get("additional_locations")):
             operations.append(
                 _build_stock_location_operation(
                     tool_specs=tool_specs,
                     company_context=company_context,
                     location_name=location_name,
-                    location_type=primary_location_type or "store",
+                    location_type=None,
                     primary=False,
+                    structural=False,
+                    parent_location_id=primary_location_id if primary_location_mode == "existing" else None,
+                    parent_location_ref=primary_location_ref if isinstance(primary_location_ref, dict) else None,
                 )
             )
 
     categories = _split_multiline_values(flat.get("category_names"))
     if scope in {"inventory_categories", "full_setup"}:
         for category_name in categories:
-            operations.append(
-                _build_inventory_category_operation(
-                    tool_specs=tool_specs,
-                    company_context=company_context,
-                    category_name=category_name,
-                )
+            category_operation = _build_inventory_category_operation(
+                tool_specs=tool_specs,
+                company_context=company_context,
+                category_name=category_name,
+                default_location_id=primary_location_id if primary_location_mode == "existing" else None,
+                default_location_ref=primary_location_ref if isinstance(primary_location_ref, dict) else None,
             )
+            operations.append(category_operation)
+            if first_category_ref is None:
+                first_category_ref = _created_result_ref(category_operation["semantic_key"], "category", "id")
 
     if scope in {"inventory_setup", "full_setup"}:
         inventory_name = str(flat.get("default_inventory_name") or "").strip()
@@ -2171,6 +4024,7 @@ def _onboarding_plan_operations(
                     related_location_name=(
                         str(flat.get("related_stock_location_label") or "").strip()
                         or str(flat.get("related_location_name") or "").strip()
+                        or str(flat.get("primary_location_label") or "").strip()
                         or str(flat.get("primary_location_name") or "").strip()
                         or None
                     ),
@@ -2180,6 +4034,7 @@ def _onboarding_plan_operations(
                         or str(flat.get("category_name") or "").strip()
                         or (categories[0] if categories else None)
                     ),
+                    category_ref=first_category_ref,
                 )
             )
 
@@ -2653,11 +4508,13 @@ def _relation_items_from_lookup_output(lookup_tool: str, output: Any) -> list[di
             return fallback
 
     if lookup_tool in {
+        "inventory.list_stock_locations",
         "inventory.search_stock_locations",
         "product.get_product_categories",
         "product.search_products",
         "inventory.list_inventory_items",
         "inventory.search_inventory_items",
+        "inventory.search_purchase_orders",
     }:
         results = output.get("results")
         if isinstance(results, list):
@@ -2671,7 +4528,7 @@ def _relation_item_has_identifier_and_label(item: dict[str, Any]) -> bool:
         _first_string(item, ["id", "uuid", "value"])
         and _first_string(
             item,
-            ["name", "title", "label", "inventory_item_name", "stock_location_name", "category"],
+            ["name", "title", "label", "inventory_item_name", "stock_location_name", "category", "order_no", "po_number"],
         )
     )
 
@@ -2729,6 +4586,8 @@ def _relation_option_from_item(lookup_tool: str, item: dict[str, Any]) -> dict[s
             "inventory_item_name",
             "stock_location_name",
             "category",
+            "order_no",
+            "po_number",
         ],
     )
     if not label:
@@ -2757,6 +4616,13 @@ def _relation_option_from_item(lookup_tool: str, item: dict[str, Any]) -> dict[s
         category = _first_string(item, ["inventory_category", "category"])
         if category:
             description_parts.append(category)
+    elif lookup_tool == "inventory.search_purchase_orders":
+        supplier_name = _first_string(item, ["supplier_name", "supplier"])
+        status = _first_string(item, ["status"])
+        if supplier_name:
+            description_parts.append(supplier_name)
+        if status:
+            description_parts.append(status)
 
     option: dict[str, Any] = {"value": identifier, "label": label}
     if description_parts:
@@ -2807,6 +4673,82 @@ def _sanitize_relation_prompt_text(value: str | None) -> str | None:
     text = re.sub(r"\buuids?\b", "options", text, flags=re.IGNORECASE)
     text = re.sub(r"\bidentifier[s]?\b", "options", text, flags=re.IGNORECASE)
     return text
+
+
+def _relation_tool_error_needs_select_recovery(error_text: str | None) -> bool:
+    lowered = str(error_text or "").strip().lower()
+    if not lowered:
+        return False
+    markers = (
+        "invalid uuid",
+        "not a valid uuid",
+        "badly formed hexadecimal uuid",
+        "uuid",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+async def _recover_relation_error_as_interaction(
+    *,
+    tool_name: str,
+    error_text: str | None,
+    tool_specs: list[ToolSpec],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any] | None:
+    if not _relation_tool_error_needs_select_recovery(error_text):
+        return None
+
+    spec = _tool_spec_by_name(tool_specs, tool_name)
+    if spec is None or not isinstance(spec.input_schema, dict):
+        return None
+
+    relation_cache: dict[str, list[dict[str, Any]]] = {}
+    fields: list[dict[str, Any]] = []
+    seen_field_names: set[str] = set()
+
+    for path, field_schema in _iter_schema_leaf_fields(spec.input_schema):
+        relation_specs = _matching_relation_specs_for_texts(tool_specs, path, str(field_schema.get("description") or ""))
+        if not relation_specs:
+            continue
+        options = await _load_relation_options(
+            relation_specs[0],
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            cache=relation_cache,
+        )
+        if not options:
+            continue
+        field_name = path.split(".")[-1].strip()
+        if not field_name or field_name in seen_field_names:
+            continue
+        seen_field_names.add(field_name)
+        fields.append(
+            {
+                "name": field_name,
+                "type": "select",
+                "label": relation_specs[0]["label"],
+                "required": True,
+                "options": options,
+                "placeholder": f"Select {relation_specs[0]['label']}",
+            }
+        )
+
+    if not fields:
+        return None
+
+    service_label = _service_label_from_tool_name(tool_name).title()
+    friendly_tool_name = tool_name.split(".", 1)[-1].replace("_", " ").strip().title()
+    description = _sanitize_relation_prompt_text(
+        f"The last {service_label.lower()} operation could not continue because one or more relation options were invalid. "
+        "Choose the correct backend options below and I will continue without asking for raw IDs."
+    )
+    return {
+        "interaction_type": "dynamic_form",
+        "title": f"{friendly_tool_name} Relation Setup",
+        "description": description,
+        "fields": fields,
+    }
 
 
 async def _rewrite_relation_interaction_payload(
@@ -3195,7 +5137,12 @@ def _ka2a_parts_from_model_content(content: Any) -> list[Any]:
     return [TextPart(text=str(content))]
 
 
-def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> TaskProcessor:
+def make_langgraph_chat_processor_from_env(
+    *,
+    agent_name: str | None = None,
+    system_prompt_override: str | None = None,
+    tool_executor_override: ToolExecutor | None | object = _TOOL_EXECUTOR_SENTINEL,
+) -> TaskProcessor:
     _require_lang()
 
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -3225,7 +5172,7 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             return _import_path("kafka_a2a.llms.gemini:create_chat_model")
         return _import_path("kafka_a2a.llms.openai_compat:create_chat_model")
 
-    system_prompt = resolve_system_prompt_from_env()
+    system_prompt = system_prompt_override if system_prompt_override is not None else resolve_system_prompt_from_env()
 
     tools_enabled = _parse_bool(os.getenv("KA2A_TOOLS_ENABLED"), default=False)
     tools_source = (os.getenv("KA2A_TOOLS_SOURCE") or "").strip().lower() or "off"
@@ -3270,7 +5217,10 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
 
         return None
 
-    tool_executor = _build_tool_executor()
+    if tool_executor_override is _TOOL_EXECUTOR_SENTINEL:
+        tool_executor = _build_tool_executor()
+    else:
+        tool_executor = tool_executor_override
 
     def _parts_from_model_content(content: Any, *, tool_names: set[str] | None = None) -> list[Any]:
         if isinstance(content, str):
@@ -3439,6 +5389,21 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
         metadata: dict[str, Any] | None,
     ) -> AsyncIterator[TaskEvent]:
         _ = configuration
+        user_text_for_memory = "\n".join([part.text for part in message.parts if isinstance(part, TextPart)]).strip()
+
+        if _is_simple_greeting_query(user_text_for_memory):
+            response_text = _agent_intro_text(agent_name)
+            response_parts = [TextPart(text=response_text)]
+            yield Artifact(name="result", parts=response_parts)
+            yield TaskStatus(
+                state=TaskState.completed,
+                message=Message(
+                    role=Role.agent,
+                    parts=response_parts,
+                    context_id=task.context_id,
+                ),
+            )
+            return
 
         creds = settings.resolve_llm_credentials(metadata=metadata, decrypt=decryptor)  # type: ignore[arg-type]
         if creds is None:
@@ -3454,7 +5419,6 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             llm = llm_factory(creds)
 
         user_content = _to_model_user_content(message)
-        user_text_for_memory = "\n".join([part.text for part in message.parts if isinstance(part, TextPart)]).strip()
         lc_messages: list[Any] = []
         mem = await _load_memory(context_id=task.context_id, metadata=metadata)
         sys = _system_prompt_with_memory(base=system_prompt, memory=mem)
@@ -3541,6 +5505,122 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
 
         last_interaction_payload = _last_agent_interaction_payload(task)
         interaction_response = _interaction_response_from_text(user_text_for_memory)
+        saved_workflow_state = await _load_workflow_state(context_id=task.context_id, metadata=metadata)
+
+        async def _update_host_orchestration_state_after_delegation(
+            *,
+            delegated_response: dict[str, Any],
+            original_request: str,
+            orchestration_plan: list[str] | None,
+            prior_completed_agents: list[str] | None = None,
+        ) -> dict[str, Any] | None:
+            nonlocal saved_workflow_state
+            if agent_name != "host":
+                return None
+            prior_state = saved_workflow_state if isinstance(saved_workflow_state, dict) else None
+            prior_plan = prior_state.get("plan") if isinstance(prior_state, dict) and isinstance(prior_state.get("plan"), list) else []
+            plan = [str(name).strip() for name in (orchestration_plan or prior_plan) if str(name).strip()]
+            if not plan:
+                if prior_state and str(prior_state.get("workflow") or "").strip().lower() == "host_orchestration":
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+                    saved_workflow_state = None
+                return None
+
+            prior_completed = (
+                [str(name).strip() for name in prior_state.get("completed_agents") or [] if str(name).strip()]
+                if isinstance(prior_state, dict)
+                else [str(name).strip() for name in (prior_completed_agents or []) if str(name).strip()]
+            )
+            delegated_agent = str(delegated_response.get("delegated_agent") or "").strip()
+            interaction_payload = _interaction_payload_from_parts(delegated_response.get("response_parts") or [])
+            remaining_agents = [name for name in plan if name not in prior_completed and name != delegated_agent]
+
+            if delegated_response.get("delegated_final_state") == TaskState.input_required and isinstance(interaction_payload, dict):
+                workflow_state = {
+                    "workflow": "host_orchestration",
+                    "status": "awaiting_specialist_input",
+                    "stage": "specialist_interaction",
+                    "original_request": original_request,
+                    "plan": plan,
+                    "current_agent": delegated_agent,
+                    "completed_agents": prior_completed,
+                    "remaining_agents": remaining_agents,
+                    "last_response_text": str(delegated_response.get("response_text") or "").strip(),
+                    "pending_interaction": interaction_payload,
+                }
+                delegated_task_id = str(delegated_response.get("delegated_task_id") or "").strip()
+                if delegated_task_id:
+                    workflow_state["delegated_task_id"] = delegated_task_id
+                await _save_workflow_state(
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    workflow_state=workflow_state,
+                )
+                saved_workflow_state = workflow_state
+                return None
+
+            completed_agents = list(prior_completed)
+            if delegated_response.get("delegated_final_state") == TaskState.completed and delegated_agent and delegated_agent not in completed_agents:
+                completed_agents.append(delegated_agent)
+            remaining_agents = [name for name in plan if name not in completed_agents]
+
+            if (
+                delegated_response.get("delegated_final_state") == TaskState.completed
+                and remaining_agents
+                and tool_executor is not None
+                and "create_multiple_choice" in tool_names
+            ):
+                try:
+                    interaction_output = await tool_executor.call_tool(
+                        name="create_multiple_choice",
+                        arguments=_host_orchestration_continue_arguments(
+                            {
+                                "current_agent": delegated_agent,
+                                "remaining_agents": remaining_agents,
+                                "last_response_text": str(delegated_response.get("response_text") or "").strip(),
+                            }
+                        ),
+                        ctx=tool_ctx,
+                    )
+                except Exception:
+                    interaction_output = None
+                if isinstance(interaction_output, dict):
+                    interaction_output = _with_interaction_metadata(
+                        interaction_output,
+                        workflow="host_orchestration",
+                        workflow_stage="continue_prompt",
+                        current_agent=delegated_agent,
+                        next_agent=remaining_agents[0],
+                        original_request=original_request,
+                        plan=plan,
+                        completed_agents=completed_agents,
+                        remaining_agents=remaining_agents,
+                        last_response_text=str(delegated_response.get("response_text") or "").strip(),
+                    )
+                    workflow_state = {
+                        "workflow": "host_orchestration",
+                        "status": "awaiting_continue_confirmation",
+                        "stage": "continue_prompt",
+                        "original_request": original_request,
+                        "plan": plan,
+                        "current_agent": delegated_agent,
+                        "completed_agents": completed_agents,
+                        "remaining_agents": remaining_agents,
+                        "last_response_text": str(delegated_response.get("response_text") or "").strip(),
+                        "pending_interaction": interaction_output,
+                    }
+                    await _save_workflow_state(
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        workflow_state=workflow_state,
+                    )
+                    saved_workflow_state = workflow_state
+                    return interaction_output
+
+            if prior_state and str(prior_state.get("workflow") or "").strip().lower() == "host_orchestration":
+                await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+                saved_workflow_state = None
+            return None
 
         if (
             agent_name == "host"
@@ -3553,9 +5633,31 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             agent_listing = await _load_host_agent_listing()
             available_names = sorted(_agent_listing_names(agent_listing, "agents"))
             registered_names = sorted(_agent_listing_names(agent_listing, "registered_agents"))
+            inferred_agent = _infer_domain_agent_name(user_text_for_memory)
             if registered_names:
                 labels = ", ".join(_friendly_agent_label(name) for name in registered_names)
-                if available_names != registered_names:
+                if inferred_agent and _is_host_availability_query(user_text_for_memory):
+                    if inferred_agent in set(available_names):
+                        label = _friendly_agent_label(inferred_agent)
+                        if available_names != registered_names:
+                            visible_labels = ", ".join(_friendly_agent_label(name) for name in available_names)
+                            response_text = (
+                                f"{label} is currently exposed to the host for routing. "
+                                f"Currently registered specialist agents: {labels}. "
+                                f"The host is currently configured to route to: {visible_labels}."
+                            )
+                        else:
+                            response_text = (
+                                f"{label} is currently exposed to the host for routing. "
+                                f"Currently registered specialist agents: {labels}."
+                            )
+                    else:
+                        response_text = _host_unavailable_agent_text(
+                            agent_name=inferred_agent,
+                            available_names=set(available_names),
+                            registered_names=set(registered_names),
+                        )
+                elif available_names != registered_names:
                     visible_labels = ", ".join(_friendly_agent_label(name) for name in available_names)
                     if visible_labels:
                         response_text = (
@@ -3575,6 +5677,237 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
             yield Artifact(name="result", parts=response_parts)
             yield TaskStatus(
                 state=TaskState.completed,
+                message=Message(
+                    role=Role.agent,
+                    parts=response_parts,
+                    context_id=task.context_id,
+                ),
+            )
+            await _maybe_update_memory(
+                llm=llm,
+                context_id=task.context_id,
+                metadata=metadata,
+                existing=mem,
+                history=history if isinstance(history, list) else None,
+                user_text=user_text_for_memory,
+                assistant_text=response_text,
+            )
+            return
+
+        if (
+            agent_name == "host"
+            and tool_executor is not None
+            and "delegate_to_agent" in tool_names
+            and interaction_response is not None
+            and _is_host_orchestration_payload(last_interaction_payload, stage="continue_prompt")
+        ):
+            orchestration_state = (
+                saved_workflow_state
+                if isinstance(saved_workflow_state, dict)
+                and str(saved_workflow_state.get("workflow") or "").strip().lower() == "host_orchestration"
+                else last_interaction_payload
+            )
+            selected_value = _selected_interaction_value(interaction_response) or "stop_here"
+            if selected_value != "continue_next":
+                await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+                saved_workflow_state = None
+                response_text = "Okay. I’ll stop here. Ask whenever you want to continue the remaining work."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.completed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+            remaining_agents = (
+                [str(name).strip() for name in orchestration_state.get("remaining_agents") or [] if str(name).strip()]
+                if isinstance(orchestration_state, dict) and isinstance(orchestration_state.get("remaining_agents"), list)
+                else []
+            )
+            next_agent = remaining_agents[0] if remaining_agents else ""
+            if not next_agent:
+                await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+                saved_workflow_state = None
+                response_text = "There are no remaining specialist steps to continue."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.completed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                return
+
+            yield TaskStatus(
+                state=TaskState.working,
+                message=Message(
+                    role=Role.agent,
+                    parts=[TextPart(text=f"Continuing the workflow with the {_friendly_agent_label(next_agent)} specialist.")],
+                    context_id=task.context_id,
+                ),
+            )
+
+            try:
+                delegated = await tool_executor.call_tool(
+                    name="delegate_to_agent",
+                    arguments={
+                        "request": _host_orchestration_next_request(
+                            orchestration_state if isinstance(orchestration_state, dict) else {},
+                            next_agent,
+                        ),
+                        "agent_name": next_agent,
+                    },
+                    ctx=tool_ctx,
+                )
+            except Exception as exc:
+                response_text = str(exc).strip() or "Delegation failed."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+            delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=next_agent)
+            if delegated_response is None:
+                response_text = "Delegation did not return a usable result."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+            yield Artifact(
+                name="delegation",
+                parts=[
+                    DataPart(
+                        data={
+                            "selectedAgent": delegated_response["delegated_agent"],
+                            "delegatedTaskId": delegated_response["delegated_task_id"],
+                            "finalState": delegated_response["delegated_final_state"].value,
+                            "statusUpdates": delegated_response["status_updates"],
+                        }
+                    )
+                ],
+            )
+
+            for update in delegated_response["status_updates"]:
+                if not isinstance(update, dict) or bool(update.get("final")):
+                    continue
+                state_value = _coerce_task_state(update.get("state"), default=TaskState.working)
+                message_text = _format_delegation_status_text(
+                    agent_name=delegated_response["delegated_agent"],
+                    state=state_value,
+                    message=str(update.get("message") or "").strip() or None,
+                )
+                yield TaskStatus(
+                    state=state_value,
+                    message=Message(
+                        role=Role.agent,
+                        parts=[TextPart(text=message_text)],
+                        context_id=task.context_id,
+                    ),
+                )
+
+            for artifact_name, payload in delegated_response["child_artifacts"].items():
+                if not isinstance(artifact_name, str) or not artifact_name.strip():
+                    continue
+                parts = _ka2a_parts_from_model_content(payload)
+                if parts:
+                    yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
+
+            orchestration_output = await _update_host_orchestration_state_after_delegation(
+                delegated_response=delegated_response,
+                original_request=(
+                    str(orchestration_state.get("original_request") or "").strip()
+                    if isinstance(orchestration_state, dict)
+                    else ""
+                ),
+                orchestration_plan=(
+                    [str(name).strip() for name in orchestration_state.get("plan") or [] if str(name).strip()]
+                    if isinstance(orchestration_state, dict)
+                    else []
+                ),
+                prior_completed_agents=(
+                    [str(name).strip() for name in orchestration_state.get("completed_agents") or [] if str(name).strip()]
+                    if isinstance(orchestration_state, dict)
+                    else []
+                ),
+            )
+            if isinstance(orchestration_output, dict):
+                response_parts = [DataPart(data=orchestration_output)]
+                response_text = json.dumps(orchestration_output, ensure_ascii=False)
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.input_required,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+            response_parts = delegated_response["response_parts"]
+            response_text = delegated_response["response_text"]
+            yield Artifact(name="result", parts=response_parts)
+            yield TaskStatus(
+                state=delegated_response["delegated_final_state"],
                 message=Message(
                     role=Role.agent,
                     parts=response_parts,
@@ -3811,6 +6144,42 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 parts = _ka2a_parts_from_model_content(payload)
                 if parts:
                     yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
+
+            orchestration_output = await _update_host_orchestration_state_after_delegation(
+                delegated_response=delegated_response,
+                original_request=(
+                    str(saved_workflow_state.get("original_request") or "").strip()
+                    if isinstance(saved_workflow_state, dict)
+                    else ""
+                ),
+                orchestration_plan=(
+                    [str(name).strip() for name in saved_workflow_state.get("plan") or [] if str(name).strip()]
+                    if isinstance(saved_workflow_state, dict)
+                    else []
+                ),
+            )
+            if isinstance(orchestration_output, dict):
+                response_parts = [DataPart(data=orchestration_output)]
+                response_text = json.dumps(orchestration_output, ensure_ascii=False)
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.input_required,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
 
             response_parts = delegated_response["response_parts"]
             response_text = delegated_response["response_text"]
@@ -4711,9 +7080,11 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         continue
 
                     try:
+                        raw_arguments = operation.get("arguments") if isinstance(operation.get("arguments"), dict) else {}
+                        resolved_arguments = _resolve_created_result_refs(raw_arguments, created_map)
                         output = await tool_executor.call_tool(
                             name=tool_name,
-                            arguments=operation.get("arguments") if isinstance(operation.get("arguments"), dict) else {},
+                            arguments=resolved_arguments,
                             ctx=tool_ctx,
                         )
                         any_tool_executed = True
@@ -4721,9 +7092,20 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                             "label": operation.get("label"),
                             "tool_name": tool_name,
                             "operation_type": operation.get("operation_type"),
-                            "arguments": operation.get("arguments"),
+                            "arguments": resolved_arguments,
                             "result": output if isinstance(output, dict) else {"value": str(output)},
                         }
+                    except (KeyError, ValueError) as exc:
+                        failed_items.append(
+                            _annotate_failed_operation(
+                                {
+                                    "label": operation.get("label"),
+                                    "tool_name": tool_name,
+                                    "reason": "dependency_resolution_failed",
+                                    "error": str(exc),
+                                }
+                            )
+                        )
                     except Exception as exc:
                         failed_items.append(
                             _annotate_failed_operation(
@@ -4948,6 +7330,74 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                             )
                             return
 
+                direct_scope = _infer_onboarding_scope_from_text(user_text_for_memory or "")
+                direct_prefill = _parse_onboarding_prefill_from_text(
+                    direct_scope or "full_setup",
+                    user_text_for_memory or "",
+                )
+                if direct_scope and direct_prefill and "create_wizard_flow" in tool_names:
+                    company_context = await _maybe_active_company_context()
+                    try:
+                        interaction_output = await tool_executor.call_tool(
+                            name="create_wizard_flow",
+                            arguments=_onboarding_wizard_arguments(direct_scope),
+                            ctx=tool_ctx,
+                        )
+                    except Exception:
+                        interaction_output = None
+
+                    if isinstance(interaction_output, dict):
+                        interaction_output = await _rewrite_relation_interaction_dict(
+                            interaction_output,
+                            tool_specs=tool_specs,
+                            tool_executor=tool_executor,
+                            tool_ctx=tool_ctx,
+                        )
+                        existing_responses = _build_onboarding_existing_responses(
+                            direct_scope,
+                            wizard_payload=interaction_output,
+                            prefill_data=direct_prefill,
+                        )
+                        if existing_responses:
+                            interaction_output["existing_responses"] = existing_responses
+                        interaction_output = _with_interaction_metadata(
+                            interaction_output,
+                            workflow="inventory_onboarding",
+                            workflow_stage="wizard",
+                            onboarding_scope=direct_scope,
+                        )
+                        interaction_output["description"] = (
+                            "I prefilled this setup from your message. Review it, correct anything that is off, "
+                            "and complete any remaining fields before I create anything."
+                        )
+                        workflow_state = {
+                            "workflow": "inventory_onboarding",
+                            "status": "collecting",
+                            "stage": "wizard",
+                            "scope": direct_scope,
+                            "pending_interaction": interaction_output,
+                            "existing_responses": existing_responses,
+                        }
+                        if company_context:
+                            workflow_state["company_context"] = company_context
+                        await _save_workflow_state(
+                            context_id=task.context_id,
+                            metadata=metadata,
+                            workflow_state=workflow_state,
+                        )
+                        response_text = json.dumps(interaction_output, ensure_ascii=False)
+                        response_parts = [DataPart(data=interaction_output)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
+
                 company_context = await _maybe_active_company_context()
                 description = "Choose the setup area you want to complete first. I will guide you step by step."
                 if isinstance(company_context, dict):
@@ -4994,6 +7444,266 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         ),
                     )
                     return
+
+        if agent_name in {"inventory_setup", "product_catalog_admin", "inventory_fulfillment", "inventory_procurement", "product_merchandising", "product_pricing"} and tool_executor is not None:
+            interaction_payload_matches = False
+            if agent_name == "inventory_setup":
+                interaction_payload_matches = _is_inventory_setup_payload(last_interaction_payload, stage="form")
+            elif isinstance(last_interaction_payload, dict):
+                interaction_payload_matches = (
+                    str(last_interaction_payload.get("workflow") or "").strip().lower() == f"{agent_name}_mutation"
+                    and str(last_interaction_payload.get("workflow_stage") or "").strip().lower() == "form"
+                )
+
+            if interaction_response is not None and interaction_payload_matches:
+                action = str(last_interaction_payload.get("mutation_action") or "").strip()
+                form_data = _inventory_setup_form_response_data(interaction_response)
+                if agent_name == "inventory_setup":
+                    tool_name, arguments, missing_required = _inventory_setup_execute_action(
+                        action=action,
+                        form_data=form_data,
+                        tool_specs=tool_specs,
+                    )
+                elif agent_name == "product_catalog_admin":
+                    tool_name, arguments, missing_required = _product_catalog_admin_execute_action(
+                        action=action,
+                        form_data=form_data,
+                        tool_specs=tool_specs,
+                    )
+                elif agent_name == "inventory_fulfillment":
+                    tool_name, arguments, missing_required = _inventory_fulfillment_execute_action(
+                        action=action,
+                        form_data=form_data,
+                        tool_specs=tool_specs,
+                    )
+                elif agent_name == "inventory_procurement":
+                    tool_name, arguments, missing_required = _inventory_procurement_execute_action(
+                        action=action,
+                        form_data=form_data,
+                        tool_specs=tool_specs,
+                    )
+                elif agent_name == "product_merchandising":
+                    tool_name, arguments, missing_required = _product_merchandising_execute_action(
+                        action=action,
+                        form_data=form_data,
+                        tool_specs=tool_specs,
+                    )
+                else:
+                    tool_name, arguments, missing_required = _product_pricing_execute_action(
+                        action=action,
+                        form_data=form_data,
+                        tool_specs=tool_specs,
+                    )
+                if missing_required:
+                    response_text = (
+                        "I still need a few required fields before I can continue: "
+                        + ", ".join(missing_required)
+                    )
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
+
+                try:
+                    output = await tool_executor.call_tool(
+                        name=tool_name,
+                        arguments=arguments,
+                        ctx=tool_ctx,
+                    )
+                except Exception as exc:
+                    recovered = await _recover_relation_error_as_interaction(
+                        tool_name=tool_name,
+                        error_text=str(exc),
+                        tool_specs=tool_specs,
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                    )
+                    if isinstance(recovered, dict):
+                        recovered = _with_interaction_metadata(
+                            recovered,
+                            workflow="inventory_setup_mutation",
+                            workflow_stage="form",
+                            mutation_action=action,
+                        )
+                        response_parts = [DataPart(data=recovered)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
+                    response_text = str(exc).strip() or "The inventory setup operation failed."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+                success_messages = {
+                    "create_inventory_item": "Inventory item created successfully.",
+                    "create_stock_location": "Stock location created successfully.",
+                    "update_stock_location_parent": "Stock location parent updated successfully.",
+                    "create_product": "Product created successfully.",
+                    "update_product": "Product updated successfully.",
+                    "transfer_location_stock": "Stock transfer completed successfully.",
+                    "adjust_inventory_item_stock": "Inventory adjustment completed successfully.",
+                    "add_purchase_order_line_item": "Purchase-order line item added successfully.",
+                    "update_product_merchandising": "Product merchandising updated successfully.",
+                    "create_pricing_strategy": "Pricing strategy created successfully.",
+                    "create_pricing_rule": "Pricing rule created successfully.",
+                }
+                response_text = success_messages.get(action, "Requested operation completed successfully.")
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name=f"{agent_name}.operation", parts=[DataPart(data=output if isinstance(output, dict) else {"value": output})])
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.completed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                )
+                return
+
+            if interaction_response is None and user_text_for_memory:
+                action = None
+                if agent_name == "inventory_setup":
+                    action = _inventory_setup_action_from_text(user_text_for_memory)
+                elif agent_name == "product_catalog_admin":
+                    action = _product_catalog_admin_action_from_text(user_text_for_memory)
+                elif agent_name == "inventory_fulfillment":
+                    action = _inventory_fulfillment_action_from_text(user_text_for_memory)
+                elif agent_name == "inventory_procurement":
+                    action = _inventory_procurement_action_from_text(user_text_for_memory)
+                elif agent_name == "product_merchandising":
+                    action = _product_merchandising_action_from_text(user_text_for_memory)
+                else:
+                    action = _product_pricing_action_from_text(user_text_for_memory)
+                if action:
+                    if agent_name == "inventory_setup":
+                        interaction_output = await _inventory_setup_dynamic_form_payload(
+                            action=action,
+                            text=user_text_for_memory,
+                            tool_names=tool_names,
+                            tool_specs=tool_specs,
+                            tool_executor=tool_executor,
+                            tool_ctx=tool_ctx,
+                        )
+                    elif agent_name == "product_catalog_admin":
+                        interaction_output = await _product_catalog_admin_dynamic_form_payload(
+                            action=action,
+                            text=user_text_for_memory,
+                            tool_specs=tool_specs,
+                            tool_executor=tool_executor,
+                            tool_ctx=tool_ctx,
+                        )
+                    elif agent_name == "inventory_fulfillment":
+                        interaction_output = await _inventory_fulfillment_dynamic_form_payload(
+                            action=action,
+                            text=user_text_for_memory,
+                            tool_names=tool_names,
+                            tool_specs=tool_specs,
+                            tool_executor=tool_executor,
+                            tool_ctx=tool_ctx,
+                        )
+                    elif agent_name == "inventory_procurement":
+                        interaction_output = await _inventory_procurement_dynamic_form_payload(
+                            action=action,
+                            text=user_text_for_memory,
+                            tool_names=tool_names,
+                            tool_specs=tool_specs,
+                            tool_executor=tool_executor,
+                            tool_ctx=tool_ctx,
+                        )
+                    elif agent_name == "product_merchandising":
+                        interaction_output = await _product_merchandising_dynamic_form_payload(
+                            action=action,
+                            text=user_text_for_memory,
+                            tool_specs=tool_specs,
+                            tool_executor=tool_executor,
+                            tool_ctx=tool_ctx,
+                        )
+                    else:
+                        interaction_output = await _product_pricing_dynamic_form_payload(
+                            action=action,
+                            text=user_text_for_memory,
+                            tool_specs=tool_specs,
+                            tool_executor=tool_executor,
+                            tool_ctx=tool_ctx,
+                        )
+                    if isinstance(interaction_output, dict):
+                        if "create_dynamic_form" in tool_names:
+                            try:
+                                rendered_output = await tool_executor.call_tool(
+                                    name="create_dynamic_form",
+                                    arguments={
+                                        "title": interaction_output.get("title"),
+                                        "description": interaction_output.get("description"),
+                                        "fields": interaction_output.get("fields"),
+                                    },
+                                    ctx=tool_ctx,
+                                )
+                            except Exception:
+                                rendered_output = interaction_output
+                            else:
+                                if isinstance(rendered_output, dict):
+                                    rendered_output.update(
+                                        {
+                                            "current_values": interaction_output.get("current_values", {}),
+                                            "workflow": interaction_output.get("workflow"),
+                                            "workflow_stage": interaction_output.get("workflow_stage"),
+                                            "mutation_action": interaction_output.get("mutation_action"),
+                                        }
+                                    )
+                                    interaction_output = rendered_output
+                        response_text = json.dumps(interaction_output, ensure_ascii=False)
+                        response_parts = [DataPart(data=interaction_output)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
 
         if (
             agent_name in ROUTER_AGENT_NAMES
@@ -5119,6 +7829,34 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     parts = _ka2a_parts_from_model_content(payload)
                     if parts:
                         yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
+
+                orchestration_output = await _update_host_orchestration_state_after_delegation(
+                    delegated_response=delegated_response,
+                    original_request=user_text_for_memory,
+                    orchestration_plan=None,
+                )
+                if isinstance(orchestration_output, dict):
+                    response_parts = [DataPart(data=orchestration_output)]
+                    response_text = json.dumps(orchestration_output, ensure_ascii=False)
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
 
                 response_parts = delegated_response["response_parts"]
                 response_text = delegated_response["response_text"]
@@ -5351,6 +8089,34 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                     if parts:
                         yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
 
+                orchestration_output = await _update_host_orchestration_state_after_delegation(
+                    delegated_response=delegated_response,
+                    original_request=user_text_for_memory,
+                    orchestration_plan=_host_orchestration_plan(user_text_for_memory, agent_summaries),
+                )
+                if isinstance(orchestration_output, dict):
+                    response_parts = [DataPart(data=orchestration_output)]
+                    response_text = json.dumps(orchestration_output, ensure_ascii=False)
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
                 response_parts = delegated_response["response_parts"]
                 response_text = delegated_response["response_text"]
                 yield Artifact(name="result", parts=response_parts)
@@ -5435,6 +8201,38 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                         )
 
                 yield Artifact(name="tool_results", parts=tool_results)
+                interaction_output = next(
+                    (
+                        result.output
+                        for result in tool_results
+                        if not result.is_error
+                        and isinstance(result.output, dict)
+                        and str(result.output.get("interaction_type") or result.output.get("type") or "").strip()
+                    ),
+                    None,
+                )
+                if isinstance(interaction_output, dict):
+                    response_parts = [DataPart(data=interaction_output)]
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
                 delegated_output = next(
                     (
                         result.output
@@ -5503,6 +8301,27 @@ def make_langgraph_chat_processor_from_env(*, agent_name: str | None = None) -> 
                 if isinstance(interaction_output, dict):
                     response_text = json.dumps(interaction_output, ensure_ascii=False)
                     response_parts = [DataPart(data=interaction_output)]
+                    break
+
+                relation_error_interaction: dict[str, Any] | None = None
+                for result in tool_results:
+                    if not result.is_error or not isinstance(result.output, dict):
+                        continue
+                    failed_tool_name = tool_call_names.get(result.tool_call_id)
+                    if not failed_tool_name:
+                        continue
+                    relation_error_interaction = await _recover_relation_error_as_interaction(
+                        tool_name=failed_tool_name,
+                        error_text=str(result.output.get("error") or "").strip() or None,
+                        tool_specs=tool_specs,
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                    )
+                    if relation_error_interaction is not None:
+                        break
+                if isinstance(relation_error_interaction, dict):
+                    response_text = json.dumps(relation_error_interaction, ensure_ascii=False)
+                    response_parts = [DataPart(data=relation_error_interaction)]
                     break
                 messages2.append(
                     HumanMessage(

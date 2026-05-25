@@ -55,6 +55,21 @@ class FakeRelationInteractionLlm:
         )
 
 
+class FakeUuidFailureLlm:
+    async def ainvoke(self, messages: list[Any], **kwargs: Any) -> Any:
+        global FAKE_LLM_CALL_COUNT
+        global FAKE_LLM_LAST_TOOLS
+        _ = messages
+        tools = kwargs.get("tools")
+        FAKE_LLM_CALL_COUNT += 1
+        FAKE_LLM_LAST_TOOLS = [tool.name for tool in tools] if isinstance(tools, list) else []
+        return SimpleNamespace(
+            content=(
+                '{"kind":"tool-call","name":"inventory.create_inventory_item","arguments":{"payload":{"name_snapshot":"Fashion Master Inventory","inventory_category_id":"not-a-uuid"}}}'
+            )
+        )
+
+
 class FakeToolExecutor(ToolExecutor):
     def __init__(
         self,
@@ -272,6 +287,19 @@ class FakeToolExecutor(ToolExecutor):
                     "required": ["title", "description", "steps", "allow_back", "show_progress"],
                 },
             ),
+            ToolSpec(
+                name="create_dynamic_form",
+                description="Render a dynamic form.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "fields": {"type": "array"},
+                    },
+                    "required": ["title", "description", "fields"],
+                },
+            ),
         ]
         if self._agent_name == "inventory_setup":
             return specs + [
@@ -282,6 +310,17 @@ class FakeToolExecutor(ToolExecutor):
                         "type": "object",
                         "properties": {
                             "query": {"type": "string"},
+                            "limit": {"type": "integer"},
+                        },
+                        "required": [],
+                    },
+                ),
+                ToolSpec(
+                    name="inventory.list_stock_locations",
+                    description="List stock locations.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
                             "limit": {"type": "integer"},
                         },
                         "required": [],
@@ -342,6 +381,272 @@ class FakeToolExecutor(ToolExecutor):
                         "required": ["payload"],
                     },
                 ),
+                ToolSpec(
+                    name="inventory.update_stock_location",
+                    description="Update a stock location.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "location_id": {"type": "string"},
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "parent_id": {
+                                        "type": "string",
+                                        "description": "UUID of parent StockLocation",
+                                    },
+                                },
+                                "required": [],
+                            },
+                        },
+                        "required": ["location_id", "payload"],
+                    },
+                ),
+            ]
+        if self._agent_name == "product_catalog_admin":
+            return specs + [
+                ToolSpec(
+                    name="product.get_product_categories",
+                    description="List product categories.",
+                    input_schema={"type": "object", "properties": {}, "required": []},
+                ),
+                ToolSpec(
+                    name="product.search_products",
+                    description="Search products.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer"},
+                        },
+                        "required": [],
+                    },
+                ),
+                ToolSpec(
+                    name="product.create_product",
+                    description="Create a product.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "category_ref_id": {"type": "string"},
+                                    "base_price": {"type": "string"},
+                                    "quick_sale": {"type": "boolean"},
+                                    "pos_category": {"type": "string"},
+                                },
+                                "required": ["name"],
+                            }
+                        },
+                        "required": ["payload"],
+                    },
+                ),
+                ToolSpec(
+                    name="product.update_product",
+                    description="Update a product.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "product_id": {"type": "string"},
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "category_ref_id": {"type": "string"},
+                                    "base_price": {"type": "string"},
+                                    "quick_sale": {"type": "boolean"},
+                                    "pos_category": {"type": "string"},
+                                },
+                                "required": [],
+                            },
+                        },
+                        "required": ["product_id", "payload"],
+                    },
+                ),
+            ]
+        if self._agent_name == "inventory_fulfillment":
+            return specs + [
+                ToolSpec(
+                    name="inventory.list_stock_locations",
+                    description="List stock locations.",
+                    input_schema={"type": "object", "properties": {"limit": {"type": "integer"}}, "required": []},
+                ),
+                ToolSpec(
+                    name="inventory.list_inventory_items",
+                    description="List inventory items.",
+                    input_schema={"type": "object", "properties": {}, "required": []},
+                ),
+                ToolSpec(
+                    name="inventory.transfer_location_stock",
+                    description="Transfer stock between locations.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "location_id": {"type": "string"},
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "transfers": {"type": "array"},
+                                    "reason": {"type": "string"},
+                                    "notes": {"type": "string"},
+                                },
+                                "required": ["transfers"],
+                            },
+                        },
+                        "required": ["location_id", "payload"],
+                    },
+                ),
+                ToolSpec(
+                    name="inventory.adjust_inventory_item_stock",
+                    description="Adjust stock on an inventory item.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "inventory_item_id": {"type": "string"},
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "adjustments": {"type": "array"},
+                                    "reason": {"type": "string"},
+                                    "notes": {"type": "string"},
+                                },
+                                "required": ["adjustments"],
+                            },
+                        },
+                        "required": ["inventory_item_id", "payload"],
+                    },
+                ),
+            ]
+        if self._agent_name == "inventory_procurement":
+            return specs + [
+                ToolSpec(
+                    name="inventory.search_purchase_orders",
+                    description="Search purchase orders.",
+                    input_schema={"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": []},
+                ),
+                ToolSpec(
+                    name="inventory.list_inventory_items",
+                    description="List inventory items.",
+                    input_schema={"type": "object", "properties": {}, "required": []},
+                ),
+                ToolSpec(
+                    name="inventory.add_purchase_order_line_item",
+                    description="Add purchase-order line item.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "purchase_order_id": {"type": "string"},
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "inventory_item_id": {"type": "string"},
+                                    "quantity": {"type": "string"},
+                                    "unit_price": {"type": "string"},
+                                    "description": {"type": "string"},
+                                },
+                                "required": ["inventory_item_id", "quantity", "unit_price"],
+                            },
+                        },
+                        "required": ["purchase_order_id", "payload"],
+                    },
+                ),
+            ]
+        if self._agent_name == "product_merchandising":
+            return specs + [
+                ToolSpec(
+                    name="product.search_products",
+                    description="Search products.",
+                    input_schema={"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": []},
+                ),
+                ToolSpec(
+                    name="product.get_product_categories",
+                    description="List product categories.",
+                    input_schema={"type": "object", "properties": {}, "required": []},
+                ),
+                ToolSpec(
+                    name="product.update_product",
+                    description="Update a product.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "product_id": {"type": "string"},
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "category_ref_id": {"type": "string"},
+                                    "quick_sale": {"type": "boolean"},
+                                    "is_featured": {"type": "boolean"},
+                                    "pos_category": {"type": "string"},
+                                },
+                                "required": [],
+                            },
+                        },
+                        "required": ["product_id", "payload"],
+                    },
+                ),
+            ]
+        if self._agent_name == "product_pricing":
+            return specs + [
+                ToolSpec(
+                    name="product.search_products",
+                    description="Search products.",
+                    input_schema={"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": []},
+                ),
+                ToolSpec(
+                    name="product.get_product_categories",
+                    description="List product categories.",
+                    input_schema={"type": "object", "properties": {}, "required": []},
+                ),
+                ToolSpec(
+                    name="product.create_pricing_strategy",
+                    description="Create pricing strategy.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "strategy": {"type": "string"},
+                                    "product_id": {"type": "string"},
+                                    "margin_percentage": {"type": "string"},
+                                    "market_multiplier": {"type": "string"},
+                                    "min_price": {"type": "string"},
+                                    "max_price": {"type": "string"},
+                                },
+                                "required": ["name", "strategy"],
+                            },
+                        },
+                        "required": ["payload"],
+                    },
+                ),
+                ToolSpec(
+                    name="product.create_pricing_rule",
+                    description="Create pricing rule.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "rule_type": {"type": "string"},
+                                    "product_id": {"type": "string"},
+                                    "category_ref_id": {"type": "string"},
+                                    "discount_type": {"type": "string"},
+                                    "value": {"type": "string"},
+                                    "description": {"type": "string"},
+                                },
+                                "required": ["name", "rule_type", "discount_type", "value"],
+                            },
+                        },
+                        "required": ["payload"],
+                    },
+                ),
             ]
         if self._agent_name != "onboarding":
             return specs
@@ -358,6 +663,17 @@ class FakeToolExecutor(ToolExecutor):
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": [],
+                },
+            ),
+            ToolSpec(
+                name="inventory.list_stock_locations",
+                description="List stock locations.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
                         "limit": {"type": "integer"},
                     },
                     "required": [],
@@ -386,11 +702,18 @@ class FakeToolExecutor(ToolExecutor):
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string"},
-                        "type": {"type": "string"},
-                        "is_primary": {"type": "boolean"},
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "location_type_name": {"type": "string"},
+                                "structural": {"type": "boolean"},
+                                "parent_id": {"type": "string"},
+                            },
+                            "required": ["name"],
+                        }
                     },
-                    "required": ["name"],
+                    "required": ["payload"],
                 },
             ),
             ToolSpec(
@@ -398,8 +721,17 @@ class FakeToolExecutor(ToolExecutor):
                 description="Create an inventory category.",
                 input_schema={
                     "type": "object",
-                    "properties": {"name": {"type": "string"}},
-                    "required": ["name"],
+                    "properties": {
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "default_location_id": {"type": "string"},
+                            },
+                            "required": ["name"],
+                        }
+                    },
+                    "required": ["payload"],
                 },
             ),
             ToolSpec(
@@ -408,14 +740,17 @@ class FakeToolExecutor(ToolExecutor):
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string"},
-                        "description": {"type": "string"},
-                        "stock_location_id": {"type": "string"},
-                        "location_name": {"type": "string"},
-                        "category_id": {"type": "string"},
-                        "category_name": {"type": "string"},
+                        "payload": {
+                            "type": "object",
+                            "properties": {
+                                "name_snapshot": {"type": "string"},
+                                "description": {"type": "string"},
+                                "inventory_category_id": {"type": "string"},
+                            },
+                            "required": ["name_snapshot"],
+                        }
                     },
-                    "required": ["name"],
+                    "required": ["payload"],
                 },
             ),
             ToolSpec(
@@ -566,6 +901,26 @@ class FakeToolExecutor(ToolExecutor):
                         },
                     ],
                 }
+            if agent_name == "inventory" and "set up inventory locations and then create products" in request.lower():
+                return {
+                    "selected_agent": "inventory",
+                    "delegated_task_id": "delegated-inventory-multistep",
+                    "response_text": "Inventory locations created successfully.",
+                    "result_parts": [{"kind": "text", "text": "Inventory locations created successfully."}],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Inventory locations created successfully.",
+                            "final": True,
+                        },
+                    ],
+                }
             if agent_name == "product" and "Collected onboarding data JSON" in request:
                 return {
                     "selected_agent": "product",
@@ -592,6 +947,26 @@ class FakeToolExecutor(ToolExecutor):
                         {
                             "state": "completed",
                             "message": "Created 3 initial products for onboarding.",
+                            "final": True,
+                        },
+                    ],
+                }
+            if agent_name == "product" and "continue the user's multi-domain workflow" in request.lower():
+                return {
+                    "selected_agent": "product",
+                    "delegated_task_id": "delegated-product-multistep",
+                    "response_text": "Initial products created successfully.",
+                    "result_parts": [{"kind": "text", "text": "Initial products created successfully."}],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Initial products created successfully.",
                             "final": True,
                         },
                     ],
@@ -738,12 +1113,19 @@ class FakeToolExecutor(ToolExecutor):
                 "allow_back": bool(arguments.get("allow_back")),
                 "show_progress": bool(arguments.get("show_progress")),
             }
+        if name == "create_dynamic_form":
+            return {
+                "interaction_type": "dynamic_form",
+                "title": arguments.get("title") or "Form",
+                "description": arguments.get("description") or "Complete the form.",
+                "fields": list(arguments.get("fields") or []),
+            }
         if name == "users.get_active_company_profile":
             return {
                 "id": "company-1",
                 "name": "Intera Demo Company",
             }
-        if name == "inventory.search_stock_locations":
+        if name in {"inventory.search_stock_locations", "inventory.list_stock_locations"}:
             return {
                 "profile_id": 1,
                 "count": 2,
@@ -774,25 +1156,139 @@ class FakeToolExecutor(ToolExecutor):
                 },
             }
         if name == "inventory.create_stock_location":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else arguments
             return {
-                "id": f"stock-location-{arguments.get('name','').lower().replace(' ', '-')}",
-                "name": arguments.get("name"),
-                "type": arguments.get("type"),
+                "location": {
+                    "id": f"stock-location-{str(payload.get('name','')).lower().replace(' ', '-')}",
+                    "name": payload.get("name"),
+                    "location_type": payload.get("location_type_name"),
+                    "parent_id": payload.get("parent_id"),
+                }
             }
         if name == "inventory.create_inventory_category":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else arguments
             return {
-                "id": f"inventory-category-{arguments.get('name','').lower().replace(' ', '-')}",
-                "name": arguments.get("name"),
+                "category": {
+                    "id": f"inventory-category-{str(payload.get('name','')).lower().replace(' ', '-')}",
+                    "name": payload.get("name"),
+                    "default_location_id": payload.get("default_location_id"),
+                }
+            }
+        if name == "inventory.update_stock_location":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else {}
+            return {
+                "location": {
+                    "id": arguments.get("location_id"),
+                    "parent_id": payload.get("parent_id"),
+                }
             }
         if name == "inventory.create_inventory_item":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else arguments
             return {
-                "id": f"inventory-{arguments.get('name','').lower().replace(' ', '-')}",
-                "name": arguments.get("name"),
+                "inventory_item": {
+                    "id": f"inventory-{str(payload.get('name_snapshot') or payload.get('name') or '').lower().replace(' ', '-')}",
+                    "name": payload.get("name_snapshot") or payload.get("name"),
+                    "inventory_category_id": payload.get("inventory_category_id") or payload.get("category_id"),
+                }
+            }
+        if name == "product.get_product_categories":
+            return {
+                "count": 2,
+                "results": [
+                    {"id": "prod-cat-1", "name": "Apparel"},
+                    {"id": "prod-cat-2", "name": "Footwear"},
+                ],
+            }
+        if name == "product.search_products":
+            return {
+                "count": 2,
+                "results": [
+                    {"id": "prod-1", "name": "Men's Oxford Shirt"},
+                    {"id": "prod-2", "name": "Leather Tote Bag"},
+                ],
             }
         if name == "product.create_product":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else arguments
             return {
-                "id": f"product-{arguments.get('name','').lower().replace(' ', '-')}",
-                "name": arguments.get("name"),
+                "id": f"product-{str(payload.get('name') or '').lower().replace(' ', '-')}",
+                "name": payload.get("name"),
+            }
+        if name == "product.update_product":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else {}
+            return {
+                "id": arguments.get("product_id"),
+                "name": payload.get("name"),
+            }
+        if name == "product.create_pricing_strategy":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else {}
+            return {
+                "pricing_strategy": {
+                    "id": "pricing-strategy-1",
+                    "name": payload.get("name"),
+                    "strategy": payload.get("strategy"),
+                    "product_id": payload.get("product_id"),
+                }
+            }
+        if name == "product.create_pricing_rule":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else {}
+            return {
+                "pricing_rule": {
+                    "id": "pricing-rule-1",
+                    "name": payload.get("name"),
+                    "rule_type": payload.get("rule_type"),
+                    "product_id": payload.get("product_id"),
+                    "category_ref_id": payload.get("category_ref_id"),
+                }
+            }
+        if name in {"inventory.list_inventory_items", "inventory.search_inventory_items"}:
+            return {
+                "count": 2,
+                "results": [
+                    {"id": "inv-1", "name": "Men's Oxford Shirt Inventory"},
+                    {"id": "inv-2", "name": "Leather Tote Bag Inventory"},
+                ],
+            }
+        if name == "inventory.search_purchase_orders":
+            return {
+                "count": 2,
+                "results": [
+                    {"id": "po-1", "order_no": "PO-1001", "supplier_name": "Style Source Ltd"},
+                    {"id": "po-2", "order_no": "PO-1002", "supplier_name": "Urban Wholesale"},
+                ],
+            }
+        if name == "inventory.add_purchase_order_line_item":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else {}
+            return {
+                "line_item": {
+                    "purchase_order_id": arguments.get("purchase_order_id"),
+                    "inventory_item_id": payload.get("inventory_item_id"),
+                    "quantity": payload.get("quantity"),
+                    "unit_price": payload.get("unit_price"),
+                    "description": payload.get("description"),
+                }
+            }
+        if name == "inventory.transfer_location_stock":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else {}
+            transfers = payload.get("transfers") or []
+            first = transfers[0] if isinstance(transfers, list) and transfers else {}
+            return {
+                "stock_transfer": {
+                    "location_id": arguments.get("location_id"),
+                    "inventory_item_id": first.get("inventory_item_id"),
+                    "to_location_id": first.get("to_location_id"),
+                    "quantity": first.get("quantity"),
+                }
+            }
+        if name == "inventory.adjust_inventory_item_stock":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else {}
+            adjustments = payload.get("adjustments") or []
+            first = adjustments[0] if isinstance(adjustments, list) and adjustments else {}
+            return {
+                "inventory_adjustment": {
+                    "inventory_item_id": arguments.get("inventory_item_id"),
+                    "quantity": first.get("quantity"),
+                    "adjustment_type": first.get("adjustment_type"),
+                }
             }
         raise AssertionError(f"Unexpected tool call: {name}")
 
@@ -800,6 +1296,14 @@ class FakeToolExecutor(ToolExecutor):
 class FakeToolExecutorWithoutUsers(FakeToolExecutor):
     def __init__(self, *, agent_name: str | None = None) -> None:
         super().__init__(agent_name=agent_name, hidden_agents={"users"})
+
+
+class FakeToolExecutorWithUuidFailure(FakeToolExecutor):
+    async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
+        if name == "inventory.create_inventory_item":
+            FAKE_TOOL_CALLS.append((name, dict(arguments)))
+            raise RuntimeError("invalid UUID input syntax for type uuid")
+        return await super().call_tool(name=name, arguments=arguments, ctx=ctx)
 
 
 class FakeToolExecutorWithoutUsersOrOnboarding(FakeToolExecutor):
@@ -816,6 +1320,7 @@ class FakeWrappedLookupToolExecutor(FakeToolExecutor):
     async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
         result = await super().call_tool(name=name, arguments=arguments, ctx=ctx)
         if name not in {
+            "inventory.list_stock_locations",
             "inventory.search_stock_locations",
             "inventory.list_inventory_categories",
             "product.get_product_categories",
@@ -890,9 +1395,17 @@ def build_fake_category_text_wrapped_tool_executor(*, agent_name: str | None = N
     return FakeCategoryTextWrappedToolExecutor(agent_name=agent_name)
 
 
+def build_fake_tool_executor_with_uuid_failure(*, agent_name: str | None = None) -> ToolExecutor:
+    return FakeToolExecutorWithUuidFailure(agent_name=agent_name)
+
+
 def reset_fake_components() -> None:
     global FAKE_LLM_CALL_COUNT
     global FAKE_LLM_LAST_TOOLS
     FAKE_LLM_CALL_COUNT = 0
     FAKE_LLM_LAST_TOOLS = []
     FAKE_TOOL_CALLS.clear()
+
+
+def fake_uuid_failure_llm_factory(*_: Any, **__: Any) -> FakeUuidFailureLlm:
+    return FakeUuidFailureLlm()

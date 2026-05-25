@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,6 +55,56 @@ def _log_mcp_operation(level: str, event: str, **fields: Any) -> None:
         ordered.append(f"{key}={_format_log_kv(value)}")
     message = "mcp " + " ".join(ordered)
     getattr(logger, level)(message)
+
+
+def _result_preview(value: Any) -> str:
+    try:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(by_alias=True, exclude_none=True)
+        if isinstance(value, dict):
+            keys = sorted(str(key) for key in value.keys())
+            return f"dict(keys={keys[:12]})"
+        if isinstance(value, list):
+            return f"list(len={len(value)})"
+        return type(value).__name__
+    except Exception:
+        return type(value).__name__
+
+
+def _extract_json_candidate_from_text(text: str) -> str | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    import re
+
+    code_block_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, flags=re.IGNORECASE)
+    if code_block_match:
+        candidate = code_block_match.group(1).strip()
+        if candidate:
+            return candidate
+
+    if raw.startswith("{") or raw.startswith("["):
+        return raw
+
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = raw.find(opener)
+        end = raw.rfind(closer)
+        if start >= 0 and end > start:
+            candidate = raw[start : end + 1].strip()
+            if candidate:
+                return candidate
+    return None
+
+
+def _extract_json_value_from_text(text: str) -> Any:
+    candidate = _extract_json_candidate_from_text(text)
+    if not candidate:
+        return None
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
 
 
 def _header_names(headers: Mapping[str, str]) -> list[str]:
@@ -135,14 +186,53 @@ class McpServerAuthConfig(_McpToolsModel):
     @classmethod
     def _validate_mode(cls, value: str) -> str:
         normalized = (value or "").strip().lower()
-        if normalized not in {"none", "static", "context", "forward_bearer"}:
-            raise ValueError("MCP auth mode must be one of: none, static, context, forward_bearer")
+        if normalized not in {
+            "none",
+            "static",
+            "context",
+            "forward_bearer",
+            "service_account",
+            "custom",
+            "api_key_header",
+            "oauth_user",
+            "oauth_workspace",
+            "http_message_signature",
+        }:
+            raise ValueError(
+                "MCP auth mode must be one of: none, static, context, forward_bearer, service_account, custom, "
+                "api_key_header, oauth_user, oauth_workspace, http_message_signature"
+            )
         return normalized
 
     @field_validator("header_name", "scheme", "token", "token_env")
     @classmethod
     def _strip_text(cls, value: str | None) -> str | None:
         return _strip(value)
+
+
+class McpRuntimeConnectionConfig(_McpToolsModel):
+    id: str
+    connection_scope: str = "workspace"
+    owner_user_id: str | None = None
+    auth_type: str = ""
+    status: str = "pending"
+    server_url_override: str | None = None
+    headers: dict[str, str] | None = None
+    granted_scopes: list[str] = Field(default_factory=list)
+    token_expires_at: str | None = None
+    resource_owner_id: str | None = None
+    resource_label: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("connection_scope", "auth_type", "status", "server_url_override", "owner_user_id")
+    @classmethod
+    def _strip_optional_text(cls, value: str | None) -> str | None:
+        return _strip(value)
+
+    @field_validator("headers")
+    @classmethod
+    def _normalize_headers(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        return McpServerConfig._normalize_headers(value)
 
 
 class McpServerConfig(_McpToolsModel):
@@ -152,6 +242,7 @@ class McpServerConfig(_McpToolsModel):
     tool_name_prefix: str | None = None
     headers: dict[str, str] | None = None
     auth: McpServerAuthConfig = Field(default_factory=McpServerAuthConfig)
+    runtime_connections: list[McpRuntimeConnectionConfig] = Field(default_factory=list)
     enabled: bool = True
 
     @field_validator("id", "server_url", "tool_name_prefix")
@@ -197,6 +288,7 @@ class McpAgentServerConfig(_McpToolsModel):
     tool_name_prefix: str | None = None
     headers: dict[str, str] | None = None
     auth: McpServerAuthConfig | None = None
+    runtime_connections: list[McpRuntimeConnectionConfig] | None = None
     enabled: bool | None = None
 
     @field_validator("ref", "id", "server_url", "tool_name_prefix")
@@ -237,6 +329,11 @@ class McpAgentServerConfig(_McpToolsModel):
             ),
             headers=self.headers if self.headers is not None else (dict(base.headers) if base and base.headers is not None else None),
             auth=self.auth if self.auth is not None else (base.auth.model_copy(deep=True) if base is not None else McpServerAuthConfig()),
+            runtime_connections=(
+                deepcopy(self.runtime_connections)
+                if hasattr(self, "runtime_connections") and self.runtime_connections is not None
+                else (deepcopy(base.runtime_connections) if base is not None else [])
+            ),
             enabled=self.enabled if self.enabled is not None else (base.enabled if base is not None else True),
         )
 
@@ -274,6 +371,7 @@ class McpAgentConfigFile(_McpToolsModel):
                     tool_name_prefix=server.tool_name_prefix,
                     headers=dict(server.headers) if server.headers is not None else None,
                     auth=server.auth.model_copy(deep=True),
+                    runtime_connections=deepcopy(server.runtime_connections),
                     enabled=server.enabled,
                 )
                 for server in self.servers
@@ -392,6 +490,7 @@ async def _run_mcp_session(
         "argument_keys": argument_keys,
     }
     phase = "connect_stream"
+    started_at = time.monotonic()
 
     _log_mcp_operation("info", "session_start", **log_fields)
     try:
@@ -412,11 +511,21 @@ async def _run_mcp_session(
                         "info",
                         "session_success",
                         **log_fields,
+                        elapsed_ms=int((time.monotonic() - started_at) * 1000),
                         result_type=type(result).__name__,
+                        result_preview=_result_preview(result),
                     )
                     return result
     except Exception as exc:
-        _log_mcp_operation("warning", "session_failed", **log_fields, phase=phase, error=str(exc))
+        _log_mcp_operation(
+            "warning",
+            "session_failed",
+            **log_fields,
+            phase=phase,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         raise RuntimeError(
             _build_mcp_failure_message(
                 operation=operation,
@@ -482,10 +591,9 @@ def _dump_result(result: Any) -> Any:
                 text = item.get("text")
                 if not isinstance(text, str) or not text.strip():
                     continue
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    continue
+                parsed = _extract_json_value_from_text(text)
+                if parsed is not None:
+                    return parsed
 
     return result
 
@@ -612,7 +720,7 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
         self._timeout_s = float(timeout_s)
         self._tools_cache_s = float(tools_cache_s)
         self._agent_name = _short_agent_name(agent_name)
-        self._cache: dict[tuple[tuple[str, str], ...], tuple[float, list[_ConfiguredToolSpec]]] = {}
+        self._cache: dict[tuple[Any, ...], tuple[float, list[_ConfiguredToolSpec]]] = {}
 
     def debug_metadata(self) -> dict[str, Any]:
         return {
@@ -624,7 +732,73 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             "auth_mode": self._cfg.auth.mode,
             "tool_name_prefix": self._cfg.tool_name_prefix,
             "allowed_tools": list(self._cfg.tools or []),
+            "runtime_connection_count": len(self._cfg.runtime_connections or []),
         }
+
+    def _runtime_connections(self) -> list[McpRuntimeConnectionConfig]:
+        return [
+            item
+            for item in (self._cfg.runtime_connections or [])
+            if (item.status or "").strip().lower() == "connected"
+        ]
+
+    def _select_runtime_connection(self, *, ctx: ToolContext) -> McpRuntimeConnectionConfig | None:
+        connections = self._runtime_connections()
+        if not connections:
+            return None
+
+        principal_user_id = _strip(ctx.principal.user_id if ctx.principal else None)
+        if principal_user_id:
+            for item in connections:
+                if (item.connection_scope or "").strip().lower() != "user":
+                    continue
+                if _strip(item.owner_user_id) == principal_user_id:
+                    return item
+
+        for item in connections:
+            if (item.connection_scope or "").strip().lower() == "workspace":
+                return item
+        return None
+
+    def _uses_runtime_connection_auth(self) -> bool:
+        return self._cfg.auth.mode in {
+            "api_key_header",
+            "oauth_user",
+            "oauth_workspace",
+            "service_account",
+            "custom",
+        }
+
+    def _resolve_request_target(
+        self,
+        *,
+        ctx: ToolContext,
+    ) -> tuple[str, dict[str, str], McpRuntimeConnectionConfig | None]:
+        headers = dict(self._cfg.headers or {})
+        connection = self._select_runtime_connection(ctx=ctx)
+
+        if self._cfg.auth.mode == "http_message_signature":
+            raise RuntimeError(
+                f"MCP server '{self._cfg.id}' requires HTTP message signing, which is not implemented yet."
+            )
+
+        if self._uses_runtime_connection_auth():
+            if connection is None:
+                raise RuntimeError(
+                    f"MCP server '{self._cfg.id}' requires a connected workspace or user tool connection, but none is available."
+                )
+            if connection.headers:
+                headers.update(connection.headers)
+        else:
+            token = self._resolve_auth_token(ctx=ctx)
+            if token is not None:
+                header_name = self._cfg.auth.header_name or "authorization"
+                scheme = self._cfg.auth.scheme or ""
+                header_value = f"{scheme} {token}".strip() if scheme else token
+                headers[header_name] = header_value
+
+        server_url = _strip(connection.server_url_override if connection is not None else None) or self._cfg.server_url
+        return server_url, headers, connection
 
     def _resolve_auth_token(self, *, ctx: ToolContext) -> str | None:
         auth = self._cfg.auth
@@ -653,17 +827,6 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             return token
         raise RuntimeError(f"Unsupported MCP auth mode for server '{self._cfg.id}': {auth.mode}")
 
-    def _resolve_headers(self, *, ctx: ToolContext) -> dict[str, str]:
-        headers = dict(self._cfg.headers or {})
-        token = self._resolve_auth_token(ctx=ctx)
-        if token is None:
-            return headers
-        header_name = self._cfg.auth.header_name or "authorization"
-        scheme = self._cfg.auth.scheme or ""
-        header_value = f"{scheme} {token}".strip() if scheme else token
-        headers[header_name] = header_value
-        return headers
-
     def _filter_tools(self, remote_tools: list[_RemoteToolSpec]) -> list[_ConfiguredToolSpec]:
         prefix = self._cfg.tool_name_prefix or ""
         allowed = set(self._cfg.tools or [])
@@ -683,8 +846,8 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
         return out
 
     async def _resolved_tools(self, *, ctx: ToolContext) -> list[_ConfiguredToolSpec]:
-        headers = self._resolve_headers(ctx=ctx)
-        cache_key = _headers_cache_key(headers)
+        server_url, headers, connection = self._resolve_request_target(ctx=ctx)
+        cache_key = (server_url, *_headers_cache_key(headers))
         now = time.monotonic()
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -695,8 +858,9 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
                     "list_tools_cache_hit",
                     agent=self._agent_name,
                     server=self._cfg.id,
-                    server_url=self._cfg.server_url,
+                    server_url=server_url,
                     cached_tools=len(tools),
+                    connection_id=connection.id if connection is not None else None,
                 )
                 return list(tools)
 
@@ -705,14 +869,16 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             "list_tools_start",
             agent=self._agent_name,
             server=self._cfg.id,
-            server_url=self._cfg.server_url,
+            server_url=server_url,
             auth_mode=self._cfg.auth.mode,
             bearer_present=bool(ctx.principal and ctx.principal.bearer_token),
             allowed_tools=len(self._cfg.tools or []),
+            connection_id=connection.id if connection is not None else None,
+            connection_scope=connection.connection_scope if connection is not None else None,
         )
         try:
             remote_tools = await _list_remote_tools(
-                server_url=self._cfg.server_url,
+                server_url=server_url,
                 headers=headers,
                 timeout_s=self._timeout_s,
             )
@@ -722,13 +888,14 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
                 "list_tools_failed",
                 agent=self._agent_name,
                 server=self._cfg.id,
-                server_url=self._cfg.server_url,
+                server_url=server_url,
                 auth_mode=self._cfg.auth.mode,
+                connection_id=connection.id if connection is not None else None,
                 error=str(exc),
             )
             raise RuntimeError(
                 f"MCP list_tools failed for agent '{self._agent_name}' on server '{self._cfg.id}' "
-                f"({self._cfg.server_url}): {exc}"
+                f"({server_url}): {exc}"
             ) from exc
         tools = self._filter_tools(remote_tools)
         _log_mcp_operation(
@@ -736,9 +903,10 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             "list_tools_success",
             agent=self._agent_name,
             server=self._cfg.id,
-            server_url=self._cfg.server_url,
+            server_url=server_url,
             remote_tools=len(remote_tools),
             exposed_tools=len(tools),
+            connection_id=connection.id if connection is not None else None,
         )
         self._cache[cache_key] = (now, list(tools))
         return tools
@@ -752,7 +920,7 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
         if route is None:
             raise RuntimeError(f"Tool '{name}' is not available from MCP server '{self._cfg.id}'.")
 
-        headers = self._resolve_headers(ctx=ctx)
+        server_url, headers, connection = self._resolve_request_target(ctx=ctx)
         compact_arguments = _compact_tool_arguments(arguments or {})
         argument_keys = sorted(str(key) for key in compact_arguments.keys() if str(key).strip())
         _log_mcp_operation(
@@ -760,15 +928,17 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             "call_tool_start",
             agent=self._agent_name,
             server=self._cfg.id,
-            server_url=self._cfg.server_url,
+            server_url=server_url,
             auth_mode=self._cfg.auth.mode,
             exposed_tool=name,
             remote_tool=route.remote_name,
             argument_keys=argument_keys,
+            connection_id=connection.id if connection is not None else None,
+            connection_scope=connection.connection_scope if connection is not None else None,
         )
         try:
             result = await _call_remote_tool(
-                server_url=self._cfg.server_url,
+                server_url=server_url,
                 headers=headers,
                 timeout_s=self._timeout_s,
                 name=route.remote_name,
@@ -780,25 +950,27 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
                 "call_tool_failed",
                 agent=self._agent_name,
                 server=self._cfg.id,
-                server_url=self._cfg.server_url,
+                server_url=server_url,
                 exposed_tool=name,
                 remote_tool=route.remote_name,
                 argument_keys=argument_keys,
+                connection_id=connection.id if connection is not None else None,
                 error=str(exc),
             )
             raise RuntimeError(
                 f"MCP call_tool failed for agent '{self._agent_name}' on server '{self._cfg.id}' "
-                f"({self._cfg.server_url}) for exposed tool '{name}' -> remote tool '{route.remote_name}': {exc}"
+                f"({server_url}) for exposed tool '{name}' -> remote tool '{route.remote_name}': {exc}"
             ) from exc
         _log_mcp_operation(
             "info",
             "call_tool_success",
             agent=self._agent_name,
             server=self._cfg.id,
-            server_url=self._cfg.server_url,
+            server_url=server_url,
             exposed_tool=name,
             remote_tool=route.remote_name,
             result_type=type(result).__name__,
+            connection_id=connection.id if connection is not None else None,
         )
         return result
 
@@ -835,6 +1007,14 @@ class CompositeToolExecutor(ToolExecutor):
         tools: list[ToolSpec] = []
         routes: dict[str, ToolExecutor] = {}
         failures: list[dict[str, Any]] = []
+        _log_mcp_operation(
+            "info",
+            "resolve_routes_start",
+            executor_count=len(self._executors),
+            skip_unavailable=self._skip_unavailable,
+            bearer_present=bool(ctx.principal and ctx.principal.bearer_token),
+            mcp_ctx_server=getattr(ctx.mcp, "server_url", None) if ctx.mcp else None,
+        )
         for executor in self._executors:
             try:
                 current = await executor.list_tools(ctx=ctx)
@@ -870,6 +1050,13 @@ class CompositeToolExecutor(ToolExecutor):
                 routes[item.name] = executor
                 tools.append(item)
         self._last_list_tool_failures = failures
+        _log_mcp_operation(
+            "info",
+            "resolve_routes_complete",
+            exposed_tools=len(tools),
+            failure_count=len(failures),
+            failed_executors=[item.get("executor_label") for item in failures],
+        )
         return tools, routes
 
     async def list_tools(self, *, ctx: ToolContext) -> list[ToolSpec]:
@@ -881,6 +1068,13 @@ class CompositeToolExecutor(ToolExecutor):
         executor = routes.get(name)
         if executor is None:
             raise RuntimeError(f"Unknown tool: {name}")
+        _log_mcp_operation(
+            "info",
+            "composite_call_tool_route",
+            exposed_tool=name,
+            executor=self._executor_debug_metadata(executor).get("executor_label"),
+            argument_keys=sorted(str(key) for key in (arguments or {}).keys()),
+        )
         return await executor.call_tool(name=name, arguments=arguments or {}, ctx=ctx)
 
 
@@ -917,6 +1111,18 @@ class MultiMcpToolExecutor(ToolExecutor):
         if extra_executor is not None:
             executors.append(extra_executor)
         self._composite = CompositeToolExecutor(executors=executors, skip_unavailable=True)
+        _log_mcp_operation(
+            "info",
+            "executor_initialized",
+            agent=_short_agent_name(self._cfg.agent_name),
+            config_path=self._cfg.config_path,
+            server_count=len(self._cfg.servers),
+            servers=[f"{server.id}:{server.server_url}" for server in self._cfg.servers],
+            timeout_s=self._cfg.timeout_s,
+            tools_cache_s=self._cfg.tools_cache_s,
+            legacy_executor=bool(legacy_executor),
+            extra_executor=bool(extra_executor),
+        )
 
     @classmethod
     def from_env(

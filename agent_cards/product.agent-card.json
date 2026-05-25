@@ -27,6 +27,19 @@
       "outputModes": ["text"]
     },
     {
+      "id": "marketplace_sourcing",
+      "name": "Marketplace Sourcing",
+      "description": "Route online product search, cross-marketplace price comparison, and supplier sourcing to the marketplace sourcing specialist.",
+      "tags": ["marketplace", "supplier", "sourcing", "amazon", "ebay", "alibaba", "comparison"],
+      "examples": [
+        "Search Amazon and eBay for receipt printers.",
+        "Compare supplier options for acrylic cups across Alibaba and AliExpress.",
+        "Find cheap thermal printers across Temu and DHgate."
+      ],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    },
+    {
       "id": "product_catalog_administration",
       "name": "Product Catalog Administration",
       "description": "Route product creation, product updates, bulk catalog seeding, and catalog export work to the product admin specialist.",
