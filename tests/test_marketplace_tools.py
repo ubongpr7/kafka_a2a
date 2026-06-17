@@ -93,3 +93,64 @@ async def test_marketplace_search_requires_workspace_tavily_key() -> None:
             arguments={"query": "thermal printer"},
             ctx=ToolContext(metadata={}),
         )
+
+
+@pytest.mark.asyncio
+async def test_marketplace_search_filters_editorial_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_search_raw(**kwargs):
+        query = kwargs["query"]
+        if "aliexpress" in query:
+            return {
+                "results": [
+                    {
+                        "title": "Per Source Smart Lighting: A Comprehensive Guide to Choosing and Using Smart LED Bulbs",
+                        "url": "https://www.aliexpress.com/s/wiki-ssr/article/per-source",
+                        "content": "A guide to choosing smart LED bulbs for home use.",
+                        "score": 0.99,
+                    }
+                ]
+            }
+        return {
+            "results": [
+                {
+                    "title": "Lightinginside Smart Light Bulbs 6 Pack",
+                    "url": "https://www.amazon.com/Lightinginside-Equivalent-Assistant-Changing-Required/dp/B0CCY9GVWS",
+                    "content": "Smart LED light bulb USD 24.99 with 4.7 out of 5 stars",
+                    "score": 0.81,
+                    "images": ["https://cdn.example.com/bulb.jpg"],
+                }
+            ]
+        }
+
+    monkeypatch.setattr("kafka_a2a.marketplace_tools.tavily_search_raw", fake_search_raw)
+    monkeypatch.setattr(
+        "kafka_a2a.marketplace_tools.resolve_tavily_credentials_from_metadata",
+        lambda **kwargs: type("Cred", (), {"api_key": "tvly-user"})(),
+    )
+
+    executor = MarketplaceSourcingToolExecutor()
+    payload = await executor.call_tool(
+        name="search_marketplace_products",
+        arguments={"query": "smart LED bulbs", "marketplaces": ["amazon", "aliexpress"], "max_results": 6},
+        ctx=ToolContext(metadata={"urn:ka2a:principal": {}}),
+    )
+
+    urls = [str(item.get("product_url") or "") for item in payload["products"]]
+    assert "https://www.aliexpress.com/s/wiki-ssr/article/per-source" not in urls
+    assert any("/dp/" in url for url in urls)
+
+
+@pytest.mark.asyncio
+async def test_marketplace_search_does_not_fall_back_to_env_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("kafka_a2a.marketplace_tools.resolve_tavily_credentials_from_metadata", lambda **kwargs: None)
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-platform-env")
+
+    executor = MarketplaceSourcingToolExecutor()
+    with pytest.raises(ValueError, match="Tavily API key is not configured"):
+        await executor.call_tool(
+            name="search_marketplace_products",
+            arguments={"query": "smart switch"},
+            ctx=ToolContext(metadata={}),
+        )

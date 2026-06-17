@@ -92,6 +92,19 @@ class FakeToolExecutor(ToolExecutor):
         if self._agent_name == "product":
             return [
                 {
+                    "name": "marketplace_sourcing",
+                    "description": "Focused marketplace specialist for online product sourcing and offer comparison.",
+                    "skills": [
+                        {
+                            "id": "marketplace_product_search",
+                            "name": "Marketplace Sourcing",
+                            "description": "Search online marketplaces and compare supplier offers.",
+                            "tags": ["marketplace", "sourcing", "online", "compare", "price"],
+                            "examples": ["Search online marketplaces for Adidas shoes."],
+                        }
+                    ],
+                },
+                {
                     "name": "product_discovery",
                     "description": "Focused product specialist for catalog search, analytics, dashboard stats, and stock alerts.",
                     "skills": [
@@ -327,6 +340,11 @@ class FakeToolExecutor(ToolExecutor):
                     },
                 ),
                 ToolSpec(
+                    name="inventory.list_stock_location_types",
+                    description="List stock location types.",
+                    input_schema={"type": "object", "properties": {}, "required": []},
+                ),
+                ToolSpec(
                     name="inventory.list_inventory_categories",
                     description="List inventory categories.",
                     input_schema={
@@ -468,6 +486,34 @@ class FakeToolExecutor(ToolExecutor):
                     },
                 ),
             ]
+        if self._agent_name == "marketplace_sourcing":
+            return specs + [
+                ToolSpec(
+                    name="search_marketplace_products",
+                    description="Search online marketplaces.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "marketplaces": {"type": "array"},
+                            "max_results": {"type": "integer"},
+                        },
+                        "required": ["query"],
+                    },
+                ),
+                ToolSpec(
+                    name="compare_marketplace_products",
+                    description="Compare selected marketplace products.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "items": {"type": "array"},
+                            "title": {"type": "string"},
+                        },
+                        "required": ["items"],
+                    },
+                ),
+            ]
         if self._agent_name == "inventory_fulfillment":
             return specs + [
                 ToolSpec(
@@ -479,6 +525,35 @@ class FakeToolExecutor(ToolExecutor):
                     name="inventory.list_inventory_items",
                     description="List inventory items.",
                     input_schema={"type": "object", "properties": {}, "required": []},
+                ),
+                ToolSpec(
+                    name="inventory.create_stock_reservation",
+                    description="Create a stock reservation.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "inventory_item_id": {"type": "string"},
+                                    "stock_location_id": {"type": "string"},
+                                    "reserved_quantity": {"type": "string"},
+                                    "external_order_type": {"type": "string"},
+                                    "external_order_id": {"type": "string"},
+                                    "external_order_line_id": {"type": "string"},
+                                    "notes": {"type": "string"},
+                                },
+                                "required": [
+                                    "inventory_item_id",
+                                    "stock_location_id",
+                                    "reserved_quantity",
+                                    "external_order_type",
+                                    "external_order_id",
+                                ],
+                            },
+                        },
+                        "required": ["payload"],
+                    },
                 ),
                 ToolSpec(
                     name="inventory.transfer_location_stock",
@@ -794,6 +869,36 @@ class FakeToolExecutor(ToolExecutor):
             agent_name = str(arguments.get("agent_name") or "product")
             delegated_task_id = str(arguments.get("delegated_task_id") or "")
             if agent_name == "onboarding":
+                if "Collected onboarding data JSON" in request:
+                    return {
+                        "selected_agent": "onboarding",
+                        "delegated_task_id": "delegated-onboarding-create",
+                        "response_text": "Created 3 stock locations, 2 inventory categories, and 1 inventory item for onboarding.",
+                        "result_parts": [
+                            {
+                                "kind": "text",
+                                "text": "Created 3 stock locations, 2 inventory categories, and 1 inventory item for onboarding.",
+                            }
+                        ],
+                        "artifacts": {},
+                        "status_updates": [
+                            {
+                                "state": "submitted",
+                                "message": "delegated task submitted",
+                                "final": False,
+                            },
+                            {
+                                "state": "working",
+                                "message": "applying onboarding setup plan",
+                                "final": False,
+                            },
+                            {
+                                "state": "completed",
+                                "message": "Created 3 stock locations, 2 inventory categories, and 1 inventory item for onboarding.",
+                                "final": True,
+                            },
+                        ],
+                    }
                 if delegated_task_id == "delegated-onboarding-scope":
                     return {
                         "selected_agent": "onboarding",
@@ -917,6 +1022,65 @@ class FakeToolExecutor(ToolExecutor):
                         {
                             "state": "completed",
                             "message": "Inventory locations created successfully.",
+                            "final": True,
+                        },
+                    ],
+                }
+            if agent_name == "inventory" and (
+                "group my inventories into categories and assign items" in request.lower()
+                or "group the inventories into categories and assign items" in request.lower()
+            ):
+                return {
+                    "selected_agent": "inventory",
+                    "delegated_task_id": "delegated-inventory-categorize",
+                    "response_text": (
+                        "I reviewed the inventory items and prepared a category plan. "
+                        "Once you confirm, I'll create the categories and assign the items."
+                    ),
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": (
+                                "I reviewed the inventory items and prepared a category plan. "
+                                "Once you confirm, I'll create the categories and assign the items."
+                            ),
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Awaiting your confirmation to create the categories and assignments.",
+                            "final": True,
+                        },
+                    ],
+                }
+            if agent_name == "inventory" and delegated_task_id == "delegated-inventory-categorize":
+                return {
+                    "selected_agent": "inventory",
+                    "delegated_task_id": "delegated-inventory-categorize",
+                    "response_text": "Created 3 inventory categories and assigned 14 inventory items.",
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": "Created 3 inventory categories and assigned 14 inventory items.",
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task continued",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Created 3 inventory categories and assigned 14 inventory items.",
                             "final": True,
                         },
                     ],
@@ -1144,6 +1308,14 @@ class FakeToolExecutor(ToolExecutor):
                     },
                 ],
             }
+        if name == "inventory.list_stock_location_types":
+            return {
+                "results": [
+                    {"value": "Warehouse", "label": "Warehouse"},
+                    {"value": "Shelf", "label": "Shelf"},
+                    {"value": "Store", "label": "Store"},
+                ]
+            }
         if name == "inventory.list_inventory_categories":
             return {
                 "profile_id": 1,
@@ -1240,6 +1412,75 @@ class FakeToolExecutor(ToolExecutor):
                     "category_ref_id": payload.get("category_ref_id"),
                 }
             }
+        if name == "search_marketplace_products":
+            query = str(arguments.get("query") or "").strip()
+            return {
+                "interaction_type": "marketplace_results",
+                "title": f"Marketplace results for “{query}”",
+                "description": f"Found 3 marketplace matches for {query}.",
+                "query": query,
+                "products": [
+                    {
+                        "id": "adidas-1",
+                        "title": "Adidas Ultraboost Light",
+                        "marketplace": "Amazon",
+                        "product_url": "https://amazon.com/dp/adidas-ultraboost-light",
+                        "price": "USD 129.99",
+                        "total_price": "USD 129.99",
+                        "total_price_value": 129.99,
+                        "score": 0.92,
+                    },
+                    {
+                        "id": "adidas-2",
+                        "title": "Adidas Adizero SL 2",
+                        "marketplace": "eBay",
+                        "product_url": "https://ebay.com/itm/adidas-adizero-sl-2",
+                        "price": "USD 119.00",
+                        "total_price": "USD 119.00",
+                        "total_price_value": 119.0,
+                        "score": 0.89,
+                    },
+                    {
+                        "id": "adidas-3",
+                        "title": "Adidas Duramo Speed",
+                        "marketplace": "AliExpress",
+                        "product_url": "https://aliexpress.com/item/adidas-duramo-speed",
+                        "price": "USD 78.50",
+                        "total_price": "USD 78.50",
+                        "total_price_value": 78.5,
+                        "score": 0.84,
+                    },
+                ],
+                "summary": {
+                    "query": query,
+                    "result_count": 3,
+                    "cheapest_offer": {
+                        "title": "Adidas Duramo Speed",
+                        "marketplace": "AliExpress",
+                        "price": "USD 78.50",
+                        "product_url": "https://aliexpress.com/item/adidas-duramo-speed",
+                    },
+                },
+                "available_marketplaces": ["Amazon", "eBay", "AliExpress"],
+                "allow_selection": True,
+                "allow_compare": True,
+                "max_selection": 4,
+                "workflow": "marketplace_sourcing",
+                "workflow_stage": "results",
+            }
+        if name == "compare_marketplace_products":
+            items = arguments.get("items") if isinstance(arguments.get("items"), list) else []
+            return {
+                "interaction_type": "comparison_view",
+                "title": str(arguments.get("title") or "Compare marketplace products"),
+                "description": "Review the selected marketplace offers side by side.",
+                "items": items,
+                "comparison_fields": ["marketplace", "price", "total_price"],
+                "allow_selection": True,
+                "highlight_differences": True,
+                "workflow": "marketplace_sourcing",
+                "workflow_stage": "comparison",
+            }
         if name in {"inventory.list_inventory_items", "inventory.search_inventory_items"}:
             return {
                 "count": 2,
@@ -1277,6 +1518,17 @@ class FakeToolExecutor(ToolExecutor):
                     "inventory_item_id": first.get("inventory_item_id"),
                     "to_location_id": first.get("to_location_id"),
                     "quantity": first.get("quantity"),
+                }
+            }
+        if name == "inventory.create_stock_reservation":
+            payload = arguments.get("payload") if isinstance(arguments.get("payload"), dict) else {}
+            return {
+                "reservation": {
+                    "inventory_item_id": payload.get("inventory_item_id"),
+                    "stock_location_id": payload.get("stock_location_id"),
+                    "reserved_quantity": payload.get("reserved_quantity"),
+                    "external_order_type": payload.get("external_order_type"),
+                    "external_order_id": payload.get("external_order_id"),
                 }
             }
         if name == "inventory.adjust_inventory_item_stock":

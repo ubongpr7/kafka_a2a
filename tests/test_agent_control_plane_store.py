@@ -199,6 +199,75 @@ def test_service_imports_workspace_tool_connections_into_runtime_payload(tmp_pat
     assert runtime_connections[0]["metadata"] == {}
 
 
+def test_service_sync_users_ai_settings_payload_preserves_workspace_agents(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = JsonAgentControlPlaneStore(settings.control_plane_store_path)
+    service = AgentControlPlaneService(store=store, settings=settings)
+
+    installed = service.install_template(
+        profile_id="1",
+        user_id="42",
+        template_id=next(item for item in service.list_templates() if item["slug"] == "host")["id"],
+        data={"slug": "host"},
+    )
+
+    stats = service.sync_users_ai_settings_payload(
+        {
+            "workspace_ai_settings": [
+                {
+                    "profile": "1",
+                    "name": "Legacy Agent",
+                    "version": "gpt-3.5-turbo",
+                    "provider": "chatgpt",
+                    "provider_label": "ChatGPT",
+                    "provider_base_url": "https://api.openai.com",
+                    "base_url": "https://api.openai.com",
+                    "special_instruction": "legacy",
+                    "system_instruction": "",
+                    "assistant_instruction": "",
+                    "api_key": "legacy-openai-key",
+                    "tavily_api_key": "legacy-tavily-key",
+                }
+            ]
+        }
+    )
+
+    assert stats["workspace_ai_settings"] == 1
+    setup = service.get_workspace_ai_setup(profile_id="1")
+    assert setup["configured"] is True
+    assert setup["agent"]["name"] == "Legacy Agent"
+    assert setup["agent"]["version"] == "gpt-5-mini"
+    registry = service.runtime_registry(
+        access=AgentRuntimeAccessContext(user_id="42", profile_id="1", is_owner=True, permissions=set())
+    )
+    assert any(item["slug"] == installed["slug"] for item in registry["agents"])
+
+
+def test_workspace_ai_setup_flags_undecryptable_secrets_for_reconfiguration(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = JsonAgentControlPlaneStore(settings.control_plane_store_path)
+    service = AgentControlPlaneService(store=store, settings=settings)
+
+    service._upsert_record(  # type: ignore[attr-defined]
+        "workspace_ai_settings",
+        WorkspaceAiSettings(
+            profile="1",
+            name="Legacy Agent",
+            version="gpt-5-mini",
+            api_key="gAAAA-stale-openai",
+            tavily_api_key="gAAAA-stale-tavily",
+        ),
+    )
+
+    setup = service.get_workspace_ai_setup(profile_id="1")
+
+    assert setup["configured"] is True
+    assert setup["agent"]["has_api_key"] is False
+    assert setup["agent"]["has_tavily_api_key"] is False
+    assert setup["agent"]["api_key_requires_reconfiguration"] is True
+    assert setup["agent"]["tavily_api_key_requires_reconfiguration"] is True
+
+
 def test_service_lists_seeded_external_mcp_tool_servers(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     store = JsonAgentControlPlaneStore(settings.control_plane_store_path)

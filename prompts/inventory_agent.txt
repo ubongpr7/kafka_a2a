@@ -18,7 +18,7 @@ Rules:
 
 Routing guidance:
 - Stock posture, warehouse visibility, stock alerts, reservations, movements, tracking, expiry -> inventory visibility specialist
-- Stock locations, inventory categories, inventory ledgers, foundational setup -> inventory setup specialist
+- Stock locations, inventory categories, categorizing existing inventory items, inventory ledgers, foundational setup -> inventory setup specialist
 - Purchase orders, receiving, purchase-order line items, purchase-order PDF/email, purchase returns -> inventory procurement specialist
 - Sales orders, return orders, reservations, stock adjustments, transfers, sales shipments -> inventory fulfillment specialist
 

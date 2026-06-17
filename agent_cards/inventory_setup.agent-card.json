@@ -1,7 +1,7 @@
 {
   "protocolVersion": "0.3.0",
   "name": "inventory_setup",
-  "description": "Focused inventory specialist for stock-location, inventory-category, and inventory-ledger setup and maintenance workflows.",
+  "description": "Focused inventory specialist for stock-location, inventory-category, inventory-ledger, inventory categorization, and inventory item control setup workflows.",
   "url": "kafka://inventory_setup",
   "preferredTransport": "kafka",
   "version": "0.1.0",
@@ -15,11 +15,13 @@
     {
       "id": "inventory_setup_admin",
       "name": "Inventory Setup Admin",
-      "description": "Create and update stock locations, inventory categories, and inventory ledgers.",
-      "tags": ["inventory", "setup", "onboarding", "locations", "categories", "create", "update"],
+      "description": "Create and update stock locations, inventory categories, inventory ledgers, automatically categorize existing inventory items, and recommend item-level stock controls.",
+      "tags": ["inventory", "setup", "onboarding", "locations", "categories", "categorize", "categorise", "classification", "reorder", "safety stock", "serial", "expiry", "create", "update"],
       "examples": [
         "Create the first stock locations for this company.",
         "Set up inventory categories before product entry.",
+        "Categorize my inventory items.",
+        "Review the reorder and tracking settings for my inventory items.",
         "Create the main inventory ledger for onboarding."
       ],
       "inputModes": ["text"],

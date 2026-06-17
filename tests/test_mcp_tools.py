@@ -259,9 +259,9 @@ def test_prod_config_splits_heavy_domains_into_focused_subagents() -> None:
         "product_merchandising": ("products", 24),
         "product_pricing": ("products", 22),
         "inventory_visibility": ("inventory", 18),
-        "inventory_setup": ("inventory", 18),
+        "inventory_setup": ("inventory", 21),
         "inventory_procurement": ("inventory", 18),
-        "inventory_fulfillment": ("inventory", 27),
+        "inventory_fulfillment": ("inventory", 29),
         "pos_live": ("pos", 30),
         "pos_admin": ("pos", 20),
     }

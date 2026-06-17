@@ -406,6 +406,7 @@ class KafkaDelegationBackend:
         self._directory_offset_reset = (os.getenv("KA2A_DIRECTORY_AUTO_OFFSET_RESET") or "earliest").strip().lower()
         self._directory_warmup_timeout_s = float(os.getenv("KA2A_DIRECTORY_WARMUP_TIMEOUT_S") or "3.0")
         self._directory_warmup_settle_s = float(os.getenv("KA2A_DIRECTORY_WARMUP_SETTLE_S") or "0.5")
+        self._explicit_agent_wait_timeout_s = float(os.getenv("KA2A_EXPLICIT_AGENT_WAIT_TIMEOUT_S") or "12.0")
         self._control_plane = ControlPlaneClient()
         self._state = _DelegationState()
 
@@ -525,6 +526,34 @@ class KafkaDelegationBackend:
         registered_cards = await self._list_registered_cards()
         return self._visible_downstream_cards(registered_cards)
 
+    async def _wait_for_explicit_agent_card(self, agent_name: str) -> AgentCard | None:
+        requested = (agent_name or "").strip()
+        if not requested:
+            return None
+        await self._ensure_started()
+        if self._state.directory is None:
+            return None
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, self._explicit_agent_wait_timeout_s)
+        best_match: AgentCard | None = None
+
+        while True:
+            registered_cards = [
+                card
+                for card in self._state.directory.list()
+                if (card.name or "").strip()
+                and card.name != self._runtime_agent_name
+                and card_public_slug(card) != self._agent_name
+            ]
+            visible_cards = self._visible_downstream_cards(registered_cards)
+            for card in visible_cards:
+                if card.name == requested or _card_matches_requested_agent(card, requested):
+                    return card
+            if loop.time() >= deadline:
+                return best_match
+            await asyncio.sleep(0.1)
+
     async def list_agents(self) -> dict[str, Any]:
         registered_cards = await self._list_registered_cards()
         visible_cards = self._visible_downstream_cards(registered_cards)
@@ -562,9 +591,17 @@ class KafkaDelegationBackend:
         delegated_task_id: str | None = None,
         ctx: ToolContext,
     ) -> dict[str, Any]:
-        registered_cards = await self._list_registered_cards()
-        visible_cards = self._visible_downstream_cards(registered_cards)
-        selected = self._select_agent(cards=visible_cards, request=request, agent_name=agent_name)
+        selected: AgentCard
+        if agent_name:
+            selected = await self._wait_for_explicit_agent_card(agent_name) or self._select_agent(
+                cards=await self._list_downstream_cards(),
+                request=request,
+                agent_name=agent_name,
+            )
+        else:
+            registered_cards = await self._list_registered_cards()
+            visible_cards = self._visible_downstream_cards(registered_cards)
+            selected = self._select_agent(cards=visible_cards, request=request, agent_name=agent_name)
 
         assert self._state.client is not None
         async def _run_delegation() -> dict[str, Any]:

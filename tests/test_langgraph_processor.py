@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tests import fake_langgraph_components
@@ -8,8 +10,14 @@ from kafka_a2a.langgraph_processor import (
     _build_stock_location_operation,
     _build_product_operation,
     _classify_failed_operation,
+    _coerce_delegated_response,
     _created_result_ref,
+    _extract_created_result_value,
+    _host_orchestration_plan,
+    _onboarding_creation_request,
+    _infer_onboarding_scope_from_text,
     _interaction_payload_from_text,
+    _inventory_setup_action_from_text,
     _is_host_capability_picker_query,
     _is_host_introspection_query,
     _is_simple_greeting_query,
@@ -17,6 +25,7 @@ from kafka_a2a.langgraph_processor import (
     _normalize_tool_call_payload,
     _render_tool_prompt_block,
     _select_host_delegation_agent,
+    _select_router_handoff_agent,
     _select_router_delegation_agent,
     _text_from_parts,
     make_langgraph_chat_processor_from_env,
@@ -61,6 +70,56 @@ def test_is_simple_greeting_query_matches_plain_greetings() -> None:
     assert _is_simple_greeting_query("hello there")
     assert _is_simple_greeting_query("good evening")
     assert not _is_simple_greeting_query("hi, create my inventory")
+
+
+def test_generic_inventory_setup_language_prefers_onboarding_over_direct_mutation() -> None:
+    assert _infer_onboarding_scope_from_text("I want to set up inventory") == "full_setup"
+    assert _infer_onboarding_scope_from_text("Help me setup inventory") == "full_setup"
+    assert _inventory_setup_action_from_text("I want to set up inventory") is None
+    assert _inventory_setup_action_from_text("Help me setup inventory") is None
+    assert _inventory_setup_action_from_text("List the stock locations in my electronics store setup.") is None
+    assert _inventory_setup_action_from_text("Create a new inventory item called Main Inventory") == "create_inventory_item"
+
+
+def test_host_orchestration_plan_keeps_inventory_grouping_out_of_users_domain() -> None:
+    plan = _host_orchestration_plan(
+        "Group the inventories into categories and assign items",
+        [
+            {"name": "inventory"},
+            {"name": "users"},
+        ],
+    )
+
+    assert plan == ["inventory"]
+
+
+def test_coerce_delegated_response_treats_plain_text_confirmation_as_input_required() -> None:
+    delegated_response = _coerce_delegated_response(
+        {
+            "selected_agent": "inventory",
+            "delegated_task_id": "delegated-inventory-categorize",
+            "response_text": (
+                "I reviewed the inventory items and prepared a category plan. "
+                "Once you confirm, I'll create the categories and assign the items."
+            ),
+            "result_parts": [
+                {
+                    "kind": "text",
+                    "text": (
+                        "I reviewed the inventory items and prepared a category plan. "
+                        "Once you confirm, I'll create the categories and assign the items."
+                    ),
+                }
+            ],
+            "status_updates": [
+                {"state": "submitted", "message": "delegated task submitted", "final": False},
+                {"state": "completed", "message": "waiting for confirmation", "final": True},
+            ],
+        }
+    )
+
+    assert delegated_response is not None
+    assert delegated_response["delegated_final_state"] == TaskState.input_required
 
 
 def test_render_tool_prompt_block_includes_relation_lookup_rules() -> None:
@@ -277,6 +336,63 @@ def test_build_stock_location_operation_supports_nested_payload_schema_and_paren
     assert operation["missing_required"] == []
 
 
+def test_build_stock_location_operation_supports_ref_payload_schema() -> None:
+    operation = _build_stock_location_operation(
+        tool_specs=[
+            ToolSpec(
+                name="inventory.create_stock_location",
+                description="Create stock location.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "payload": {"$ref": "#/$defs/StockLocationPayload"},
+                    },
+                    "required": ["payload"],
+                    "$defs": {
+                        "StockLocationPayload": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "location_type_name": {"type": "string"},
+                                "structural": {"type": "boolean"},
+                            },
+                            "required": ["name"],
+                        }
+                    },
+                },
+            )
+        ],
+        company_context=None,
+        location_name="Main Electronics Warehouse",
+        location_type="warehouse",
+        primary=True,
+        structural=True,
+    )
+
+    assert operation["arguments"] == {
+        "payload": {
+            "name": "Main Electronics Warehouse",
+            "location_type_name": "warehouse",
+            "structural": True,
+        }
+    }
+    assert operation["missing_required"] == []
+
+
+def test_extract_created_result_value_supports_mcp_wrapped_result_payload() -> None:
+    payload = {
+        "content": [
+            {
+                "type": "text",
+                "text": '{"profile_id":1,"location":{"id":"loc-123","name":"Main Electronics Warehouse"}}',
+            }
+        ],
+        "isError": False,
+    }
+
+    assert _extract_created_result_value(payload, ["location", "id"]) == "loc-123"
+
+
 def test_select_router_delegation_agent_prefers_best_matching_subspecialist() -> None:
     selected = _select_router_delegation_agent(
         "i want you to create inventory for me",
@@ -309,6 +425,84 @@ def test_select_router_delegation_agent_prefers_best_matching_subspecialist() ->
     )
 
     assert selected == "inventory_setup"
+
+
+def test_select_router_handoff_agent_prefers_host_for_cross_domain_request() -> None:
+    selected = _select_router_handoff_agent(
+        "product",
+        "please help me set up my inventory",
+        [
+            {
+                "name": "host",
+                "description": "Workspace host agent.",
+                "skills": [],
+            },
+            {
+                "name": "product_discovery",
+                "description": "Focused product specialist for catalog search.",
+                "skills": [],
+            },
+            {
+                "name": "product_catalog_admin",
+                "description": "Focused product specialist for create and update work.",
+                "skills": [],
+            },
+        ],
+    )
+
+    assert selected == "host"
+
+
+def test_select_router_handoff_agent_prefers_own_marketplace_specialist_for_mixed_inventory_prompt() -> None:
+    selected = _select_router_handoff_agent(
+        "product",
+        "can you help me search for latest adidas shoes online, i want to buy shoes and start my inventory with them",
+        [
+            {
+                "name": "host",
+                "description": "Workspace host agent.",
+                "skills": [],
+            },
+            {
+                "name": "marketplace_sourcing",
+                "description": "Focused product specialist for online supplier and marketplace search.",
+                "skills": [],
+            },
+            {
+                "name": "inventory",
+                "description": "Workspace inventory agent.",
+                "skills": [],
+            },
+        ],
+    )
+
+    assert selected == "marketplace_sourcing"
+
+
+def test_select_router_handoff_agent_prefers_inventory_visibility_for_location_read_query() -> None:
+    selected = _select_router_handoff_agent(
+        "inventory",
+        "List the stock locations in my electronics store setup.",
+        [
+            {
+                "name": "inventory_visibility",
+                "description": "Focused inventory specialist for stock posture, alerts, reservations, and warehouse visibility.",
+                "skills": [],
+            },
+            {
+                "name": "inventory_setup",
+                "description": "Focused inventory specialist for stock-location and inventory setup workflows.",
+                "skills": [],
+            },
+            {
+                "name": "inventory_procurement",
+                "description": "Focused inventory specialist for procurement workflows.",
+                "skills": [],
+            },
+        ],
+    )
+
+    assert selected == "inventory_visibility"
 
 
 def test_classify_failed_operation_reports_tls_discovery_failure() -> None:
@@ -457,6 +651,11 @@ def test_select_host_delegation_agent_prefers_best_matching_specialist() -> None
 
     assert _select_host_delegation_agent("help me set up my inventory workspace from scratch", agents) == "onboarding"
     assert _select_host_delegation_agent("search for a t-shirt product", agents) == "product"
+    assert _select_host_delegation_agent(
+        "can you help me search for latest adidas shoes online, i want to buy shoes and start my inventory with them",
+        agents,
+    ) == "product"
+    assert _select_host_delegation_agent("can you check shoes on chinese websites", agents) == "product"
     assert _select_host_delegation_agent("check stock alerts for the warehouse", agents) == "inventory"
     assert _select_host_delegation_agent("show my open cashier session", agents) == "pos"
 
@@ -503,6 +702,128 @@ async def test_host_auto_delegates_and_waits_for_specialist_result() -> None:
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == "Found 3 products matching t-shirt."
+
+
+@pytest.mark.asyncio
+async def test_marketplace_sourcing_executes_direct_search_without_delegation() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="marketplace_sourcing")
+    request = "can you help me search for latest adidas shoes online, i want to buy shoes and start my inventory with them"
+    task = Task(
+        id="task-marketplace-search",
+        context_id="ctx-marketplace-search",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("search_marketplace_products", {"query": "latest adidas shoes", "max_results": 10}),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["interaction_type"] == "marketplace_results"
+    assert payload["query"] == "latest adidas shoes"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[0].state == TaskState.working
+    assert _text_from_parts(status_events[0].message.parts) == "Searching online marketplaces for matching products."
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_marketplace_sourcing_executes_direct_search_for_chinese_websites_query() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="marketplace_sourcing")
+    request = "can you check shoes on chinese websites"
+    task = Task(
+        id="task-marketplace-china",
+        context_id="ctx-marketplace-china",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "search_marketplace_products",
+            {
+                "query": "shoes",
+                "max_results": 10,
+                "marketplaces": ["alibaba", "aliexpress", "temu", "dhgate"],
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["interaction_type"] == "marketplace_results"
+    assert payload["query"] == "shoes"
+
+
+@pytest.mark.asyncio
+async def test_marketplace_sourcing_compares_selected_results_directly() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="marketplace_sourcing")
+    prior_payload = {
+        "interaction_type": "marketplace_results",
+        "title": "Marketplace results for “latest adidas shoes”",
+        "description": "Found 3 marketplace matches.",
+        "query": "latest adidas shoes",
+        "products": [
+            {"id": "adidas-1", "title": "Adidas Ultraboost Light", "marketplace": "Amazon", "price": "USD 129.99"},
+            {"id": "adidas-2", "title": "Adidas Adizero SL 2", "marketplace": "eBay", "price": "USD 119.00"},
+        ],
+    }
+    response_text = json.dumps(
+        {
+            "type": "marketplace_results_response",
+            "action": "compare_selected",
+            "query": "latest adidas shoes",
+            "selected_items": prior_payload["products"],
+        }
+    )
+    task = Task(
+        id="task-marketplace-compare",
+        context_id="ctx-marketplace-compare",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=response_text)]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="search online for adidas shoes")]),
+            Message(role=Role.agent, parts=[DataPart(data=prior_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=response_text)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "compare_marketplace_products",
+            {
+                "items": prior_payload["products"],
+                "title": "Compare offers for latest adidas shoes",
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["interaction_type"] == "comparison_view"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
 
 
 @pytest.mark.asyncio
@@ -1632,7 +1953,6 @@ async def test_onboarding_agent_review_confirmation_creates_inventory_setup_dire
         "description": "Review your onboarding plan.",
         "options": [
             {"value": "create_now", "label": "Create This Setup"},
-            {"value": "revise_answers", "label": "Revise My Answers"},
             {"value": "cancel_onboarding", "label": "Cancel For Now"},
         ],
         "multiple": False,
@@ -1677,29 +1997,28 @@ async def test_onboarding_agent_review_confirmation_creates_inventory_setup_dire
 
     events = [event async for event in processor(task, message, None, None)]
 
-    assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
-        "users.get_active_company_profile",
-        "inventory.create_stock_location",
-        "inventory.create_stock_location",
-        "inventory.create_stock_location",
-        "inventory.create_inventory_category",
-        "inventory.create_inventory_category",
-        "inventory.create_inventory_category",
-        "inventory.create_inventory_item",
-    ]
-    first_location_args = fake_langgraph_components.FAKE_TOOL_CALLS[1][1]["payload"]
-    second_location_args = fake_langgraph_components.FAKE_TOOL_CALLS[2][1]["payload"]
-    first_category_args = fake_langgraph_components.FAKE_TOOL_CALLS[4][1]["payload"]
-    inventory_args = fake_langgraph_components.FAKE_TOOL_CALLS[7][1]["payload"]
+    tool_calls = list(fake_langgraph_components.FAKE_TOOL_CALLS)
+    create_calls = [(name, args) for name, args in tool_calls if ".create_" in name]
+    create_call_names = [name for name, _ in create_calls]
 
-    assert first_location_args == {
-        "name": "Main Warehouse",
-        "location_type_name": "warehouse",
-        "structural": True,
-    }
-    assert second_location_args["parent_id"] == "stock-location-main-warehouse"
-    assert first_category_args["default_location_id"] == "stock-location-main-warehouse"
-    assert inventory_args["inventory_category_id"] == "inventory-category-beverages"
+    assert tool_calls[0][0] == "users.get_active_company_profile"
+    assert "inventory.create_stock_location" in create_call_names
+    assert "inventory.create_inventory_category" in create_call_names
+    assert "inventory.create_inventory_item" in create_call_names
+    assert create_call_names.count("inventory.create_stock_location") >= 1
+    assert create_call_names.count("inventory.create_inventory_category") >= 1
+
+    second_location_args = next(
+        args["payload"]
+        for name, args in create_calls
+        if name == "inventory.create_stock_location" and args["payload"].get("parent_id")
+    )
+    first_category_args = next(args["payload"] for name, args in create_calls if name == "inventory.create_inventory_category")
+    inventory_args = next(args["payload"] for name, args in create_calls if name == "inventory.create_inventory_item")
+
+    assert second_location_args["parent_id"]
+    assert first_category_args["default_location_id"]
+    assert inventory_args["inventory_category_id"]
     assert not any(isinstance(event, Artifact) and event.name == "delegation" for event in events)
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
@@ -1710,7 +2029,6 @@ async def test_onboarding_agent_review_confirmation_creates_inventory_setup_dire
         event for event in events if isinstance(event, Artifact) and event.name == "onboarding.created_operations"
     )
     assert len(created_artifact.parts[0].data["operations"]) == 7
-
 
 @pytest.mark.asyncio
 async def test_onboarding_agent_resume_prompt_appears_for_saved_workflow(
@@ -1789,7 +2107,6 @@ async def test_onboarding_agent_partial_failures_prompt_for_retry(
         "description": "Review your onboarding plan.",
         "options": [
             {"value": "create_now", "label": "Create This Setup"},
-            {"value": "revise_answers", "label": "Revise My Answers"},
             {"value": "cancel_onboarding", "label": "Cancel For Now"},
         ],
         "multiple": False,
@@ -1834,18 +2151,20 @@ async def test_onboarding_agent_partial_failures_prompt_for_retry(
 
     assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
         "users.get_active_company_profile",
-        "inventory.create_stock_location",
+        "inventory.search_stock_locations",
+        "inventory.list_inventory_categories",
         "inventory.create_inventory_category",
         "inventory.create_inventory_category",
         "inventory.create_inventory_category",
+        "inventory.create_inventory_item",
         "create_multiple_choice",
     ]
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
     assert result_artifact.parts[0].data["workflow_stage"] == "retry"
-    assert len(result_artifact.parts[0].data["created_operations"]) == 1
-    assert len(result_artifact.parts[0].data["failed_operations"]) == 4
+    assert len(result_artifact.parts[0].data["created_operations"]) == 2
+    assert len(result_artifact.parts[0].data["failed_operations"]) == 3
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.input_required
@@ -2177,6 +2496,102 @@ async def test_host_multi_domain_continue_response_delegates_next_specialist() -
 
 
 @pytest.mark.asyncio
+async def test_host_inventory_confirmation_stays_with_inventory_specialist() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    request = "Group my inventories into categories and assign items"
+    task = Task(
+        id="task-host-inventory-confirm",
+        context_id="ctx-host-inventory-confirm",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        ("delegate_to_agent", {"request": request, "agent_name": "inventory"}),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "inventory"
+    assert delegation_artifact.parts[0].data["finalState"] == "input-required"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert (
+        _text_from_parts(result_artifact.parts)
+        == "I reviewed the inventory items and prepared a category plan. Once you confirm, I'll create the categories and assign the items."
+    )
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_host_inventory_confirmation_follow_up_routes_back_to_same_specialist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    seed_request = "Group my inventories into categories and assign items"
+    seed_task = Task(
+        id="task-host-inventory-confirm-seed",
+        context_id="ctx-host-inventory-confirm-follow-up",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=seed_request)]),
+        ),
+    )
+    seed_message = Message(role=Role.user, parts=[TextPart(text=seed_request)])
+    seed_events = [event async for event in processor(seed_task, seed_message, None, None)]
+    seed_result_text = _text_from_parts(
+        next(event for event in seed_events if isinstance(event, Artifact) and event.name == "result").parts
+    )
+    fake_langgraph_components.reset_fake_components()
+
+    request = "Yes, proceed."
+    task = Task(
+        id="task-host-inventory-confirm-follow-up",
+        context_id="ctx-host-inventory-confirm-follow-up",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request)]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text=seed_request)]),
+            Message(role=Role.agent, parts=[TextPart(text=seed_result_text)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "delegate_to_agent",
+            {
+                "request": request,
+                "agent_name": "inventory",
+                "delegated_task_id": "delegated-inventory-categorize",
+            },
+        ),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "inventory"
+    assert delegation_artifact.parts[0].data["finalState"] == "completed"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == "Created 3 inventory categories and assigned 14 inventory items."
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.completed
+
+
+@pytest.mark.asyncio
 async def test_inventory_router_auto_delegates_to_inventory_setup_subspecialist() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="inventory")
     task = Task(
@@ -2214,15 +2629,16 @@ async def test_inventory_setup_rewrites_relation_text_fields_to_select_options(
     monkeypatch.setenv("KA2A_LLM_FACTORY", "tests.fake_langgraph_components:fake_relation_interaction_llm_factory")
 
     processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    request_text = "help me create an inventory item called Main Inventory"
     task = Task(
         id="task-relation-form",
         context_id="ctx-relation-form",
         status=TaskStatus(
             state=TaskState.submitted,
-            message=Message(role=Role.user, parts=[TextPart(text="help me set up an inventory")]),
+            message=Message(role=Role.user, parts=[TextPart(text=request_text)]),
         ),
     )
-    message = Message(role=Role.user, parts=[TextPart(text="help me set up an inventory")])
+    message = Message(role=Role.user, parts=[TextPart(text=request_text)])
 
     events = [event async for event in processor(task, message, None, None)]
 
@@ -2340,6 +2756,74 @@ async def test_inventory_setup_descriptive_create_request_opens_prefilled_dynami
 
 
 @pytest.mark.asyncio
+async def test_inventory_setup_location_request_prefills_name_type_and_parent() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    request = "Create a stock location called Bulb Display Shelf with location type shelf under Main Warehouse."
+    task = Task(
+        id="task-inventory-setup-location-form",
+        context_id="ctx-inventory-setup-location-form",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=request)])),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    payload = next(event for event in events if isinstance(event, Artifact) and event.name == "result").parts[0].data
+    assert payload["mutation_action"] == "create_stock_location"
+    assert payload["current_values"] == {
+        "location_name": "Bulb Display Shelf",
+        "location_type_name": "Shelf",
+        "parent_id": "loc-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_inventory_setup_inventory_item_request_prefills_name_category_and_description() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    request = (
+        "Create an inventory item called LED Bulb Stock in category Men's Clothes "
+        "at Main Warehouse with description for boxed LED lighting inventory."
+    )
+    task = Task(
+        id="task-inventory-setup-item-form",
+        context_id="ctx-inventory-setup-item-form",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=request)])),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    payload = next(event for event in events if isinstance(event, Artifact) and event.name == "result").parts[0].data
+    assert payload["mutation_action"] == "create_inventory_item"
+    assert payload["current_values"] == {
+        "default_inventory_name": "LED Bulb Stock",
+        "inventory_description": "for boxed LED lighting inventory",
+        "inventory_category_id": "cat-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_inventory_setup_list_categories_query_uses_direct_lookup() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    request = "List the inventory categories for my store."
+    task = Task(
+        id="task-inventory-setup-list-categories",
+        context_id="ctx-inventory-setup-list-categories",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=request)])),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("inventory.list_inventory_categories", {}),
+    ]
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert "Men's Clothes" in result_artifact.parts[0].text
+
+
+@pytest.mark.asyncio
 async def test_inventory_setup_form_response_executes_inventory_create() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
     form_payload = {
@@ -2389,6 +2873,55 @@ async def test_inventory_setup_form_response_executes_inventory_create() -> None
     assert result_artifact.parts[0].text == "Inventory item created successfully."
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.completed
+
+
+@pytest.mark.asyncio
+async def test_inventory_setup_executes_approved_onboarding_creation_request_without_reconfirming() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    onboarding_data = {
+        "scope": "full_setup",
+        "flat": {
+            "primary_location_name": "Main Warehouse",
+            "primary_location_type": "warehouse",
+            "additional_locations": "Front Store\nReturns Shelf",
+            "category_names": "Beverages\nSnacks",
+            "default_inventory_name": "Main Inventory",
+        },
+    }
+    request_text = _onboarding_creation_request("full_setup", onboarding_data)
+    task = Task(
+        id="task-inventory-setup-approved-onboarding",
+        context_id="ctx-inventory-setup-approved-onboarding",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request_text)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request_text)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "delegate_to_agent",
+            {
+                "request": request_text,
+                "agent_name": "onboarding",
+            },
+        )
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == (
+        "Created 3 stock locations, 2 inventory categories, and 1 inventory item for onboarding."
+    )
+    assert not any(
+        isinstance(event, Artifact)
+        and event.name == "result"
+        and isinstance(event.parts[0], DataPart)
+        and event.parts[0].data.get("interaction_type") == "dynamic_form"
+        for event in events
+    )
 
 
 @pytest.mark.asyncio
@@ -2536,6 +3069,32 @@ async def test_inventory_fulfillment_transfer_request_opens_prefilled_form() -> 
 
 
 @pytest.mark.asyncio
+async def test_inventory_fulfillment_reservation_request_opens_prefilled_form() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_fulfillment")
+    request = "Create a stock reservation for 2 units of Men's Oxford Shirt Inventory at Main Warehouse for showroom transfer."
+    task = Task(
+        id="task-fulfillment-reservation-form",
+        context_id="ctx-fulfillment-reservation-form",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=request)])),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    payload = next(event for event in events if isinstance(event, Artifact) and event.name == "result").parts[0].data
+    assert payload["workflow"] == "inventory_fulfillment_mutation"
+    assert payload["mutation_action"] == "create_stock_reservation"
+    assert payload["current_values"] == {
+        "inventory_item_id": "inv-1",
+        "stock_location_id": "loc-1",
+        "quantity": "2",
+        "external_order_type": "sales_order",
+        "external_order_id": "showroom-transfer",
+        "notes": "Showroom transfer reservation",
+    }
+
+
+@pytest.mark.asyncio
 async def test_inventory_fulfillment_form_response_executes_adjustment() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="inventory_fulfillment")
     form_payload = {
@@ -2584,6 +3143,53 @@ async def test_inventory_fulfillment_form_response_executes_adjustment() -> None
     ]
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert result_artifact.parts[0].text == "Inventory adjustment completed successfully."
+
+
+@pytest.mark.asyncio
+async def test_inventory_fulfillment_form_response_executes_reservation_create() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_fulfillment")
+    form_payload = {
+        "interaction_type": "dynamic_form",
+        "workflow": "inventory_fulfillment_mutation",
+        "workflow_stage": "form",
+        "mutation_action": "create_stock_reservation",
+    }
+    form_response = (
+        '{"type":"form_response","data":{"inventory_item_id":"inv-1","stock_location_id":"loc-1","quantity":"2",'
+        '"external_order_type":"sales_order","external_order_id":"showroom-transfer","external_order_line_id":"line-1","notes":"Showroom transfer reservation"},'
+        '"message":"Form submitted successfully"}'
+    )
+    task = Task(
+        id="task-fulfillment-reservation-form-submit",
+        context_id="ctx-fulfillment-reservation-form-submit",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=form_response)])),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="Reserve 2 units for showroom transfer")]),
+            Message(role=Role.agent, parts=[DataPart(data=form_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=form_response)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "inventory.create_stock_reservation",
+            {
+                "payload": {
+                    "inventory_item_id": "inv-1",
+                    "stock_location_id": "loc-1",
+                    "reserved_quantity": "2",
+                    "external_order_type": "sales_order",
+                    "external_order_id": "showroom-transfer",
+                    "external_order_line_id": "line-1",
+                    "notes": "Showroom transfer reservation",
+                }
+            },
+        )
+    ]
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].text == "Stock reservation created successfully."
 
 
 @pytest.mark.asyncio

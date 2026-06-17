@@ -162,6 +162,43 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         structured = _extract_primary_data(parts)
         return text, structured
 
+    def _latest_pending_interaction_payload(messages: list[Any]) -> dict[str, Any] | None:
+        for message in reversed(messages):
+            if str(getattr(message, "role", "") or "").strip() != ConversationMessageRole.assistant.value:
+                continue
+            payload = getattr(message, "structured_payload", None)
+            if not isinstance(payload, dict) or not payload:
+                continue
+            interaction_type = str(payload.get("interaction_type") or payload.get("type") or "").strip().lower()
+            if interaction_type:
+                return payload
+        return None
+
+    def _looks_like_structured_interaction_response(text: str) -> bool:
+        raw = str(text or "").strip()
+        if not raw.startswith("{"):
+            return False
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        interaction_type = str(payload.get("interaction_type") or payload.get("type") or "").strip().lower()
+        if interaction_type.endswith("_response"):
+            return True
+        return any(key in payload for key in ("selected", "response", "responses", "additional_input"))
+
+    def _pending_interaction_requires_structured_reply(payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict) or not payload:
+            return False
+        interaction_type = str(payload.get("interaction_type") or payload.get("type") or "").strip().lower()
+        if not interaction_type:
+            return False
+        if interaction_type == "multiple_choice":
+            return not bool(payload.get("allow_input") or payload.get("allow_additional_input"))
+        return True
+
     def _history_content_for_message(message) -> str:
         content = str(message.content or "").strip()
         if content:
@@ -410,6 +447,23 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         conversation.agent_icon_url = str(refreshed_config.get("icon_url") or conversation.agent_icon_url).strip()
         await _save_conversation_update(websocket, conversation)
         resume_task_id = conversation.resume_task_id if conversation.awaiting_input else None
+        if resume_task_id:
+            detail = await deps.chat_store.get_conversation_detail(
+                conversation_id=conversation.id,
+                profile_id=profile_id,
+                user_id=principal.user_id,
+                message_limit=8,
+            )
+            pending_interaction = (
+                _latest_pending_interaction_payload(detail.messages)
+                if detail is not None
+                else None
+            )
+            if (
+                _pending_interaction_requires_structured_reply(pending_interaction)
+                and not _looks_like_structured_interaction_response(text)
+            ):
+                resume_task_id = None
         context_id = conversation.last_context_id
 
         user_message = await deps.chat_store.append_message(

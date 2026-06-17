@@ -598,6 +598,26 @@ def _dump_result(result: Any) -> Any:
     return result
 
 
+def _error_text_from_mcp_result(result: Any) -> str | None:
+    if hasattr(result, "model_dump"):
+        result = result.model_dump(by_alias=True, exclude_none=True)  # type: ignore[assignment]
+    if not isinstance(result, dict) or not bool(result.get("isError")):
+        return None
+
+    content = result.get("content")
+    if isinstance(content, list):
+        messages: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                messages.append(text.strip())
+        if messages:
+            return "\n".join(messages)
+    return "Remote MCP tool returned an error."
+
+
 def _compact_tool_arguments(value: Any) -> Any:
     if isinstance(value, dict):
         compacted: dict[str, Any] = {}
@@ -645,6 +665,9 @@ async def _call_remote_tool(
         remote_tool=name,
         argument_keys=argument_keys,
     )
+    error_text = _error_text_from_mcp_result(result)
+    if error_text:
+        raise RuntimeError(error_text)
     return _dump_result(result)
 
 

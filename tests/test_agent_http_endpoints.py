@@ -623,3 +623,172 @@ def test_conversation_websocket_rebuilds_structured_history_for_follow_up(
             assert saw_final_response is True
 
         assert call_count["value"] == 2
+
+
+def test_conversation_plain_text_breaks_out_of_closed_interaction_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    manager_token = _make_token(
+        user_id="82",
+        profile_id="52",
+        owner_id="99",
+        permissions=["manage_agent_settings", "interact_with_agent"],
+    )
+    stream_message_calls = {"value": 0}
+    continue_calls = {"value": 0}
+
+    async def _fake_stream_message(self, *, message=None, **_: object):
+        stream_message_calls["value"] += 1
+
+        async def _stream():
+            if stream_message_calls["value"] == 1:
+                yield _FakeEvent(
+                    {
+                        "kind": "task",
+                        "id": "task-82-a",
+                        "contextId": "ctx-82",
+                        "status": {"state": "working"},
+                    },
+                    kind="task",
+                    id="task-82-a",
+                    context_id="ctx-82",
+                    status=SimpleNamespace(state="working"),
+                )
+                artifact_payload = {
+                    "name": "result",
+                    "parts": [
+                        {
+                            "kind": "data",
+                            "data": {
+                                "interaction_type": "multiple_choice",
+                                "title": "Continue Workflow",
+                                "description": "Choose how you want to continue.",
+                                "options": [{"value": "continue_next", "label": "Continue"}],
+                                "multiple": False,
+                                "allow_input": False,
+                            },
+                        }
+                    ],
+                }
+                yield _FakeEvent(
+                    {
+                        "kind": "artifact-update",
+                        "taskId": "task-82-a",
+                        "contextId": "ctx-82",
+                        "artifact": artifact_payload,
+                    },
+                    kind="artifact-update",
+                    task_id="task-82-a",
+                    context_id="ctx-82",
+                    artifact=SimpleNamespace(model_dump=lambda **__: artifact_payload),
+                )
+                final_message = {
+                    "role": "assistant",
+                    "parts": artifact_payload["parts"],
+                }
+                yield _FakeEvent(
+                    {
+                        "kind": "status-update",
+                        "taskId": "task-82-a",
+                        "contextId": "ctx-82",
+                        "status": {"state": "input-required", "message": final_message},
+                        "final": True,
+                    },
+                    kind="status-update",
+                    task_id="task-82-a",
+                    context_id="ctx-82",
+                    status=SimpleNamespace(state="input-required", message=SimpleNamespace(model_dump=lambda **__: final_message)),
+                    final=True,
+                )
+                return
+
+            yield _FakeEvent(
+                {
+                    "kind": "task",
+                    "id": "task-82-b",
+                    "contextId": "ctx-82-b",
+                    "status": {"state": "working"},
+                },
+                kind="task",
+                id="task-82-b",
+                context_id="ctx-82-b",
+                status=SimpleNamespace(state="working"),
+            )
+            final_message = {
+                "role": "assistant",
+                "messageId": "msg-82",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "Started a fresh request instead of resuming the stale workflow prompt.",
+                    }
+                ],
+            }
+            yield _FakeEvent(
+                {
+                    "kind": "status-update",
+                    "taskId": "task-82-b",
+                    "contextId": "ctx-82-b",
+                    "status": {"state": "completed", "message": final_message},
+                    "final": True,
+                },
+                kind="status-update",
+                task_id="task-82-b",
+                context_id="ctx-82-b",
+                status=SimpleNamespace(state="completed", message=SimpleNamespace(model_dump=lambda **__: final_message)),
+                final=True,
+            )
+
+        return _stream()
+
+    async def _fake_continue_task_stream(self, **_: object):
+        continue_calls["value"] += 1
+        raise AssertionError("Plain-text follow-up should not resume a closed-choice interaction.")
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.continue_task_stream", _fake_continue_task_stream)
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        templates = client.get("/agent_api/templates/", headers=_auth_headers(manager_token))
+        template = templates.json()[0]
+        install_response = client.post(
+            f"/agent_api/templates/{template['id']}/install/",
+            headers=_auth_headers(manager_token),
+            json={"slug": "closed-prompt-host", "name": "Closed Prompt Host"},
+        )
+        assert install_response.status_code == 200
+
+        created = client.post(
+            "/conversations",
+            headers=_auth_headers(manager_token),
+            json={"agent_slug": "closed-prompt-host", "title": "Closed prompt thread"},
+        )
+        assert created.status_code == 200
+        conversation_id = created.json()["conversation"]["id"]
+
+        with client.websocket_connect(f"/ws/conversations/{conversation_id}?token={manager_token}") as websocket:
+            snapshot = websocket.receive_json()
+            assert snapshot["type"] == "conversation.snapshot"
+
+            websocket.send_json({"type": "message.send", "text": "continue"})
+            saw_prompt = False
+            for _ in range(20):
+                envelope = websocket.receive_json()
+                if envelope.get("type") == "message.created" and envelope.get("message", {}).get("structuredPayload"):
+                    saw_prompt = True
+                    break
+            assert saw_prompt is True
+
+            websocket.send_json({"type": "message.send", "text": "search for Adidas shoes online"})
+            saw_fresh_response = False
+            for _ in range(20):
+                envelope = websocket.receive_json()
+                if envelope.get("type") == "message.created":
+                    content = envelope.get("message", {}).get("content") or ""
+                    if "Started a fresh request" in content:
+                        saw_fresh_response = True
+                        break
+            assert saw_fresh_response is True
+
+        assert stream_message_calls["value"] == 2
+        assert continue_calls["value"] == 0

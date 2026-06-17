@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import secrets
 from datetime import datetime
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
@@ -10,6 +16,8 @@ from starlette.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from kafka_a2a.server.auth import JwtBearerConfig
+from kafka_a2a.marketplace_tools import _extract_price
+from kafka_a2a.tavily import tavily_search_raw
 
 from ..common.auth import build_agent_auth_context, get_bearer_token_from_request, require_permission
 from .services import AgentControlPlaneError, AgentControlPlaneService, AgentRuntimeAccessContext
@@ -93,6 +101,107 @@ class AttachSkillPayload(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class BulkPriceResearchPayload(BaseModel):
+    task_id: str
+    currency: str | None = None
+    apply: bool = True
+    max_products: int = 25
+    max_results_per_variant: int = 5
+
+
+def _product_service_base_url() -> str:
+    return (
+        os.environ.get("KA2A_PRODUCT_SERVICE_URL")
+        or os.environ.get("PRODUCT_SERVICE_URL")
+        or os.environ.get("PRODUCT_BACKEND_URL")
+        or "http://product:7003"
+    ).rstrip("/")
+
+
+def _http_json_request(
+    *,
+    url: str,
+    method: str = "GET",
+    token: str,
+    payload: dict[str, Any] | None = None,
+    timeout_s: float = 30.0,
+) -> dict[str, Any]:
+    body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}",
+    }
+    if body is not None:
+        headers["content-type"] = "application/json"
+    request = UrlRequest(url, data=body, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=timeout_s) as response:  # noqa: S310
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(raw)
+        except Exception:
+            detail = raw or str(exc)
+        raise HTTPException(status_code=int(exc.code), detail=detail) from exc
+    except (TimeoutError, URLError) as exc:
+        raise HTTPException(status_code=502, detail=f"Product service request failed: {exc}") from exc
+
+
+def _iter_bulk_variants(products: list[dict[str, Any]], *, max_products: int) -> list[dict[str, str]]:
+    variants: list[dict[str, str]] = []
+    for product in products[: max(1, min(max_products, 100))]:
+        product_name = str(product.get("name") or "").strip()
+        category = str(product.get("category") or "").strip()
+        for variant in product.get("variants") or []:
+            if not isinstance(variant, dict):
+                continue
+            variant_id = str(variant.get("id") or "").strip()
+            if not variant_id:
+                continue
+            variant_name = str(variant.get("name") or product_name).strip()
+            sku = str(variant.get("sku") or product.get("sku") or "").strip()
+            variants.append({
+                "product_id": str(product.get("id") or ""),
+                "product_name": product_name,
+                "variant_id": variant_id,
+                "variant_name": variant_name,
+                "sku": sku,
+                "category": category,
+            })
+    return variants
+
+
+def _best_price_from_tavily_response(response: dict[str, Any], *, currency: str) -> dict[str, Any] | None:
+    target_currency = (currency or "").strip().upper()
+    candidates: list[dict[str, Any]] = []
+    for item in response.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        text = " ".join(
+            str(item.get(key) or "")
+            for key in ("title", "content", "raw_content")
+        )
+        price_label, amount, found_currency = _extract_price(text)
+        if amount is None or amount <= 0:
+            continue
+        candidates.append({
+            "price_label": price_label,
+            "amount": amount,
+            "currency": found_currency,
+            "title": str(item.get("title") or ""),
+            "url": str(item.get("url") or ""),
+            "score": item.get("score"),
+            "matches_requested_currency": bool(found_currency and found_currency.upper() == target_currency),
+        })
+    requested = [item for item in candidates if item["matches_requested_currency"]]
+    pool = requested or candidates
+    if not pool:
+        return None
+    return sorted(pool, key=lambda item: (not item["matches_requested_currency"], item["amount"]))[0]
+
+
 def build_agents_router(
     *,
     service: AgentControlPlaneService,
@@ -119,6 +228,108 @@ def build_agents_router(
         provided = (request.headers.get("X-KA2A-Runtime-Token") or "").strip()
         if not expected or not provided or not secrets.compare_digest(expected, provided):
             raise HTTPException(status_code=403, detail="Runtime sync token is invalid.")
+
+    @router.post("/price-research/bulk-task/")
+    async def research_bulk_task_prices(body: BulkPriceResearchPayload, request: Request):
+        access = _runtime_access(request)
+        if not access.can_interact():
+            raise HTTPException(status_code=403, detail="Missing permission: interact_with_agent")
+
+        token = get_bearer_token_from_request(request)
+        if not token:
+            raise HTTPException(status_code=401, detail="Bearer token is required.")
+
+        tavily_api_key = await run_in_threadpool(
+            service.resolve_workspace_tavily_api_key,
+            profile_id=access.profile_id,
+        )
+        if not tavily_api_key:
+            raise HTTPException(status_code=400, detail="Tavily API key is not configured for this workspace.")
+
+        currency = (body.currency or "").strip().upper() or "USD"
+        task_query = urlencode({"task_id": body.task_id})
+        task_url = f"{_product_service_base_url()}/product_api/products/bulk_task_status/?{task_query}"
+        task_payload = await asyncio.to_thread(_http_json_request, url=task_url, token=token)
+        products = task_payload.get("created_products") if isinstance(task_payload, dict) else None
+        if not isinstance(products, list) or not products:
+            raise HTTPException(status_code=404, detail="No created products were found for this bulk task.")
+
+        variants = _iter_bulk_variants(products, max_products=body.max_products)
+        if not variants:
+            raise HTTPException(status_code=404, detail="No product variants were found for this bulk task.")
+
+        results: list[dict[str, Any]] = []
+        applied_count = 0
+        for variant in variants:
+            query_parts = [
+                variant["variant_name"] or variant["product_name"],
+                variant["category"],
+                variant["sku"],
+                f"current retail price in {currency}",
+                "buy online",
+            ]
+            query = " ".join(part for part in query_parts if part).strip()
+            result: dict[str, Any] = {
+                **variant,
+                "query": query,
+                "currency": currency,
+                "status": "not_found",
+                "applied": False,
+            }
+            try:
+                tavily_response = await tavily_search_raw(
+                    api_key=tavily_api_key,
+                    query=query,
+                    max_results=max(1, min(body.max_results_per_variant, 10)),
+                    search_depth="basic",
+                    include_raw_content=True,
+                    include_images=False,
+                    timeout_s=20.0,
+                )
+                best_price = _best_price_from_tavily_response(tavily_response, currency=currency)
+                if best_price is None:
+                    results.append(result)
+                    continue
+
+                result.update({
+                    "status": "suggested",
+                    "suggested_price": f"{best_price['amount']:.2f}",
+                    "suggested_currency": best_price.get("currency"),
+                    "source_title": best_price.get("title"),
+                    "source_url": best_price.get("url"),
+                    "matches_requested_currency": best_price.get("matches_requested_currency", False),
+                })
+
+                if body.apply and best_price.get("matches_requested_currency"):
+                    patch_url = f"{_product_service_base_url()}/product_api/variants/{variant['variant_id']}/"
+                    await asyncio.to_thread(
+                        _http_json_request,
+                        url=patch_url,
+                        method="PATCH",
+                        token=token,
+                        payload={"price_override": f"{best_price['amount']:.2f}"},
+                    )
+                    result["status"] = "applied"
+                    result["applied"] = True
+                    applied_count += 1
+            except HTTPException:
+                raise
+            except Exception as exc:
+                result.update({"status": "failed", "error": str(exc)})
+            results.append(result)
+
+        return {
+            "task_id": body.task_id,
+            "currency": currency,
+            "apply": body.apply,
+            "product_count": len(products),
+            "variant_count": len(variants),
+            "suggested_count": sum(1 for item in results if item.get("suggested_price")),
+            "applied_count": applied_count,
+            "skipped_count": sum(1 for item in results if item.get("status") in {"not_found", "suggested"}),
+            "failed_count": sum(1 for item in results if item.get("status") == "failed"),
+            "results": results,
+        }
 
     @router.get("/templates/")
     async def list_templates(request: Request):

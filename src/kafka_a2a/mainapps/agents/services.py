@@ -56,6 +56,21 @@ def _infer_provider_from_model_name(model_name: str) -> tuple[str, str]:
     return "unknown", "Unknown"
 
 
+def _normalize_workspace_model_version_id(version_id: str, provider: str) -> str:
+    normalized = (version_id or "").strip()
+    provider_lower = (provider or "").strip().lower()
+    aliases = {
+        "gpt-3.5-turbo": "gpt-5-mini",
+        "gpt-4.1-mini": "gpt-5-mini",
+        "gpt-4o-mini": "gpt-5-mini",
+        "gpt-4.1": "gpt-5.4",
+        "gpt-4o": "gpt-5.4",
+    }
+    if provider_lower in {"chatgpt", "openai"}:
+        return aliases.get(normalized, normalized)
+    return normalized
+
+
 def _encrypt_secret(value: str) -> str:
     raw = (value or "").strip()
     if not raw:
@@ -94,6 +109,11 @@ def _decrypt_secret(value: str) -> str:
         except Exception:
             return raw
     return raw
+
+
+def _has_usable_secret(value: str) -> bool:
+    decrypted = _decrypt_secret(value)
+    return bool(decrypted and not decrypted.startswith("gAAAA"))
 
 
 def _decrypt_json_secret(value: str) -> dict[str, Any]:
@@ -1518,6 +1538,8 @@ class AgentControlPlaneService:
                 "available_versions": model_versions,
             }
         version = next((item for item in self._list_model_version_records() if item.id == ai.version), None)
+        has_api_key = _has_usable_secret(ai.api_key)
+        has_tavily_api_key = _has_usable_secret(ai.tavily_api_key)
         return {
             "configured": True,
             "agent": {
@@ -1533,10 +1555,12 @@ class AgentControlPlaneService:
                 "special_instruction": ai.special_instruction,
                 "system_instruction": ai.system_instruction,
                 "assistant_instruction": ai.assistant_instruction,
-                "has_api_key": bool(_decrypt_secret(ai.api_key)),
-                "has_tavily_api_key": bool(_decrypt_secret(ai.tavily_api_key)),
-                "api_key_masked": self._mask_secret(_decrypt_secret(ai.api_key)),
-                "tavily_api_key_masked": self._mask_secret(_decrypt_secret(ai.tavily_api_key)),
+                "has_api_key": has_api_key,
+                "has_tavily_api_key": has_tavily_api_key,
+                "api_key_masked": self._mask_secret(_decrypt_secret(ai.api_key)) if has_api_key else "",
+                "tavily_api_key_masked": self._mask_secret(_decrypt_secret(ai.tavily_api_key)) if has_tavily_api_key else "",
+                "api_key_requires_reconfiguration": bool(ai.api_key) and not has_api_key,
+                "tavily_api_key_requires_reconfiguration": bool(ai.tavily_api_key) and not has_tavily_api_key,
             },
             "available_versions": model_versions,
         }
@@ -1576,23 +1600,15 @@ class AgentControlPlaneService:
         self._cache_clear()
         return self.get_workspace_ai_setup(profile_id=profile_id)
 
-    def import_users_service_payload(self, payload: dict[str, Any]) -> dict[str, int]:
-        self._cache_clear()
-        self.ensure_seeded()
-        templates_by_slug = {item.slug: item for item in self._list_template_records()}
-        skills_by_key = {item.key: item for item in self._list_skill_records()}
-        tools_by_key = {item.key: item for item in self._list_tool_records()}
-        model_versions = self._list_model_version_records()
+    def _parse_users_service_ai_settings_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        existing_model_versions: list[ModelVersionOption] | None = None,
+    ) -> tuple[list[ModelVersionOption], list[WorkspaceAiSettings]]:
+        model_versions = list(existing_model_versions or self._list_model_version_records())
         model_versions_by_id = {item.id: item for item in model_versions}
-
-        self._delete_records("workspace_ai_settings")
-        self._delete_records("workspace_tool_connections")
-        self._delete_records("workspace_skill_bindings")
-        self._delete_records("workspace_tool_bindings")
-        self._delete_records("workspace_agents")
-
         imported_ai_settings: list[WorkspaceAiSettings] = []
-        imported_tool_connections: list[WorkspaceToolConnection] = []
         ai_settings_rows = payload.get("workspace_ai_settings") or []
         for row in ai_settings_rows:
             if not isinstance(row, dict):
@@ -1602,6 +1618,7 @@ class AgentControlPlaneService:
             provider_label = str(row.get("provider_label") or "").strip()
             if not provider and version_id:
                 provider, provider_label = _infer_provider_from_model_name(version_id)
+            version_id = _normalize_workspace_model_version_id(version_id, provider)
             existing_model = model_versions_by_id.get(version_id) if version_id else None
             if version_id and existing_model is None:
                 model = ModelVersionOption(
@@ -1631,6 +1648,39 @@ class AgentControlPlaneService:
                     tavily_api_key=str(row.get("tavily_api_key") or ""),
                 )
             )
+        return model_versions, imported_ai_settings
+
+    def sync_users_ai_settings_payload(self, payload: dict[str, Any]) -> dict[str, int]:
+        self._cache_clear()
+        self.ensure_seeded()
+        model_versions, imported_ai_settings = self._parse_users_service_ai_settings_payload(payload)
+        self._upsert_records("model_versions", model_versions)
+        self._upsert_records("workspace_ai_settings", imported_ai_settings)
+        self._cache_clear()
+        return {
+            "workspace_ai_settings": len(imported_ai_settings),
+            "model_versions": len(model_versions),
+        }
+
+    def import_users_service_payload(self, payload: dict[str, Any]) -> dict[str, int]:
+        self._cache_clear()
+        self.ensure_seeded()
+        templates_by_slug = {item.slug: item for item in self._list_template_records()}
+        skills_by_key = {item.key: item for item in self._list_skill_records()}
+        tools_by_key = {item.key: item for item in self._list_tool_records()}
+        model_versions = self._list_model_version_records()
+
+        self._delete_records("workspace_ai_settings")
+        self._delete_records("workspace_tool_connections")
+        self._delete_records("workspace_skill_bindings")
+        self._delete_records("workspace_tool_bindings")
+        self._delete_records("workspace_agents")
+
+        model_versions, imported_ai_settings = self._parse_users_service_ai_settings_payload(
+            payload,
+            existing_model_versions=model_versions,
+        )
+        imported_tool_connections: list[WorkspaceToolConnection] = []
 
         tool_servers_by_server_id = {item.server_id: item for item in self._list_tool_server_records()}
         tool_connections_rows = payload.get("workspace_tool_connections") or []
@@ -1811,6 +1861,15 @@ class AgentControlPlaneService:
                 "apiKey": _secret_for_claim(tavily_api_key)
             }
         return self._cache_set(cache_key, payload)
+
+    def resolve_workspace_tavily_api_key(self, *, profile_id: str) -> str:
+        ai = self._get_workspace_ai_settings_record(profile_id=profile_id)
+        if ai is None:
+            return ""
+        api_key = _decrypt_secret(ai.tavily_api_key)
+        if api_key.startswith("gAAAA"):
+            return ""
+        return api_key
 
     def _workspace_agent_payloads(self, agents: list[WorkspaceAgent]) -> list[dict[str, Any]]:
         if not agents:

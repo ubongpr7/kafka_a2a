@@ -462,6 +462,23 @@ def _import_users_control_plane(args: argparse.Namespace) -> None:
         print(f" - {key}: {value}")
 
 
+def _import_users_ai_settings(args: argparse.Namespace) -> None:
+    path = Path(args.path).expanduser().resolve()
+    if not path.exists():
+        raise SystemExit(f"Migration payload was not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    settings = A2AAppSettings.from_env()
+    settings.ensure_dirs()
+    service = AgentControlPlaneService(
+        store=build_agent_control_plane_store(settings),
+        settings=settings,
+    )
+    stats = service.sync_users_ai_settings_payload(payload)
+    print("Imported users-service AI settings payload:")
+    for key, value in stats.items():
+        print(f" - {key}: {value}")
+
+
 def _sync_mcp_tool_servers(args: argparse.Namespace) -> None:
     settings = A2AAppSettings.from_env()
     settings.ensure_dirs()
@@ -719,6 +736,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_import = sub.add_parser("import-users-control-plane", help="Import exported users-service agent/setup payload into the A2A control plane")
     p_import.add_argument("--path", required=True, help="Path to JSON file exported from intera_users.")
     p_import.set_defaults(func=_import_users_control_plane)
+
+    p_import_ai = sub.add_parser(
+        "import-users-ai-settings",
+        help="Import only workspace AI settings from a users-service export into the A2A control plane.",
+    )
+    p_import_ai.add_argument("--path", required=True, help="Path to JSON file exported from intera_users.")
+    p_import_ai.set_defaults(func=_import_users_ai_settings)
 
     p_sync_mcp = sub.add_parser(
         "sync-mcp-tool-servers",
