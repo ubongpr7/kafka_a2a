@@ -1328,8 +1328,8 @@ async def test_host_procurement_payload_threads_calendar_windows_and_labels() ->
 
 
 def test_generic_inventory_setup_language_prefers_onboarding_over_direct_mutation() -> None:
-    assert _infer_onboarding_scope_from_text("I want to set up inventory") == "full_setup"
-    assert _infer_onboarding_scope_from_text("Help me setup inventory") == "full_setup"
+    assert _infer_onboarding_scope_from_text("I want to import products") == "product_onboarding"
+    assert _infer_onboarding_scope_from_text("Help me setup product import") == "product_onboarding"
     assert _inventory_setup_action_from_text("I want to set up inventory") is None
     assert _inventory_setup_action_from_text("Help me setup inventory") is None
     assert _inventory_setup_action_from_text("List the stock locations in my electronics store setup.") is None
@@ -2547,7 +2547,7 @@ async def test_host_continues_delegated_onboarding_interaction_with_same_task() 
             state=TaskState.submitted,
             message=Message(
                 role=Role.user,
-                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"full_setup","additional_input":null}')],
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"product_onboarding","additional_input":null}')],
             ),
         ),
         history=[
@@ -2557,7 +2557,7 @@ async def test_host_continues_delegated_onboarding_interaction_with_same_task() 
     )
     second_message = Message(
         role=Role.user,
-        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"full_setup","additional_input":null}')],
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"product_onboarding","additional_input":null}')],
     )
 
     second_events = [event async for event in processor(second_task, second_message, None, None)]
@@ -2566,7 +2566,7 @@ async def test_host_continues_delegated_onboarding_interaction_with_same_task() 
         (
             "delegate_to_agent",
             {
-                "request": '{"type":"multiple_choice_response","selected":"full_setup","additional_input":null}',
+                "request": '{"type":"multiple_choice_response","selected":"product_onboarding","additional_input":null}',
                 "agent_name": "onboarding",
                 "delegated_task_id": "delegated-onboarding-scope",
             },
@@ -2695,10 +2695,10 @@ async def test_onboarding_agent_scope_selection_opens_wizard() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
     picker_payload = {
         "interaction_type": "multiple_choice",
-        "title": "Start Inventory Onboarding",
+        "title": "Start Product Import",
         "description": "Choose the setup area you want to complete first. I will guide you step by step.",
         "options": [
-            {"value": "full_setup", "label": "Full Inventory Setup"},
+            {"value": "product_onboarding", "label": "Product Import"},
             {"value": "stock_locations", "label": "Stock Locations"},
             {"value": "inventory_categories", "label": "Inventory Categories"},
             {"value": "inventory_setup", "label": "Inventory Setup"},
@@ -2706,7 +2706,7 @@ async def test_onboarding_agent_scope_selection_opens_wizard() -> None:
         ],
         "multiple": False,
         "allow_input": True,
-        "workflow": "inventory_onboarding",
+        "workflow": "product_import",
         "workflow_stage": "scope_picker",
     }
     task = Task(
@@ -2716,7 +2716,7 @@ async def test_onboarding_agent_scope_selection_opens_wizard() -> None:
             state=TaskState.submitted,
             message=Message(
                 role=Role.user,
-                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"full_setup","additional_input":null}')],
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"product_onboarding","additional_input":null}')],
             ),
         ),
         history=[
@@ -2726,7 +2726,7 @@ async def test_onboarding_agent_scope_selection_opens_wizard() -> None:
     )
     message = Message(
         role=Role.user,
-        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"full_setup","additional_input":null}')],
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"product_onboarding","additional_input":null}')],
     )
 
     events = [event async for event in processor(task, message, None, None)]
@@ -2738,12 +2738,12 @@ async def test_onboarding_agent_scope_selection_opens_wizard() -> None:
         "product.get_product_categories",
         "users.get_active_company_profile",
     ]
-    assert fake_langgraph_components.FAKE_TOOL_CALLS[0][1]["title"] == "Full Inventory Setup Wizard"
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[0][1]["title"] == "Product Import Wizard"
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert result_artifact.parts[0].data["interaction_type"] == "wizard_flow"
     assert result_artifact.parts[0].data["workflow_stage"] == "wizard"
-    assert result_artifact.parts[0].data["onboarding_scope"] == "full_setup"
+    assert result_artifact.parts[0].data["onboarding_scope"] == "product_onboarding"
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.input_required
@@ -2754,10 +2754,10 @@ async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects
     processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
     picker_payload = {
         "interaction_type": "multiple_choice",
-        "title": "Start Inventory Onboarding",
+        "title": "Start Product Import",
         "description": "Choose the setup area you want to complete first. I will guide you step by step.",
         "options": [
-            {"value": "full_setup", "label": "Full Inventory Setup"},
+            {"value": "product_onboarding", "label": "Product Import"},
             {"value": "stock_locations", "label": "Stock Locations"},
             {"value": "inventory_categories", "label": "Inventory Categories"},
             {"value": "inventory_setup", "label": "Inventory Setup"},
@@ -2765,7 +2765,7 @@ async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects
         ],
         "multiple": False,
         "allow_input": True,
-        "workflow": "inventory_onboarding",
+        "workflow": "product_import",
         "workflow_stage": "scope_picker",
     }
     task = Task(
@@ -2877,7 +2877,7 @@ async def test_onboarding_agent_descriptive_request_opens_prefilled_wizard() -> 
     payload = result_artifact.parts[0].data
     assert payload["interaction_type"] == "wizard_flow"
     assert payload["workflow_stage"] == "wizard"
-    assert payload["onboarding_scope"] == "full_setup"
+    assert payload["onboarding_scope"] == "product_onboarding"
     assert payload["description"].startswith("I prefilled this setup from your message.")
 
     existing_responses = payload["existing_responses"]
@@ -2918,10 +2918,10 @@ async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects
     processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
     picker_payload = {
         "interaction_type": "multiple_choice",
-        "title": "Start Inventory Onboarding",
+        "title": "Start Product Import",
         "description": "Choose the setup area you want to complete first. I will guide you step by step.",
         "options": [
-            {"value": "full_setup", "label": "Full Inventory Setup"},
+            {"value": "product_onboarding", "label": "Product Import"},
             {"value": "stock_locations", "label": "Stock Locations"},
             {"value": "inventory_categories", "label": "Inventory Categories"},
             {"value": "inventory_setup", "label": "Inventory Setup"},
@@ -2929,7 +2929,7 @@ async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects
         ],
         "multiple": False,
         "allow_input": True,
-        "workflow": "inventory_onboarding",
+        "workflow": "product_import",
         "workflow_stage": "scope_picker",
     }
     task = Task(
@@ -2979,10 +2979,10 @@ async def test_onboarding_agent_inventory_setup_scope_populates_category_options
     processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
     picker_payload = {
         "interaction_type": "multiple_choice",
-        "title": "Start Inventory Onboarding",
+        "title": "Start Product Import",
         "description": "Choose the setup area you want to complete first. I will guide you step by step.",
         "options": [
-            {"value": "full_setup", "label": "Full Inventory Setup"},
+            {"value": "product_onboarding", "label": "Product Import"},
             {"value": "stock_locations", "label": "Stock Locations"},
             {"value": "inventory_categories", "label": "Inventory Categories"},
             {"value": "inventory_setup", "label": "Inventory Setup"},
@@ -2990,7 +2990,7 @@ async def test_onboarding_agent_inventory_setup_scope_populates_category_options
         ],
         "multiple": False,
         "allow_input": True,
-        "workflow": "inventory_onboarding",
+        "workflow": "product_import",
         "workflow_stage": "scope_picker",
     }
     task = Task(
@@ -3084,14 +3084,14 @@ async def test_onboarding_agent_wizard_completion_prompts_for_review() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
     wizard_payload = {
         "interaction_type": "wizard_flow",
-        "title": "Full Inventory Setup Wizard",
+        "title": "Product Import Wizard",
         "description": "Fill in the setup details and I will prepare the onboarding action plan.",
         "steps": [],
         "allow_back": True,
         "show_progress": True,
-        "workflow": "inventory_onboarding",
+        "workflow": "product_import",
         "workflow_stage": "wizard",
-        "onboarding_scope": "full_setup",
+        "onboarding_scope": "product_onboarding",
     }
     response_text = (
         '{"type":"wizard_flow_response","completed":true,"all_responses":'
@@ -3174,7 +3174,7 @@ async def test_onboarding_agent_review_uses_relation_labels_from_wizard_selectio
         ],
         "allow_back": True,
         "show_progress": True,
-        "workflow": "inventory_onboarding",
+        "workflow": "product_import",
         "workflow_stage": "wizard",
         "onboarding_scope": "inventory_setup",
     }
@@ -3230,9 +3230,9 @@ async def test_onboarding_agent_review_confirmation_creates_inventory_setup_dire
         ],
         "multiple": False,
         "allow_input": True,
-        "workflow": "inventory_onboarding",
+        "workflow": "product_import",
         "workflow_stage": "review",
-        "onboarding_scope": "full_setup",
+        "onboarding_scope": "product_onboarding",
         "onboarding_data": {
             "scope": "full_setup",
             "steps": {},
@@ -3246,7 +3246,7 @@ async def test_onboarding_agent_review_confirmation_creates_inventory_setup_dire
             },
             "raw_response": {},
         },
-        "onboarding_summary": "Scope: Full Inventory Setup",
+        "onboarding_summary": "Scope: Product Import",
     }
     task = Task(
         id="task-onboarding-confirm",
@@ -3341,9 +3341,9 @@ async def test_onboarding_agent_resume_prompt_appears_for_saved_workflow(
         (
             "create_multiple_choice",
             {
-                "title": "Resume Inventory Onboarding",
+                "title": "Resume Product Import",
                 "description": (
-                    "You have an unfinished Full Inventory Setup workflow.\n\n"
+                    "You have an unfinished Product Import workflow.\n\n"
                     "Choose whether to resume it or start a new onboarding flow."
                 ),
                 "options": [
@@ -3384,9 +3384,9 @@ async def test_onboarding_agent_partial_failures_prompt_for_retry(
         ],
         "multiple": False,
         "allow_input": True,
-        "workflow": "inventory_onboarding",
+        "workflow": "product_import",
         "workflow_stage": "review",
-        "onboarding_scope": "full_setup",
+        "onboarding_scope": "product_onboarding",
         "onboarding_data": {
             "scope": "full_setup",
             "steps": {},
@@ -3398,7 +3398,7 @@ async def test_onboarding_agent_partial_failures_prompt_for_retry(
             },
             "raw_response": {},
         },
-        "onboarding_summary": "Scope: Full Inventory Setup",
+        "onboarding_summary": "Scope: Product Import",
     }
     task = Task(
         id="task-onboarding-retry",

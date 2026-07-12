@@ -1994,7 +1994,7 @@ ONBOARDING_SCOPE_LABELS: dict[str, str] = {
     "stock_locations": "Catalog Discovery",
     "inventory_categories": "Category Matching",
     "inventory_setup": "Import Review",
-    "product_onboarding": "Product Selection",
+    "product_onboarding": "Product Import",
 }
 
 
@@ -2243,8 +2243,9 @@ def _with_interaction_metadata(payload: dict[str, Any], **metadata: Any) -> dict
 def _is_onboarding_payload(payload: dict[str, Any] | None, *, stage: str) -> bool:
     if not isinstance(payload, dict):
         return False
+    workflow = str(payload.get("workflow") or "").strip().lower()
     return (
-        str(payload.get("workflow") or "").strip().lower() == "inventory_onboarding"
+        workflow in {"inventory_onboarding", "product_import"}
         and str(payload.get("workflow_stage") or "").strip().lower() == stage
     )
 
@@ -2257,11 +2258,7 @@ def _onboarding_scope_picker_arguments(
         "title": "Start Product Import",
         "description": description,
         "options": [
-            {"value": "full_setup", "label": "Product Import"},
-            {"value": "stock_locations", "label": "Catalog Discovery"},
-            {"value": "inventory_categories", "label": "Category Matching"},
-            {"value": "inventory_setup", "label": "Import Review"},
-            {"value": "product_onboarding", "label": "Product Selection"},
+            {"value": "product_onboarding", "label": "Product Import"},
         ],
         "multiple": False,
         "allow_input": True,
@@ -2273,6 +2270,119 @@ def _select_options(options: list[tuple[str, str]]) -> list[dict[str, str]]:
 
 
 def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
+    if scope == "product_onboarding":
+        return [
+            {
+                "id": "filters",
+                "title": "Choose Catalog Filters",
+                "description": "First choose whether you want to browse by category, brand, or both. Then list the categories and brands you want.",
+                "fields": [
+                    {
+                        "name": "catalog_scope",
+                        "type": "select",
+                        "label": "Browse By",
+                        "required": True,
+                        "options": _select_options(
+                            [
+                                ("category", "Product Category"),
+                                ("brand", "Brand"),
+                                ("both", "Both Category and Brand"),
+                            ]
+                        ),
+                        "placeholder": "Choose how you want to filter products",
+                    },
+                    {
+                        "name": "selected_category_names",
+                        "type": "textarea",
+                        "label": "Selected Categories",
+                        "required": False,
+                        "placeholder": "Beverages\nSnacks\nHousehold Care",
+                    },
+                    {
+                        "name": "selected_brand_names",
+                        "type": "textarea",
+                        "label": "Selected Brands",
+                        "required": False,
+                        "placeholder": "Nivea\nCoca-Cola\nCadbury",
+                    },
+                    {
+                        "name": "browse_all_categories",
+                        "type": "boolean",
+                        "label": "Browse all global categories",
+                        "required": False,
+                    },
+                    {
+                        "name": "browse_all_brands",
+                        "type": "boolean",
+                        "label": "Browse all global brands",
+                        "required": False,
+                    },
+                ],
+            },
+            {
+                "id": "products",
+                "title": "Review Catalog Page",
+                "description": "I will browse products 30 at a time. Pick the ones you want from this page and choose whether to import now or continue.",
+                "fields": [
+                    {
+                        "name": "current_page",
+                        "type": "text",
+                        "label": "Current Page",
+                        "required": False,
+                        "placeholder": "1",
+                    },
+                    {
+                        "name": "page_size",
+                        "type": "select",
+                        "label": "Products Per Page",
+                        "required": False,
+                        "options": _select_options([("30", "30 products")]),
+                        "placeholder": "30",
+                    },
+                    {
+                        "name": "selected_product_barcodes",
+                        "type": "textarea",
+                        "label": "Selected Product Barcodes",
+                        "required": False,
+                        "placeholder": "8800000002501\n8800000002502",
+                    },
+                    {
+                        "name": "page_action",
+                        "type": "select",
+                        "label": "Page Action",
+                        "required": True,
+                        "options": _select_options(
+                            [
+                                ("import_current_page", "Import Current Page"),
+                                ("select_more", "Select More"),
+                                ("end", "End For Now"),
+                            ]
+                        ),
+                        "placeholder": "Choose what to do next",
+                    },
+                ],
+            },
+            {
+                "id": "review",
+                "title": "Confirm Import",
+                "description": "Review the selected products and confirm that I should import them into your workspace.",
+                "fields": [
+                    {
+                        "name": "confirm_import",
+                        "type": "boolean",
+                        "label": "Confirm Import",
+                        "required": True,
+                    },
+                    {
+                        "name": "send_in_app_notification",
+                        "type": "boolean",
+                        "label": "Notify me in app when import processing completes",
+                        "required": False,
+                    },
+                ],
+            },
+        ]
+
     steps = [
         {
             "id": "categories",
@@ -2437,20 +2547,17 @@ def _infer_onboarding_scope_from_text(text: str) -> str | None:
     has_category = "categor" in normalized
     has_inventory = "inventory" in normalized or "stock ledger" in normalized
     has_product = "product" in normalized or "sku" in normalized
-    if mentions_setup and has_inventory and not has_location and not has_category and not has_product:
-        return "full_setup"
-    if sum(bool(flag) for flag in (has_location, has_category, has_inventory, has_product)) >= 2:
-        return "full_setup"
+    has_import_intent = any(token in normalized for token in ("import", "catalog", "barcode", "variant", "variants", "select all", "global products"))
+    if has_import_intent or has_product:
+        return "product_onboarding"
     if has_location:
         return "stock_locations"
     if has_category:
-        return "inventory_categories"
+        return "product_onboarding"
     if has_inventory:
-        return "inventory_setup"
-    if has_product:
         return "product_onboarding"
     if mentions_setup:
-        return "full_setup"
+        return "product_onboarding"
     return None
 
 
@@ -2574,6 +2681,23 @@ def _parse_onboarding_prefill_from_text(scope: str, text: str) -> dict[str, Any]
     if product_category_name:
         parsed["product_category_name"] = product_category_name
 
+    brand_names = _extract_named_text_list(
+        stripped,
+        (
+            r"(?:^|\n)\s*(?:product\s+)?brands?\s*[:=-]\s*(?P<value>[^\n]+(?:\n(?!\s*[A-Za-z][A-Za-z /'-]{0,40}\s*[:=-]).+)*)",
+            r"\bbrands?\s+(?:are|like|such as)\s+(?P<value>[^.]+)",
+        ),
+    )
+    if brand_names:
+        parsed["brand_names"] = "\n".join(_dedupe_preserving_order(brand_names))
+
+    if "both" in normalized and ("brand" in normalized or "category" in normalized):
+        parsed["catalog_scope"] = "both"
+    elif "brand" in normalized and "category" not in normalized:
+        parsed["catalog_scope"] = "brand"
+    elif "category" in normalized and "brand" not in normalized:
+        parsed["catalog_scope"] = "category"
+
     if "pos-ready" in normalized or "pos ready" in normalized:
         parsed["pos_ready"] = True
     if "do not add products" in normalized or "don't add products" in normalized:
@@ -2603,7 +2727,7 @@ def _parse_onboarding_prefill_from_text(scope: str, text: str) -> dict[str, Any]
         return {
             key: value
             for key, value in parsed.items()
-            if key in {"initial_product_names", "product_category_name", "pos_ready"}
+            if key in {"initial_product_names", "product_category_name", "brand_names", "catalog_scope", "pos_ready"}
         }
     return parsed
 
@@ -2650,6 +2774,8 @@ def _prefill_value_for_wizard_field(field: dict[str, Any], prefill_data: dict[st
             str(prefill_data.get("product_category_name") or "").strip()
             or str(prefill_data.get("category_name") or "").strip()
         )
+    elif field_name == "catalog_scope":
+        desired_text = str(prefill_data.get("catalog_scope") or "").strip()
     if desired_text:
         return _prefill_match_option_value(field, desired_text)
     return None
@@ -2844,6 +2970,10 @@ def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
     if categories:
         lines.append("Categories: " + ", ".join(categories))
 
+    catalog_scope = str(flat.get("catalog_scope") or "").strip()
+    if catalog_scope:
+        lines.append(f"Browse by: {catalog_scope}")
+
     inventory_name = str(flat.get("default_inventory_name") or "").strip()
     if inventory_name:
         lines.append(f"Inventory item: {inventory_name}")
@@ -2869,6 +2999,10 @@ def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
     product_names = _split_multiline_values(flat.get("product_names") or flat.get("initial_product_names"))
     if product_names:
         lines.append("Products: " + ", ".join(product_names))
+
+    brand_names = _split_multiline_values(flat.get("brand_names"))
+    if brand_names:
+        lines.append("Brands: " + ", ".join(brand_names))
 
     product_category = (
         str(flat.get("product_category_label") or "").strip()
@@ -2908,6 +3042,7 @@ def _onboarding_creation_request(scope: str, data: dict[str, Any]) -> str:
     if scope == "product_onboarding":
         return (
             "Import the selected global catalog products using the available product import tools if possible. "
+            "Use category-first discovery, allow brand selection, keep the catalog paginated, and filter out products that are already in this workspace. "
             "Perform the requested product import work rather than only describing it. "
             "If any required detail is missing, ask one concise follow-up question.\n"
             f"Collected onboarding data JSON:\n{serialized}"
@@ -12020,15 +12155,11 @@ def _annotate_delegated_interaction_payload(
 
 def _onboarding_scope_value_from_label(label: str) -> str:
     lowered = re.sub(r"\s+", " ", label.strip().lower())
-    if "full" in lowered and "setup" in lowered:
-        return "full_setup"
+    if "product" in lowered or "catalog" in lowered or "selection" in lowered or "review" in lowered or "matching" in lowered:
+        return "product_onboarding"
     if "stock" in lowered and "location" in lowered:
         return "stock_locations"
     if "categor" in lowered:
-        return "inventory_categories"
-    if "ledger" in lowered or ("inventory" in lowered and "setup" in lowered):
-        return "inventory_setup"
-    if "product" in lowered:
         return "product_onboarding"
     slug = re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")
     return slug or "option"
@@ -12056,7 +12187,7 @@ def _fallback_onboarding_interaction_payload(
             "interaction_type": "multiple_choice",
             **_onboarding_scope_picker_arguments(),
         },
-        workflow="inventory_onboarding",
+        workflow="product_import",
         workflow_stage="scope_picker",
     )
     payload["options"] = [
@@ -15214,7 +15345,7 @@ def make_langgraph_chat_processor_from_env(
                 and _is_onboarding_payload(last_interaction_payload, stage="scope_picker")
                 and "create_wizard_flow" in tool_names
             ):
-                selected_scope = _selected_interaction_value(interaction_response) or "full_setup"
+                selected_scope = _selected_interaction_value(interaction_response) or "product_onboarding"
                 try:
                     interaction_output = await tool_executor.call_tool(
                         name="create_wizard_flow",
@@ -15233,12 +15364,12 @@ def make_langgraph_chat_processor_from_env(
                     )
                     interaction_output = _with_interaction_metadata(
                         interaction_output,
-                        workflow="inventory_onboarding",
+                        workflow="product_import",
                         workflow_stage="wizard",
                         onboarding_scope=selected_scope,
                     )
                     workflow_state = {
-                        "workflow": "inventory_onboarding",
+                        "workflow": "product_import",
                         "status": "collecting",
                         "stage": "wizard",
                         "scope": selected_scope,
@@ -15270,10 +15401,10 @@ def make_langgraph_chat_processor_from_env(
                 and _is_onboarding_payload(last_interaction_payload, stage="wizard")
                 and "create_multiple_choice" in tool_names
             ):
-                selected_scope = str(last_interaction_payload.get("onboarding_scope") or "full_setup").strip() or "full_setup"
+                selected_scope = str(last_interaction_payload.get("onboarding_scope") or "product_onboarding").strip() or "product_onboarding"
                 if bool(interaction_response.get("skipped")):
                     workflow_state = {
-                        "workflow": "inventory_onboarding",
+                        "workflow": "product_import",
                         "status": "paused",
                         "stage": "wizard",
                         "scope": selected_scope,
@@ -15333,14 +15464,14 @@ def make_langgraph_chat_processor_from_env(
                 if isinstance(interaction_output, dict):
                     interaction_output = _with_interaction_metadata(
                         interaction_output,
-                        workflow="inventory_onboarding",
+                        workflow="product_import",
                         workflow_stage="review",
                         onboarding_scope=selected_scope,
                         onboarding_data=onboarding_data,
                         onboarding_summary=summary,
                     )
                     workflow_state = {
-                        "workflow": "inventory_onboarding",
+                        "workflow": "product_import",
                         "status": "awaiting_review",
                         "stage": "review",
                         "scope": selected_scope,
@@ -15380,7 +15511,7 @@ def make_langgraph_chat_processor_from_env(
                 selected_action = _selected_interaction_value(interaction_response) or "cancel_onboarding"
                 if selected_action == "revise_answers":
                     selected_action = "cancel_onboarding"
-                selected_scope = str(last_interaction_payload.get("onboarding_scope") or "full_setup").strip() or "full_setup"
+                selected_scope = str(last_interaction_payload.get("onboarding_scope") or "product_onboarding").strip() or "product_onboarding"
                 onboarding_data = (
                     last_interaction_payload.get("onboarding_data")
                     if isinstance(last_interaction_payload.get("onboarding_data"), dict)
@@ -15519,7 +15650,7 @@ def make_langgraph_chat_processor_from_env(
                                     context_id=task.context_id,
                                     metadata=metadata,
                                     workflow_state={
-                                        "workflow": "inventory_onboarding",
+                                        "workflow": "product_import",
                                         "status": "awaiting_input",
                                         "stage": "delegated_follow_up",
                                         "scope": selected_scope,
@@ -15562,7 +15693,7 @@ def make_langgraph_chat_processor_from_env(
                     if isinstance(interaction_output, dict):
                         interaction_output = _with_interaction_metadata(
                             interaction_output,
-                            workflow="inventory_onboarding",
+                            workflow="product_import",
                             workflow_stage="retry",
                             onboarding_scope=selected_scope,
                             onboarding_data=onboarding_data,
@@ -15573,7 +15704,7 @@ def make_langgraph_chat_processor_from_env(
                         if company_context:
                             interaction_output["company_context"] = company_context
                         workflow_state = {
-                            "workflow": "inventory_onboarding",
+                            "workflow": "product_import",
                             "status": "partial_failure",
                             "stage": "retry",
                             "scope": selected_scope,
@@ -15721,7 +15852,7 @@ def make_langgraph_chat_processor_from_env(
                         if isinstance(interaction_output, dict):
                             interaction_output = _with_interaction_metadata(
                                 interaction_output,
-                                workflow="inventory_onboarding",
+                                workflow="product_import",
                                 workflow_stage="resume_prompt",
                             )
                             response_text = json.dumps(interaction_output, ensure_ascii=False)
@@ -15739,7 +15870,7 @@ def make_langgraph_chat_processor_from_env(
 
                 direct_scope = _infer_onboarding_scope_from_text(user_text_for_memory or "")
                 direct_prefill = _parse_onboarding_prefill_from_text(
-                    direct_scope or "full_setup",
+                    direct_scope or "product_onboarding",
                     user_text_for_memory or "",
                 )
                 if direct_scope and direct_prefill and "create_wizard_flow" in tool_names:
@@ -15774,7 +15905,7 @@ def make_langgraph_chat_processor_from_env(
                             interaction_output["existing_responses"] = existing_responses
                         interaction_output = _with_interaction_metadata(
                             interaction_output,
-                            workflow="inventory_onboarding",
+                            workflow="product_import",
                             workflow_stage="wizard",
                             onboarding_scope=direct_scope,
                         )
@@ -15783,7 +15914,7 @@ def make_langgraph_chat_processor_from_env(
                             "and complete any remaining fields before I create anything."
                         )
                         workflow_state = {
-                            "workflow": "inventory_onboarding",
+                            "workflow": "product_import",
                             "status": "collecting",
                             "stage": "wizard",
                             "scope": direct_scope,
@@ -15811,7 +15942,7 @@ def make_langgraph_chat_processor_from_env(
                         return
 
                 company_context = await _maybe_active_company_context()
-                description = "Choose the setup area you want to complete first. I will guide you step by step."
+                description = "Choose the import area you want to complete first. I will guide you step by step."
                 if isinstance(company_context, dict):
                     company_name = str(company_context.get("name") or "").strip()
                     if company_name:
@@ -15828,11 +15959,11 @@ def make_langgraph_chat_processor_from_env(
                 if isinstance(interaction_output, dict):
                     interaction_output = _with_interaction_metadata(
                         interaction_output,
-                        workflow="inventory_onboarding",
+                        workflow="product_import",
                         workflow_stage="scope_picker",
                     )
                     workflow_state = {
-                        "workflow": "inventory_onboarding",
+                        "workflow": "product_import",
                         "status": "awaiting_scope",
                         "stage": "scope_picker",
                         "pending_interaction": interaction_output,
