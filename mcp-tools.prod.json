@@ -80,23 +80,9 @@
         {
           "ref": "products",
           "tools": [
-            "create_product",
-            "create_product_variant",
-            "get_product_categories"
-          ]
-        },
-        {
-          "ref": "inventory",
-          "tools": [
-            "search_inventory_items",
-            "list_inventory_items",
-            "list_stock_locations",
-            "search_stock_locations",
-            "list_stock_location_types",
-            "list_inventory_categories",
-            "create_inventory_category",
-            "create_inventory_item",
-            "create_stock_location"
+            "list_global_catalog_categories",
+            "list_global_catalog_products",
+            "import_global_catalog_products"
           ]
         }
       ]

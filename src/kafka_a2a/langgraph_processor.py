@@ -1317,7 +1317,7 @@ def _query_tokens(value: str, *, max_tokens: int = 12) -> list[str]:
 
 
 HOST_AGENT_LABELS: dict[str, str] = {
-    "onboarding": "Inventory Onboarding",
+    "onboarding": "Product Import",
     "product": "Product Management",
     "inventory": "Inventory Management",
     "pos": "Point of Sale (POS)",
@@ -1436,9 +1436,9 @@ HOST_DOMAIN_AREA_REQUESTS: dict[str, dict[str, str]] = {
     },
     "inventory": {
         "inventory_setup": (
-            "The user selected Set Up Inventory from the Inventory Management menu. "
-            "Help them create or configure stock locations, inventory categories, or inventory items. "
-            "Start with a short structured choice or the next required setup step. "
+            "The user selected Product Import from the Product Management menu. "
+            "Help them discover curated products, select items, and import them into the workspace. "
+            "Start with a short structured choice or the next required import step. "
             "Never ask for raw internal ids when lookups or selections can be used instead."
         ),
         "inventory_visibility": (
@@ -1843,7 +1843,7 @@ def _host_domain_area_follow_up_request(payload: dict[str, Any], response: dict[
 def _host_follow_up_request_for_agent(agent_name: str) -> str:
     if agent_name == "onboarding":
         return (
-            "Start a guided inventory onboarding flow. Ask the user what setup they want to complete first, "
+            "Start a guided product import flow. Ask the user what catalog they want to import first, "
             "then collect the required details step by step using structured interactions."
         )
     label = _friendly_agent_label(agent_name)
@@ -1990,11 +1990,11 @@ def _host_unavailable_agent_text(
 
 
 ONBOARDING_SCOPE_LABELS: dict[str, str] = {
-    "full_setup": "Full Inventory Setup",
-    "stock_locations": "Stock Locations",
-    "inventory_categories": "Inventory Categories",
-    "inventory_setup": "Inventory Setup",
-    "product_onboarding": "Product Onboarding",
+    "full_setup": "Product Import",
+    "stock_locations": "Catalog Discovery",
+    "inventory_categories": "Category Matching",
+    "inventory_setup": "Import Review",
+    "product_onboarding": "Product Selection",
 }
 
 
@@ -2251,17 +2251,17 @@ def _is_onboarding_payload(payload: dict[str, Any] | None, *, stage: str) -> boo
 
 def _onboarding_scope_picker_arguments(
     *,
-    description: str = "Choose the setup area you want to complete first. I will guide you step by step.",
+    description: str = "Choose the product import area you want to complete first. I will guide you step by step.",
 ) -> dict[str, Any]:
     return {
-        "title": "Start Inventory Onboarding",
+        "title": "Start Product Import",
         "description": description,
         "options": [
-            {"value": "full_setup", "label": "Full Inventory Setup"},
-            {"value": "stock_locations", "label": "Stock Locations"},
-            {"value": "inventory_categories", "label": "Inventory Categories"},
-            {"value": "inventory_setup", "label": "Inventory Setup"},
-            {"value": "product_onboarding", "label": "Product Onboarding"},
+            {"value": "full_setup", "label": "Product Import"},
+            {"value": "stock_locations", "label": "Catalog Discovery"},
+            {"value": "inventory_categories", "label": "Category Matching"},
+            {"value": "inventory_setup", "label": "Import Review"},
+            {"value": "product_onboarding", "label": "Product Selection"},
         ],
         "multiple": False,
         "allow_input": True,
@@ -2540,12 +2540,12 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
         {
             "id": "products",
             "title": "Product Follow-Up",
-            "description": "Decide whether you want to continue into initial product onboarding after the foundation setup.",
+            "description": "Decide whether you want to continue into product import after catalog discovery.",
             "fields": [
                 {
                     "name": "continue_to_product_onboarding",
                     "type": "boolean",
-                    "label": "Continue to Product Onboarding After Foundation Setup",
+                    "label": "Continue to Product Import After Discovery",
                     "required": False,
                 },
                 {
@@ -2575,10 +2575,10 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
 
 
 def _onboarding_wizard_arguments(scope: str) -> dict[str, Any]:
-    label = ONBOARDING_SCOPE_LABELS.get(scope, "Inventory Onboarding")
+    label = ONBOARDING_SCOPE_LABELS.get(scope, "Product Import")
     return {
         "title": f"{label} Wizard",
-        "description": "Fill in the setup details and I will prepare the onboarding action plan.",
+        "description": "Fill in the import details and I will prepare the product import plan.",
         "steps": _onboarding_wizard_steps(scope),
         "allow_back": True,
         "show_progress": True,
@@ -3095,20 +3095,17 @@ def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
         lines.append(f"POS ready: {'Yes' if flat['pos_ready'] else 'No'}")
 
     if isinstance(flat.get("continue_to_product_onboarding"), bool):
-        lines.append(
-            "Continue to product onboarding: "
-            + ("Yes" if flat["continue_to_product_onboarding"] else "No")
-        )
+        lines.append("Continue to product import: " + ("Yes" if flat["continue_to_product_onboarding"] else "No"))
 
     return "\n".join(lines)
 
 
 def _onboarding_review_picker_arguments(summary: str) -> dict[str, Any]:
     return {
-        "title": "Review Onboarding Plan",
+        "title": "Review Product Import Plan",
         "description": summary + "\n\nChoose what you want me to do next.",
         "options": [
-            {"value": "create_now", "label": "Create This Setup"},
+            {"value": "create_now", "label": "Import These Products"},
             {"value": "cancel_onboarding", "label": "Cancel For Now"},
         ],
         "multiple": False,
@@ -3117,22 +3114,21 @@ def _onboarding_review_picker_arguments(summary: str) -> dict[str, Any]:
 
 
 def _onboarding_target_agent(scope: str) -> str:
-    return "product" if scope == "product_onboarding" else "inventory"
+    return "product" if scope == "product_onboarding" else "product"
 
 
 def _onboarding_creation_request(scope: str, data: dict[str, Any]) -> str:
     serialized = json.dumps(data, ensure_ascii=False)
     if scope == "product_onboarding":
         return (
-            "Create the initial product onboarding setup using the available product write tools if possible. "
-            "Perform the requested product creation work rather than only describing it. "
+            "Import the selected global catalog products using the available product import tools if possible. "
+            "Perform the requested product import work rather than only describing it. "
             "If any required detail is missing, ask one concise follow-up question.\n"
             f"Collected onboarding data JSON:\n{serialized}"
         )
     return (
-        "Create the requested inventory foundation setup using the available inventory write tools if possible. "
-        "Create stock locations, inventory categories, and inventory items as applicable to the collected data, "
-        "rather than only describing them. If any required detail is missing, ask one concise follow-up question.\n"
+        "Import the requested product selection using the available product import tools if possible. "
+        "Do not create inventory items or inventory categories as part of this flow. If any required detail is missing, ask one concise follow-up question.\n"
         f"Collected onboarding data JSON:\n{serialized}"
     )
 
@@ -10548,14 +10544,14 @@ def _onboarding_resume_picker_arguments(workflow_state: dict[str, Any]) -> dict[
     )
     if summary:
         description = f"{description}\n\nLatest saved plan:\n{summary}"
-    description = f"{description}\n\nChoose whether to resume it or start a new onboarding flow."
+    description = f"{description}\n\nChoose whether to resume it or start a new product import flow."
     return {
-        "title": "Resume Inventory Onboarding",
+        "title": "Resume Product Import",
         "description": description,
         "options": [
-            {"value": "resume_saved", "label": "Resume Saved Onboarding"},
+            {"value": "resume_saved", "label": "Resume Saved Import"},
             {"value": "start_over", "label": "Start Over"},
-            {"value": "cancel_saved", "label": "Cancel Saved Onboarding"},
+            {"value": "cancel_saved", "label": "Cancel Saved Import"},
         ],
         "multiple": False,
         "allow_input": True,
@@ -15386,7 +15382,7 @@ def make_langgraph_chat_processor_from_env(
                     await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
                 else:
                     await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
-                    response_text = "Saved onboarding was canceled. When you are ready, I can start a fresh onboarding flow."
+                    response_text = "Saved import flow was canceled. When you are ready, I can start a fresh product import flow."
                     response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
@@ -15489,7 +15485,7 @@ def make_langgraph_chat_processor_from_env(
                         metadata=metadata,
                         workflow_state=workflow_state,
                     )
-                    response_text = "Onboarding paused. When you are ready, I can resume the saved setup workflow."
+                    response_text = "Import paused. When you are ready, I can resume the saved import workflow."
                     response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
@@ -15603,7 +15599,7 @@ def make_langgraph_chat_processor_from_env(
 
                 if selected_action == "cancel_onboarding":
                     await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
-                    response_text = "Onboarding canceled for now. When you are ready, I can restart the setup flow."
+                    response_text = "Import canceled for now. When you are ready, I can restart the import flow."
                     response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
@@ -15629,7 +15625,7 @@ def make_langgraph_chat_processor_from_env(
                     state=TaskState.working,
                     message=Message(
                         role=Role.agent,
-                        parts=[TextPart(text="Applying the onboarding setup plan now.")],
+                        parts=[TextPart(text="Applying the product import plan now.")],
                         context_id=task.context_id,
                     ),
                 )
@@ -15854,7 +15850,7 @@ def make_langgraph_chat_processor_from_env(
                     response_text = _onboarding_operation_summary(
                         created_operations=created_map,
                         failed_operations=failed_items,
-                    ) or "Some approved onboarding setup steps could not be completed automatically."
+                    ) or "Some approved product import steps could not be completed automatically."
                     if summary:
                         response_text = f"{summary}\n\n{response_text}"
                     response_parts = [TextPart(text=response_text)]

@@ -46,7 +46,7 @@
       "tags": ["product", "catalog", "create", "update", "delete", "variants", "bulk"],
       "examples": [
         "Create the first products for this business.",
-        "Seed the initial catalog during onboarding.",
+        "Seed the initial catalog during product import.",
         "Bulk update POS settings for selected products."
       ],
       "inputModes": ["text"],

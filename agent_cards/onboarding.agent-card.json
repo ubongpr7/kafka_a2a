@@ -1,7 +1,7 @@
 {
   "protocolVersion": "0.3.0",
   "name": "onboarding",
-  "description": "Workflow specialist agent for guided inventory onboarding, including stock locations, inventory categories, inventory setup, and initial product onboarding.",
+  "description": "Workflow specialist agent for guided product import, including curated global-catalog search, product selection, import confirmation, and import tracking.",
   "url": "kafka://onboarding",
   "preferredTransport": "kafka",
   "version": "0.1.0",
@@ -13,27 +13,27 @@
   "defaultOutputModes": ["text"],
   "skills": [
     {
-      "id": "inventory_environment_onboarding",
-      "name": "Inventory Environment Onboarding",
-      "description": "Guide the user through foundational setup for stock locations, inventory categories, and inventory ledgers before operational use.",
-      "tags": ["onboarding", "inventory", "setup", "stock-locations", "categories", "workflow", "guided"],
+      "id": "product_import_workflow",
+      "name": "Product Import Workflow",
+      "description": "Guide the user through discovering curated global products, selecting them, and importing them into the workspace catalog.",
+      "tags": ["product-import", "catalog", "search", "selection", "workflow", "guided"],
       "examples": [
-        "Help me set up my inventory workspace from scratch.",
-        "Guide me through creating stock locations and inventory categories.",
-        "Start inventory onboarding for my company."
+        "Help me import products into my workspace.",
+        "Guide me through curated global product selection.",
+        "Start product import for my company."
       ],
       "inputModes": ["text"],
       "outputModes": ["text"]
     },
     {
-      "id": "guided_product_onboarding",
-      "name": "Guided Product Onboarding",
-      "description": "Continue from foundational setup into guided product onboarding for initial catalog creation.",
-      "tags": ["onboarding", "product", "catalog", "guided", "setup"],
+      "id": "global_catalog_selection",
+      "name": "Global Catalog Selection",
+      "description": "Continue from catalog discovery into guided selection of one, many, or all products before import.",
+      "tags": ["catalog", "product", "selection", "guided", "import"],
       "examples": [
-        "After setup, help me add my first products.",
-        "Walk me through initial product onboarding.",
-        "Continue onboarding into product creation."
+        "After discovery, help me select products to import.",
+        "Walk me through selecting products from the global catalog.",
+        "Continue into product import confirmation."
       ],
       "inputModes": ["text"],
       "outputModes": ["text"]
