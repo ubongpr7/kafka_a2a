@@ -2273,305 +2273,91 @@ def _select_options(options: list[tuple[str, str]]) -> list[dict[str, str]]:
 
 
 def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
-    if scope == "stock_locations":
-        return [
-            {
-                "id": "locations",
-                "title": "Stock Locations",
-                "description": "Tell me how you want your stock locations organized.",
-                "fields": [
-                    {
-                        "name": "primary_location_mode",
-                        "type": "select",
-                        "label": "Primary Location Source",
-                        "required": True,
-                        "options": _select_options(
-                            [
-                                ("new", "Create a New Primary Location"),
-                                ("existing", "Use an Existing Location"),
-                            ]
-                        ),
-                        "placeholder": "Choose how to set the primary location",
-                    },
-                    {
-                        "name": "primary_location_id",
-                        "type": "select",
-                        "label": "Existing Primary Location",
-                        "required": False,
-                        "options": [],
-                        "placeholder": "Select an existing stock location",
-                        "show_when": {"field": "primary_location_mode", "equals": "existing"},
-                    },
-                    {
-                        "name": "primary_location_name",
-                        "type": "text",
-                        "label": "Primary Location Name",
-                        "required": False,
-                        "placeholder": "Main Warehouse",
-                        "show_when": {"field": "primary_location_mode", "equals": "new"},
-                    },
-                    {
-                        "name": "primary_location_type",
-                        "type": "select",
-                        "label": "Primary Location Type",
-                        "required": False,
-                        "options": _select_options(
-                            [
-                                ("warehouse", "Warehouse"),
-                                ("store", "Store"),
-                                ("backroom", "Back Room"),
-                                ("fulfillment", "Fulfillment Center"),
-                                ("other", "Other"),
-                            ]
-                        ),
-                        "show_when": {"field": "primary_location_mode", "equals": "new"},
-                    },
-                    {
-                        "name": "additional_locations",
-                        "type": "textarea",
-                        "label": "Additional Locations",
-                        "required": False,
-                        "placeholder": "Front Store\nReturns Shelf\nOverflow Room",
-                    },
-                ],
-            }
-        ]
-    if scope == "inventory_categories":
-        return [
-            {
-                "id": "categories",
-                "title": "Inventory Categories",
-                "description": "List the categories you want available before product entry.",
-                "fields": [
-                    {
-                        "name": "category_names",
-                        "type": "textarea",
-                        "label": "Category Names",
-                        "required": True,
-                        "placeholder": "Beverages\nSnacks\nCleaning Supplies",
-                    }
-                ],
-            }
-        ]
-    if scope == "inventory_setup":
-        return [
-            {
-                "id": "inventory",
-                "title": "Inventory Setup",
-                "description": "Define the first inventory item you want to create.",
-                "fields": [
-                    {
-                        "name": "default_inventory_name",
-                        "type": "text",
-                        "label": "Inventory Name",
-                        "required": True,
-                        "placeholder": "Main Inventory",
-                    },
-                    {
-                        "name": "inventory_description",
-                        "type": "textarea",
-                        "label": "Inventory Description",
-                        "required": False,
-                        "placeholder": "Primary sellable stock item for the business.",
-                    },
-                    {
-                        "name": "related_stock_location_id",
-                        "type": "select",
-                        "label": "Primary Location for This Inventory",
-                        "required": False,
-                        "options": [],
-                        "placeholder": "Select a stock location",
-                    },
-                    {
-                        "name": "inventory_category_id",
-                        "type": "select",
-                        "label": "Default Category",
-                        "required": False,
-                        "options": [],
-                        "placeholder": "Select an inventory category",
-                    },
-                ],
-            }
-        ]
-    if scope == "product_onboarding":
-        return [
-            {
-                "id": "products",
-                "title": "Initial Product Onboarding",
-                "description": "Tell me about the first products you want to seed into the catalog.",
-                "fields": [
-                    {
-                        "name": "product_names",
-                        "type": "textarea",
-                        "label": "Product Names",
-                        "required": True,
-                        "placeholder": "Coca-Cola 50cl\nFanta 50cl\nSprite 50cl",
-                    },
-                    {
-                        "name": "product_category_id",
-                        "type": "select",
-                        "label": "Default Product Category",
-                        "required": False,
-                        "options": [],
-                        "placeholder": "Select a product category",
-                    },
-                    {
-                        "name": "pos_ready",
-                        "type": "boolean",
-                        "label": "Make These Products POS-Ready",
-                        "required": False,
-                    },
-                ],
-            }
-        ]
-
-    return [
-        {
-            "id": "locations",
-            "title": "Stock Locations",
-            "description": "Set up the main places where stock will live.",
-            "fields": [
-                {
-                    "name": "primary_location_mode",
-                    "type": "select",
-                    "label": "Primary Location Source",
-                    "required": True,
-                    "options": _select_options(
-                        [
-                            ("new", "Create a New Primary Location"),
-                            ("existing", "Use an Existing Location"),
-                        ]
-                    ),
-                    "placeholder": "Choose how to set the primary location",
-                },
-                {
-                    "name": "primary_location_id",
-                    "type": "select",
-                    "label": "Existing Primary Location",
-                    "required": False,
-                    "options": [],
-                    "placeholder": "Select an existing stock location",
-                    "show_when": {"field": "primary_location_mode", "equals": "existing"},
-                },
-                {
-                    "name": "primary_location_name",
-                    "type": "text",
-                    "label": "Primary Location Name",
-                    "required": False,
-                    "placeholder": "Main Warehouse",
-                    "show_when": {"field": "primary_location_mode", "equals": "new"},
-                },
-                {
-                    "name": "primary_location_type",
-                    "type": "select",
-                    "label": "Primary Location Type",
-                    "required": False,
-                    "options": _select_options(
-                        [
-                            ("warehouse", "Warehouse"),
-                            ("store", "Store"),
-                            ("backroom", "Back Room"),
-                            ("fulfillment", "Fulfillment Center"),
-                            ("other", "Other"),
-                        ]
-                    ),
-                    "show_when": {"field": "primary_location_mode", "equals": "new"},
-                },
-                {
-                    "name": "additional_locations",
-                    "type": "textarea",
-                    "label": "Additional Locations",
-                    "required": False,
-                    "placeholder": "Front Store\nReturns Shelf\nOverflow Room",
-                },
-            ],
-        },
+    steps = [
         {
             "id": "categories",
-            "title": "Inventory Categories",
-            "description": "Define the category structure you want ready before product entry.",
+            "title": "Choose Product Categories",
+            "description": "Start by selecting the product categories you want to browse from the global catalog.",
             "fields": [
                 {
-                    "name": "category_names",
+                    "name": "selected_category_names",
                     "type": "textarea",
-                    "label": "Category Names",
+                    "label": "Selected Categories",
                     "required": True,
-                    "placeholder": "Beverages\nSnacks\nCleaning Supplies",
-                }
-            ],
-        },
-        {
-            "id": "inventory",
-            "title": "Inventory Item",
-            "description": "Define the first inventory item to create.",
-            "fields": [
-                {
-                    "name": "default_inventory_name",
-                    "type": "text",
-                    "label": "Inventory Name",
-                    "required": True,
-                    "placeholder": "Main Inventory",
+                    "placeholder": "Beverages\nSnacks\nHousehold Care",
                 },
                 {
-                    "name": "inventory_description",
-                    "type": "textarea",
-                    "label": "Inventory Description",
+                    "name": "browse_all_categories",
+                    "type": "boolean",
+                    "label": "Browse all global categories",
                     "required": False,
-                    "placeholder": "Primary sellable stock item for the business.",
-                },
-                {
-                    "name": "related_stock_location_id",
-                    "type": "select",
-                    "label": "Primary Location for This Inventory",
-                    "required": False,
-                    "options": [],
-                    "placeholder": "Select a stock location",
-                },
-                {
-                    "name": "inventory_category_id",
-                    "type": "select",
-                    "label": "Default Category",
-                    "required": False,
-                    "options": [],
-                    "placeholder": "Select an inventory category",
                 },
             ],
         },
         {
             "id": "products",
-            "title": "Product Follow-Up",
-            "description": "Decide whether you want to continue into product import after catalog discovery.",
+            "title": "Review Catalog Page",
+            "description": "I will browse products 30 at a time. Pick the ones you want from this page and choose whether to import now or continue.",
             "fields": [
                 {
-                    "name": "continue_to_product_onboarding",
-                    "type": "boolean",
-                    "label": "Continue to Product Import After Discovery",
+                    "name": "current_page",
+                    "type": "text",
+                    "label": "Current Page",
                     "required": False,
+                    "placeholder": "1",
                 },
                 {
-                    "name": "initial_product_names",
-                    "type": "textarea",
-                    "label": "Optional Initial Product Names",
-                    "required": False,
-                    "placeholder": "Coca-Cola 50cl\nFanta 50cl",
-                },
-                {
-                    "name": "product_category_id",
+                    "name": "page_size",
                     "type": "select",
-                    "label": "Default Product Category",
+                    "label": "Products Per Page",
                     "required": False,
-                    "options": [],
-                    "placeholder": "Select a product category",
+                    "options": _select_options([("30", "30 products")]),
+                    "placeholder": "30",
                 },
                 {
-                    "name": "pos_ready",
+                    "name": "selected_product_barcodes",
+                    "type": "textarea",
+                    "label": "Selected Product Barcodes",
+                    "required": False,
+                    "placeholder": "8800000002501\n8800000002502",
+                },
+                {
+                    "name": "page_action",
+                    "type": "select",
+                    "label": "Page Action",
+                    "required": True,
+                    "options": _select_options(
+                        [
+                            ("import_current_page", "Import Current Page"),
+                            ("select_more", "Select More"),
+                            ("end", "End For Now"),
+                        ]
+                    ),
+                    "placeholder": "Choose what to do next",
+                },
+            ],
+        },
+        {
+            "id": "review",
+            "title": "Confirm Import",
+            "description": "Review the selected products and confirm that I should import them into your workspace.",
+            "fields": [
+                {
+                    "name": "confirm_import",
                     "type": "boolean",
-                    "label": "Make These Products POS-Ready",
+                    "label": "Confirm Import",
+                    "required": True,
+                },
+                {
+                    "name": "send_in_app_notification",
+                    "type": "boolean",
+                    "label": "Notify me in app when import processing completes",
                     "required": False,
                 },
             ],
         },
     ]
+    return steps
 
 
 def _onboarding_wizard_arguments(scope: str) -> dict[str, Any]:
@@ -10626,9 +10412,9 @@ def _onboarding_retry_picker_arguments(
 
 def _onboarding_completed_text(created_operations: dict[str, Any]) -> str:
     counts = {
-        "stock_location": 0,
-        "inventory_category": 0,
-        "inventory": 0,
+        "category": 0,
+        "catalog_page": 0,
+        "review": 0,
         "product": 0,
     }
     for payload in created_operations.values():
@@ -10639,22 +10425,20 @@ def _onboarding_completed_text(created_operations: dict[str, Any]) -> str:
             counts[operation_type] += 1
 
     parts: list[str] = []
-    if counts["stock_location"]:
-        parts.append(f"{counts['stock_location']} stock location" + ("s" if counts["stock_location"] != 1 else ""))
-    if counts["inventory_category"]:
-        parts.append(
-            f"{counts['inventory_category']} inventory categor" + ("ies" if counts["inventory_category"] != 1 else "y")
-        )
-    if counts["inventory"]:
-        parts.append(f"{counts['inventory']} inventory item" + ("s" if counts["inventory"] != 1 else ""))
+    if counts["category"]:
+        parts.append(f"{counts['category']} category selection" + ("s" if counts["category"] != 1 else ""))
+    if counts["catalog_page"]:
+        parts.append(f"{counts['catalog_page']} catalog page review" + ("s" if counts["catalog_page"] != 1 else ""))
+    if counts["review"]:
+        parts.append(f"{counts['review']} import review" + ("s" if counts["review"] != 1 else ""))
     if counts["product"]:
         parts.append(f"{counts['product']} product" + ("s" if counts["product"] != 1 else ""))
 
     if not parts:
-        return "No onboarding records were created."
+        return "No product import records were created."
     if len(parts) == 1:
-        return f"Created {parts[0]} for onboarding."
-    return "Created " + ", ".join(parts[:-1]) + f", and {parts[-1]} for onboarding."
+        return f"Created {parts[0]} for product import."
+    return "Created " + ", ".join(parts[:-1]) + f", and {parts[-1]} for product import."
 
 
 def _tool_discovery_failures_for_name(tool_executor: ToolExecutor | None, tool_name: str) -> list[dict[str, Any]]:
@@ -15333,6 +15117,23 @@ def make_langgraph_chat_processor_from_env(
             saved_workflow_state = await _load_workflow_state(context_id=task.context_id, metadata=metadata)
             active_company_context: dict[str, Any] | None = None
 
+            def _is_legacy_product_import_state(state: dict[str, Any] | None) -> bool:
+                if not isinstance(state, dict):
+                    return False
+                flattened = json.dumps(state, default=str, ensure_ascii=False).lower()
+                legacy_markers = (
+                    "primary_location_for_this_inventory",
+                    "default_inventory_name",
+                    "inventory_description",
+                    "inventory_category_id",
+                    "inventory_item_id",
+                    "primary_location_mode",
+                    "stock_locations",
+                    "inventory_setup",
+                    "inventory_item",
+                )
+                return any(marker in flattened for marker in legacy_markers)
+
             async def _maybe_active_company_context() -> dict[str, Any] | None:
                 nonlocal active_company_context
                 if active_company_context is not None:
@@ -15352,6 +15153,10 @@ def make_langgraph_chat_processor_from_env(
                     return None
                 active_company_context = _extract_company_context(output)
                 return active_company_context
+
+            if _is_legacy_product_import_state(saved_workflow_state):
+                saved_workflow_state = None
+                await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
 
             if (
                 interaction_response is not None
