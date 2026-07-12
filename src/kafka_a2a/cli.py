@@ -103,6 +103,7 @@ def _resolve_cli_mcp_config_path(settings: A2AAppSettings) -> Path:
     candidates.extend(
         [
             ka2a_root / "mcp-tools.local.json",
+            ka2a_root / "mcp-tools.dev.json",
             ka2a_root / "mcp-tools.prod.json",
         ]
     )
