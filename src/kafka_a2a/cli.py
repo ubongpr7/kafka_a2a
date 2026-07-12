@@ -153,6 +153,8 @@ def _jwt_from_env(prefix: str = "KA2A_JWT_") -> JwtBearerConfig | None:
         return None
 
     secret = _read_text_file(key_path) if key_path else key
+    if secret:
+        secret = secret.strip().replace("\\n", "\n")
     if not (secret or jwks_url):
         raise SystemExit(
             f"{prefix}KEY/{prefix}KEY_PATH or {prefix}JWKS_URL is required when JWT auth is enabled"
