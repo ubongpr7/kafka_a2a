@@ -200,13 +200,16 @@ jobs:
               network_configuration = {
                   'awsvpcConfiguration': target_service['networkConfiguration']['awsvpcConfiguration']
               }
+              migration_task_spec = manifest_targets[migration_target]
+              container_overrides = []
+              for container in migration_task_spec.get('containerDefinitions', []):
+                  container_name = container['name']
+                  container_overrides.append({
+                      'name': container_name,
+                      'command': migration_command if container_name == migration_container_name else ['sh', '-c', 'sleep 600'],
+                  })
               overrides = {
-                  'containerOverrides': [
-                      {
-                          'name': migration_container_name,
-                          'command': migration_command,
-                      }
-                  ]
+                  'containerOverrides': container_overrides
               }
               run_task = aws_json(
                   'ecs',
