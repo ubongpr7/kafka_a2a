@@ -9,6 +9,9 @@ WORKDIR /app
 # Install from the lockfile using uv.
 COPY pyproject.toml uv.lock README.md /app/
 COPY src /app/src
+COPY agent_cards /app/agent_cards
+COPY prompts /app/prompts
+COPY mcp-tools.example.json mcp-tools.local.json mcp-tools.prod.json /app/
 
 ARG KA2A_UV_EXTRAS="server,auth"
 RUN set -eux; \
