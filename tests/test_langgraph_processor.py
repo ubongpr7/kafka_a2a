@@ -1,19 +1,38 @@
 from __future__ import annotations
 
+from calendar import monthrange
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from tests import fake_langgraph_components
 from kafka_a2a.langgraph_processor import (
+    _build_inventory_stock_risk_insight,
+    _build_pos_best_sales_day_insight,
+    _build_host_business_analyst_insight,
+    _build_pos_sales_by_location_insight,
+    _build_pos_sales_overview_insight,
+    _build_pos_top_sellers_insight,
+    _enrich_top_seller_results_with_variant_context,
     _build_inventory_operation,
     _build_stock_location_operation,
+    _build_realtime_dashboard_snapshot_insight,
     _build_product_operation,
+    _build_staff_activity_insight,
+    _build_permission_security_insight,
+    _build_subscription_usage_insight,
     _classify_failed_operation,
     _coerce_delegated_response,
     _created_result_ref,
     _extract_created_result_value,
+    _host_named_insight_payload,
+    _host_named_insight_from_text,
+    _latest_insight_follow_up_answer,
+    _latest_repeated_question_response_parts,
+    _inventory_procurement_named_insight_from_text,
     _host_orchestration_plan,
+    _infer_domain_agent_name,
     _onboarding_creation_request,
     _infer_onboarding_scope_from_text,
     _interaction_payload_from_text,
@@ -23,15 +42,21 @@ from kafka_a2a.langgraph_processor import (
     _is_simple_greeting_query,
     _onboarding_operation_summary,
     _normalize_tool_call_payload,
+    _inventory_visibility_named_insight_from_text,
+    _pos_admin_named_insight_from_text,
+    _pos_admin_named_insight_payload,
+    _resolve_insight_time_window,
     _render_tool_prompt_block,
     _select_host_delegation_agent,
     _select_router_handoff_agent,
     _select_router_delegation_agent,
     _text_from_parts,
+    _users_named_insight_from_text,
+    _users_named_insight_payload,
     make_langgraph_chat_processor_from_env,
 )
 from kafka_a2a.models import Artifact, DataPart, Message, Role, Task, TaskState, TaskStatus, TextPart
-from kafka_a2a.tools import ToolSpec
+from kafka_a2a.tools import ToolContext, ToolSpec
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +97,1236 @@ def test_is_simple_greeting_query_matches_plain_greetings() -> None:
     assert not _is_simple_greeting_query("hi, create my inventory")
 
 
+def test_pos_admin_named_insight_from_text_detects_priority_flows() -> None:
+    assert _pos_admin_named_insight_from_text("Show sales by location today") == "sales_by_location_today"
+    assert _pos_admin_named_insight_from_text("Show top sellers in seven days") == "top_sellers_seven_days"
+    assert _pos_admin_named_insight_from_text("How many sales was made last month?") == "sales_overview"
+    assert _pos_admin_named_insight_from_text("can you analyse my sales data for the past 1 year?") == "sales_overview"
+    assert _pos_admin_named_insight_from_text("Which products are selling the most?") == "top_sellers_seven_days"
+    assert _pos_admin_named_insight_from_text("Show sales trend for barcode 8800000001501 over the past year") == "product_sales_trend"
+    assert _pos_admin_named_insight_from_text("Compare product Eva Premium Water across locations for the past year") == "product_sales_trend"
+    assert _pos_admin_named_insight_from_text("Compare products Eva Premium Water and Coca-Cola Original Taste for the past year") == "product_comparison"
+    assert _pos_admin_named_insight_from_text("Compare Eva Premium Water and Coca-Cola Original Taste for the past 1 year") == "product_comparison"
+    assert _host_named_insight_from_text("Compare Eva Premium Water and Coca-Cola Original Taste for the past 1 year") == "pos::product_comparison"
+    assert _pos_admin_named_insight_from_text("Compare Eva Premium Water with barcode 8800000001101 for the past year") == "product_comparison"
+    assert _host_named_insight_from_text("Compare Eva Premium Water with barcode 8800000001101 for the past year") == "pos::product_comparison"
+    assert _pos_admin_named_insight_from_text("Compare variants of Next Pique Polo Shirt for the past year") == "variant_comparison"
+    assert _pos_admin_named_insight_from_text("Show sales by location for the past month") == "sales_by_location_today"
+    assert _pos_admin_named_insight_from_text("Show top sellers for the past year") == "top_sellers_seven_days"
+    assert _pos_admin_named_insight_from_text("What is the highest sales I ever made in a day?") == "best_sales_day"
+    assert _pos_admin_named_insight_from_text("Break down today's sales by location.") == "sales_by_location_today"
+    assert _pos_admin_named_insight_from_text("Compare revenue across locations today.") == "sales_by_location_today"
+    assert _pos_admin_named_insight_from_text("Summarize today's order count by location.") == "sales_by_location_today"
+    assert _pos_admin_named_insight_from_text("Which branch is underperforming in sales today?") == "sales_by_location_today"
+    assert _pos_admin_named_insight_from_text("Show today's average basket by location.") == "sales_by_location_today"
+    assert _pos_admin_named_insight_from_text("Who were the best sellers in 7 days?") == "top_sellers_seven_days"
+    assert _pos_admin_named_insight_from_text("Create a new discount") is None
+
+
+def test_build_pos_sales_by_location_insight_returns_widget_first_payload() -> None:
+    payload = _build_pos_sales_by_location_insight(
+        {
+            "total_sales": 41400.0,
+            "_window_label": "last 30 days",
+            "groups": [
+                {"label": "Agric", "order_count": 3, "total_sales": 22850.0},
+                {"label": "Airport Road", "order_count": 3, "total_sales": 18550.0},
+            ],
+        }
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert payload["summary"] == "Agric leads sales for last 30 days."
+    assert payload["widgets"][0]["type"] == "metric_grid"
+    assert payload["widgets"][1]["type"] == "bar_chart"
+    assert payload["widgets"][1]["title"] == "Sales by location for last 30 days"
+    assert payload["data_sources"][0]["endpoint_or_topic"] == "get_sales_summary"
+    assert payload["widgets"][0]["data"][2]["label"] == "Avg Basket"
+
+
+def test_build_pos_sales_overview_insight_returns_widget_first_payload() -> None:
+    payload = _build_pos_sales_overview_insight(
+        {
+            "total_sales": 41400.0,
+            "_window_label": "last month",
+            "groups": [
+                {"label": "Agric", "order_count": 3, "total_sales": 22850.0},
+                {"label": "Airport Road", "order_count": 3, "total_sales": 18550.0},
+            ],
+        },
+        top_sellers_payload={
+            "results": [
+                {"product_name": "Cabin Biscuit 200g", "variant_name": "Cabin Biscuit 200g", "quantity_sold": 8, "sales_total": 16000.0, "order_count": 3, "barcode": "123"},
+                {"product_name": "Body Lotion", "variant_name": "Body Lotion 500 ml", "quantity_sold": 5, "sales_total": 12400.0, "order_count": 2},
+            ]
+        },
+        daily_sales_payload={
+            "groups": [
+                {"label": "2026-06-02", "order_count": 2, "total_sales": 12000.0},
+                {"label": "2026-06-12", "order_count": 3, "total_sales": 17000.0},
+                {"label": "2026-06-25", "order_count": 1, "total_sales": 12400.0},
+            ]
+        },
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert payload["summary"] == "6 sales were recorded for last month, totaling ₦41,400.00."
+    assert payload["explanation"] == "Agric contributed the most revenue for last month at 55.2% of sales, and Cabin Biscuit 200g led the product mix."
+    assert payload["widgets"][0]["type"] == "metric_grid"
+    assert payload["widgets"][1]["type"] == "line_chart"
+    assert payload["widgets"][2]["type"] == "comparison_table"
+    assert payload["widgets"][3]["type"] == "bar_chart"
+    assert payload["widgets"][3]["title"] == "Sales by location for last month"
+    assert payload["widgets"][4]["type"] == "donut_chart"
+    assert payload["widgets"][4]["title"] == "Order share by location for last month"
+    assert payload["widgets"][5]["type"] == "bar_chart"
+    assert payload["widgets"][5]["title"] == "Top products by sales amount for last month"
+    assert payload["widgets"][6]["type"] == "histogram"
+    assert payload["widgets"][7]["type"] == "donut_chart"
+    assert payload["widgets"][8]["type"] == "ranked_list"
+    ranked_item = payload["widgets"][8]["items"][0]
+    assert ranked_item["barcode"] == "123"
+    assert ranked_item["image_url"].startswith("data:image/svg+xml")
+    assert payload["widgets"][0]["data"][0]["label"] == "Sales Count"
+    assert payload["data_sources"][2]["endpoint_or_topic"] == "get_top_sellers"
+    assert payload["insights"][1]["title"] == "Best trading day"
+
+
+def test_build_pos_top_sellers_insight_returns_ranked_widget_payload() -> None:
+    payload = _build_pos_top_sellers_insight(
+        {
+            "_window_label": "3 months ago",
+            "results": [
+                {
+                    "product_name": "Cabin Biscuit 200g",
+                    "variant_name": "Cabin Biscuit 200g",
+                    "quantity_sold": 12,
+                    "sales_total": 7800.0,
+                    "order_count": 6,
+                }
+            ]
+        }
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert payload["summary"] == "Cabin Biscuit 200g is the top seller for 3 months ago."
+    assert payload["widgets"][0]["type"] == "metric_grid"
+    assert payload["widgets"][1]["type"] == "ranked_list"
+    assert payload["widgets"][1]["title"] == "Top sellers for 3 months ago"
+    assert payload["widgets"][1]["items"][0]["image_url"].startswith("data:image/svg+xml")
+    assert payload["data_sources"][0]["endpoint_or_topic"] == "get_top_sellers"
+
+
+def test_build_pos_best_sales_day_insight_returns_trend_payload() -> None:
+    payload = _build_pos_best_sales_day_insight(
+        {
+            "_window_label": "all time",
+            "groups": [
+                {"label": "2026-05-12", "order_count": 3, "total_sales": 5000.0},
+                {"label": "2026-06-03", "order_count": 7, "total_sales": 12000.0},
+                {"label": "2026-06-28", "order_count": 5, "total_sales": 9000.0},
+            ],
+        }
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert payload["summary"] == "2026-06-03 was the strongest sales day in all time."
+    assert payload["widgets"][0]["type"] == "metric_grid"
+    assert payload["widgets"][1]["type"] == "line_chart"
+    assert payload["widgets"][2]["type"] == "ranked_list"
+    assert payload["insights"][0]["title"] == "Peak day"
+
+
+def test_resolve_insight_time_window_supports_relative_ranges() -> None:
+    today = datetime.now(timezone.utc).date()
+    month_window = _resolve_insight_time_window("show sales by location for the past month", default_days=1, default_label="today")
+    assert month_window["days"] == 30
+    assert month_window["label"] == "last month"
+
+    last_month_window = _resolve_insight_time_window("how many sales was made last month", default_days=1, default_label="today")
+    if today.month == 1:
+        assert last_month_window["start_date"] == f"{today.year - 1}-12-01"
+        assert last_month_window["end_date"] == f"{today.year - 1}-12-31"
+    else:
+        previous_month = today.month - 1
+        month_end = monthrange(today.year, previous_month)[1]
+        assert last_month_window["start_date"] == f"{today.year}-{previous_month:02d}-01"
+        assert last_month_window["end_date"] == f"{today.year}-{previous_month:02d}-{month_end:02d}"
+    assert last_month_window["label"] == "last month"
+
+    trailing_months_window = _resolve_insight_time_window("show purchase order analysis for the last three months", default_days=30, default_label="last 30 days")
+    assert trailing_months_window["label"] == "last 3 months"
+    assert trailing_months_window["end_date"] == today.isoformat()
+
+    year_window = _resolve_insight_time_window("show top sellers for the past year", default_days=7, default_label="last 7 days")
+    assert year_window["days"] == 365
+    assert year_window["label"] == "last year"
+
+    anchored_window = _resolve_insight_time_window("show staff activity from 3 months ago", default_days=30, default_label="last 30 days")
+    assert 28 <= anchored_window["days"] <= 31
+    assert anchored_window["label"] == "3 months ago"
+
+    explicit_window = _resolve_insight_time_window(
+        "show stock value from 2026-06-01 to 2026-06-30",
+        default_days=30,
+        default_label="last 30 days",
+    )
+    assert explicit_window["start_date"] == "2026-06-01"
+    assert explicit_window["end_date"] == "2026-06-30"
+    assert explicit_window["label"] == "2026-06-01 to 2026-06-30"
+
+    named_month_window = _resolve_insight_time_window(
+        "show sales by location in june 2026",
+        default_days=30,
+        default_label="last 30 days",
+    )
+    assert named_month_window["start_date"] == "2026-06-01"
+    assert named_month_window["end_date"] == "2026-06-30"
+    assert named_month_window["label"] == "June 2026"
+
+    quarter_window = _resolve_insight_time_window(
+        "show purchase order analysis in q1 2026",
+        default_days=30,
+        default_label="last 30 days",
+    )
+    assert quarter_window["start_date"] == "2026-01-01"
+    assert quarter_window["end_date"] == "2026-03-31"
+    assert quarter_window["label"] == "Q1 2026"
+
+    all_time_window = _resolve_insight_time_window(
+        "what is the highest sales I ever made in a day",
+        default_days=1,
+        default_label="today",
+    )
+    assert all_time_window["label"] == "all time"
+    assert all_time_window["days"] == 3651
+
+
+class _RecordingToolExecutor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def list_tools(self, *, ctx: ToolContext) -> list[ToolSpec]:
+        return []
+
+    async def call_tool(self, *, name: str, arguments: dict[str, object], ctx: ToolContext) -> dict[str, object]:
+        self.calls.append((name, arguments))
+        if name == "pos.get_sales_summary":
+            if arguments.get("group_by") == "day":
+                return {
+                    "total_sales": 2400.0,
+                    "groups": [
+                        {"label": "2026-06-01", "order_count": 1, "total_sales": 900.0},
+                        {"label": "2026-06-04", "order_count": 1, "total_sales": 1500.0},
+                    ],
+                }
+            return {
+                "total_sales": 2400.0,
+                "groups": [{"label": "HQ", "order_count": 2, "total_sales": 2400.0}],
+            }
+        if name == "pos.get_top_sellers":
+            return {
+                "results": [{"product_name": "Cabin Biscuit 200g", "variant_name": "Cabin Biscuit 200g", "quantity_sold": 5, "sales_total": 2400.0, "order_count": 2}],
+            }
+        if name == "pos.get_product_sales_trend":
+            query = str(arguments.get("query") or "")
+            if "Coca" in query:
+                product_rows = [
+                    {
+                        "product_name": "Coca-Cola Original Taste",
+                        "variant_name": "Coca-Cola Original Taste 50cl",
+                        "sku_snapshot": "COKE-50CL",
+                        "barcode_snapshot": "5449000000996",
+                        "quantity_sold": 25,
+                        "sales_total": 12500.0,
+                        "order_count": 10,
+                    }
+                ]
+                trend_rows = [
+                    {"label": "2026-01-01", "quantity_sold": 10, "sales_total": 5000.0, "order_count": 4},
+                    {"label": "2026-02-01", "quantity_sold": 15, "sales_total": 7500.0, "order_count": 6},
+                ]
+                return {
+                    "query": query,
+                    "totals": {"quantity_sold": 25, "sales_total": 12500.0, "order_count": 10, "average_unit_price": 500.0},
+                    "trend": trend_rows,
+                    "series_trend": [],
+                    "locations": [],
+                    "products": product_rows,
+                    "recent_orders": [],
+                }
+            if "Eva" in query:
+                product_rows = [
+                    {
+                        "product_name": "Eva Premium Water",
+                        "variant_name": "Eva Premium Water 75cl",
+                        "sku_snapshot": "EVA-75CL",
+                        "barcode_snapshot": "6151100030011",
+                        "quantity_sold": 40,
+                        "sales_total": 16000.0,
+                        "order_count": 16,
+                    }
+                ]
+                trend_rows = [
+                    {"label": "2026-01-01", "quantity_sold": 12, "sales_total": 4800.0, "order_count": 5},
+                    {"label": "2026-02-01", "quantity_sold": 28, "sales_total": 11200.0, "order_count": 11},
+                ]
+                return {
+                    "query": query,
+                    "totals": {"quantity_sold": 40, "sales_total": 16000.0, "order_count": 16, "average_unit_price": 400.0},
+                    "trend": trend_rows,
+                    "series_trend": [],
+                    "locations": [],
+                    "products": product_rows,
+                    "recent_orders": [],
+                }
+            return {
+                "query": arguments.get("query"),
+                "totals": {"quantity_sold": 56, "sales_total": 21000.0, "order_count": 24, "average_unit_price": 375.0},
+                "trend": [
+                    {"label": "2026-01-01", "quantity_sold": 12, "sales_total": 4200.0, "order_count": 5},
+                    {"label": "2026-02-01", "quantity_sold": 44, "sales_total": 16800.0, "order_count": 19},
+                ],
+                "series_trend": [
+                    {"label": "2026-01-01", "product_name": "Next Pique Polo Shirt", "variant_name": "Black L", "sku_snapshot": "NEXT-POLO-BLK-L", "barcode_snapshot": "8800000002502", "quantity_sold": 20, "sales_total": 9000.0, "order_count": 10},
+                    {"label": "2026-01-01", "product_name": "Next Pique Polo Shirt", "variant_name": "Navy M", "sku_snapshot": "NEXT-POLO-NAV-M", "barcode_snapshot": "8800000002501", "quantity_sold": 8, "sales_total": 2400.0, "order_count": 2},
+                    {"label": "2026-02-01", "product_name": "Next Pique Polo Shirt", "variant_name": "Black L", "sku_snapshot": "NEXT-POLO-BLK-L", "barcode_snapshot": "8800000002502", "quantity_sold": 12, "sales_total": 5700.0, "order_count": 8},
+                    {"label": "2026-02-01", "product_name": "Next Pique Polo Shirt", "variant_name": "Navy M", "sku_snapshot": "NEXT-POLO-NAV-M", "barcode_snapshot": "8800000002501", "quantity_sold": 16, "sales_total": 3900.0, "order_count": 4},
+                ],
+                "locations": [
+                    {"location": "Gberigbe Store", "quantity_sold": 28, "sales_total": 9800.0, "order_count": 11},
+                    {"location": "Airport Road", "quantity_sold": 28, "sales_total": 11200.0, "order_count": 13},
+                ],
+                "products": [
+                    {
+                        "product_name": "Next Pique Polo Shirt",
+                        "variant_name": "Black L",
+                        "sku_snapshot": "NEXT-POLO-BLK-L",
+                        "barcode_snapshot": "8800000002502",
+                        "quantity_sold": 32,
+                        "sales_total": 14700.0,
+                        "order_count": 18,
+                    },
+                    {
+                        "product_name": "Next Pique Polo Shirt",
+                        "variant_name": "Navy M",
+                        "sku_snapshot": "NEXT-POLO-NAV-M",
+                        "barcode_snapshot": "8800000002501",
+                        "quantity_sold": 24,
+                        "sales_total": 6300.0,
+                        "order_count": 6,
+                    }
+                ],
+                "recent_orders": [
+                    {
+                        "completed_at": "2026-02-03T10:00:00Z",
+                        "location": "Gberigbe Store",
+                        "terminal_name": "Front POS",
+                        "quantity": 2,
+                        "unit_price": 350.0,
+                        "line_total": 700.0,
+                    }
+                ],
+            }
+        if name == "product.get_variant_lookup":
+            return {
+                "results": [
+                    {
+                        "product_name": "Next Pique Polo Shirt",
+                        "name": "Black L",
+                        "sku": "NEXT-POLO-BLK-L",
+                        "barcode": "8800000002502",
+                        "image_url": "https://example.com/black-l.png",
+                    },
+                    {
+                        "product_name": "Next Pique Polo Shirt",
+                        "name": "Navy M",
+                        "sku": "NEXT-POLO-NAV-M",
+                        "barcode": "8800000002501",
+                        "image_url": "https://example.com/navy-m.png",
+                    }
+                ]
+            }
+        if name == "pos.get_terminal_activity":
+            return {
+                "results": [
+                    {"terminal_name": "Front POS", "cashier_name": "Ada", "order_count": 4, "sales_total": 2400.0, "average_basket": 600.0}
+                ],
+            }
+        if name == "audit.search_events":
+            return {
+                "count": 2,
+                "results": [
+                    {"occurred_at": "2026-07-01T10:00:00Z", "summary": "Staff updated role", "action": "update_role", "severity": "warning", "source_service": "users"},
+                    {"occurred_at": "2026-07-01T09:00:00Z", "summary": "Inventory adjusted", "action": "adjustment", "severity": "info", "source_service": "inventory"},
+                ],
+            }
+        if name == "audit.get_event_timeline":
+            return {
+                "count": 2,
+                "timeline": [
+                    {"timestamp": "2026-07-01T08:00:00Z", "title": "Access granted", "detail": "Support access granted", "severity": "warning"},
+                    {"timestamp": "2026-07-01T09:00:00Z", "title": "Role updated", "detail": "Manager role expanded", "severity": "info"},
+                ],
+            }
+        if name == "audit.get_staff_activity":
+            return {
+                "event_count": 3,
+                "actions": [{"key": "login", "count": 2}],
+                "source_services": [{"key": "users", "count": 3}],
+                "daily_activity": [{"bucket": "2026-07-01", "count": 3}],
+                "recent_events": [{"occurred_at": "2026-07-01T10:00:00Z", "summary": "Ada logged in", "action": "login"}],
+            }
+        if name == "audit.get_permission_security_activity":
+            return {
+                "event_count": 2,
+                "actors": [{"key": "Support Agent", "count": 1}],
+                "support_access_grants": [{"key": "grant-1", "count": 1}],
+                "severities": [{"key": "warning", "count": 1}],
+                "recent_events": [{"occurred_at": "2026-07-01T10:00:00Z", "summary": "Support access granted", "action": "grant"}],
+            }
+        if name == "audit.get_product_activity":
+            return {
+                "event_count": 2,
+                "actions": [{"key": "update_product", "count": 2}],
+                "source_services": [{"key": "products", "count": 2}],
+                "daily_activity": [{"bucket": "2026-07-01", "count": 2}],
+                "recent_events": [{"occurred_at": "2026-07-01T10:00:00Z", "summary": "Product updated", "action": "update_product"}],
+            }
+        if name == "audit.get_pos_activity":
+            return {
+                "event_count": 2,
+                "actions": [{"key": "complete_sale", "count": 2}],
+                "source_services": [{"key": "pos", "count": 2}],
+                "daily_activity": [{"bucket": "2026-07-01", "count": 2}],
+                "recent_events": [{"occurred_at": "2026-07-01T10:00:00Z", "summary": "Sale completed", "action": "complete_sale"}],
+            }
+        if name == "audit.get_purchase_order_activity":
+            return {
+                "event_count": 2,
+                "timeline": [
+                    {"timestamp": "2026-07-01T09:00:00Z", "title": "PO approved", "detail": "PO-101 approved", "severity": "info"},
+                    {"timestamp": "2026-07-01T11:00:00Z", "title": "PO received", "detail": "PO-101 partially received", "severity": "warning"},
+                ],
+                "recent_events": [{"occurred_at": "2026-07-01T11:00:00Z", "summary": "PO partially received", "action": "receive"}],
+            }
+        if name == "audit.get_realtime_dashboard_snapshot":
+            return {
+                "metrics": {
+                    "sales_24h_amount": 12400.5,
+                    "sales_24h_orders": 11,
+                    "receiving_24h_units": 42,
+                    "security_events_24h": 1,
+                },
+                "alerts": {
+                    "total_attention_items": 2,
+                    "high_severity_24h": 1,
+                    "support_access_24h": 1,
+                },
+                "charts": {"sales_amount_by_hour": [{"bucket": "09:00", "value": 3200.0}]},
+                "leaderboards": {"top_products_24h": [{"title": "Cabin Biscuit 200g", "subtitle": "Units sold", "metric_value": 12}]},
+                "feed": [{"occurred_at": "2026-07-01T10:00:00Z", "summary": "Sale completed", "source_service": "pos", "severity": "info"}],
+            }
+        if name == "notifications.get_alert_summary":
+            return {
+                "unread_count": 3,
+                "category_counts": [{"key": "system", "count": 2}],
+                "recent_notifications": [{"title": "Restock soon"}],
+            }
+        if name == "subscriptions.get_usage_and_limits":
+            return {
+                "subscription": {"status": "TRIAL", "plan": {"name": "Enterprise"}},
+                "features": [{"name": "Staff users", "usage": 8, "limit_value": 10, "remaining": 2, "status": "near_limit"}],
+                "warnings": ["Trial ends soon."],
+            }
+        if name == "inventory.get_stock_risk":
+            return {
+                "summary": {"out_of_stock_count": 1, "reorder_count": 1, "low_stock_count": 1, "expiring_count": 0},
+                "risk_items": {"out_of_stock": [{"name": "Cabin Biscuit 200g", "quantity_available": 0, "location_name": "Lekki", "sku": "CAB-200"}]},
+            }
+        if name == "inventory.get_stock_movements":
+            return {
+                "results": [{"occurred_at": "2026-07-01T10:00:00Z", "movement_type": "adjustment", "quantity_delta": -2, "location_name": "HQ", "inventory_item_name": "Cabin Biscuit 200g"}],
+            }
+        if name == "inventory.get_stock_analytics":
+            return {
+                "analytics": {
+                    "total_stock_value": 18400.0,
+                    "total_locations": 2,
+                    "location_distribution": [{"location_name": "Lekki", "item_count": 12, "total_quantity": 80, "total_value": 14000.0}],
+                    "aging_analysis": {"0-30_days": 4, "31-90_days": 2, "91-365_days": 1, "over_1_year": 1},
+                }
+            }
+        if name == "inventory.get_reorder_candidates":
+            return {
+                "count": 1,
+                "results": [{"name": "Cabin Biscuit 200g", "quantity_available": 1, "quantity": 1, "location_name": "Lekki"}],
+            }
+        if name == "inventory.search_purchase_orders":
+            return {
+                "results": [{"reference_number": "PO-101", "supplier_name": "Acme", "status": "issued", "delivery_date": "2026-07-03"}],
+            }
+        if name == "inventory.search_stock_locations":
+            return {
+                "results": [{"name": "Lekki", "stock_item_count": 12, "available_quantity": 80}],
+            }
+        if name == "inventory.get_purchase_order_analytics":
+            return {
+                "analytics": {
+                    "supplier_performance": [{"supplier_name": "Acme", "order_count": 2, "total_value": 3200.0, "avg_delivery_time": 4, "on_time_deliveries": 1}],
+                    "on_time_delivery_rate": 50,
+                    "average_delivery_time": 4,
+                    "total_order_value": 3200.0,
+                    "average_order_value": 1600.0,
+                    "cost_per_order": 1600.0,
+                }
+            }
+        if name == "product.get_product_dashboard_stats":
+            return {
+                "dashboard": {"category_distribution": [{"category_name": "Snacks", "count": 4}]},
+            }
+        if name == "product.get_product_stock_alerts":
+            return {
+                "alerts": [{"product_name": "Cabin Biscuit 200g", "alert_type": "low_stock"}],
+            }
+        if name == "product.search_product_variants":
+            return {
+                "results": [{"product_name": "Cabin Biscuit", "name": "Cabin Biscuit 200g", "sku": "CAB-200", "barcode": "123", "selling_price": 500.0}],
+            }
+        if name == "product.get_variant_lookup":
+            return {
+                "results": [{"product_name": "Cabin Biscuit", "name": "Cabin Biscuit 200g", "sku": "CAB-200", "barcode": "123", "selling_price": 500.0}],
+            }
+        if name == "product.get_top_catalog_matches":
+            return {
+                "count": 1,
+                "results": [{"name": "Cabin Biscuit 200g", "brand": "Cabin", "category_name": "Snacks", "variant_count": 1, "already_imported": False}],
+            }
+        raise AssertionError(f"Unexpected tool call: {name}")
+
+
+class _VariantLookupCountingExecutor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def call_tool(self, *, name: str, arguments: dict[str, object], ctx: ToolContext) -> dict[str, object]:
+        _ = ctx
+        self.calls.append((name, dict(arguments)))
+        if name != "product.get_variant_lookup":
+            raise AssertionError(f"Unexpected tool call: {name}")
+        query = str(arguments.get("query") or "")
+        return {
+            "results": [
+                {
+                    "product_name": query,
+                    "name": query,
+                    "sku": f"{query[:8].upper()}-SKU",
+                    "barcode": f"{query[:8].upper()}-BAR",
+                    "image_url": f"https://example.com/{query[:8]}.png",
+                }
+            ]
+        }
+
+
+@pytest.mark.asyncio
+async def test_pos_named_insight_payload_threads_relative_date_filters_into_tools() -> None:
+    executor = _RecordingToolExecutor()
+
+    overview_payload = await _pos_admin_named_insight_payload(
+        insight_key="sales_overview",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="how many sales was made last month",
+    )
+    sales_payload = await _pos_admin_named_insight_payload(
+        insight_key="sales_by_location_today",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="show sales by location for the past month",
+    )
+    top_seller_payload = await _pos_admin_named_insight_payload(
+        insight_key="top_sellers_seven_days",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="show top sellers from 3 months ago",
+    )
+    best_day_payload = await _pos_admin_named_insight_payload(
+        insight_key="best_sales_day",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="what is the highest sales I ever made in a day?",
+    )
+    yearly_overview_payload = await _pos_admin_named_insight_payload(
+        insight_key="sales_overview",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="can you analyse my sales data for the past 1 year?",
+    )
+    product_trend_payload = await _pos_admin_named_insight_payload(
+        insight_key="product_sales_trend",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="show sales trend for barcode 8800000001501 over the past year",
+    )
+    variant_comparison_payload = await _pos_admin_named_insight_payload(
+        insight_key="variant_comparison",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="compare variants of Next Pique Polo Shirt for the past year",
+    )
+    product_comparison_payload = await _pos_admin_named_insight_payload(
+        insight_key="product_comparison",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="compare products Eva Premium Water and Coca-Cola Original Taste for the past year",
+    )
+    mixed_product_comparison_payload = await _pos_admin_named_insight_payload(
+        insight_key="product_comparison",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="compare Eva Premium Water with barcode 8800000001101 for the past year",
+    )
+
+    assert overview_payload is not None
+    assert sales_payload is not None
+    assert top_seller_payload is not None
+    assert best_day_payload is not None
+    assert yearly_overview_payload is not None
+    assert product_trend_payload is not None
+    assert product_trend_payload["widgets"][0]["type"] == "entity_preview"
+    assert product_trend_payload["widgets"][2]["type"] == "line_chart"
+    assert variant_comparison_payload is not None
+    assert variant_comparison_payload["widgets"][1]["type"] == "ranked_list"
+    assert variant_comparison_payload["widgets"][2]["type"] == "line_chart"
+    assert variant_comparison_payload["widgets"][2]["series"][0]["label"] == "Black L"
+    assert variant_comparison_payload["widgets"][2]["series"][1]["label"] == "Navy M"
+    assert variant_comparison_payload["widgets"][4]["type"] == "line_chart"
+    assert variant_comparison_payload["widgets"][7]["type"] == "comparison_table"
+    assert "sku" not in variant_comparison_payload["widgets"][7]["columns"]
+    assert product_comparison_payload is not None
+    assert product_comparison_payload["widgets"][2]["type"] == "line_chart"
+    assert product_comparison_payload["widgets"][2]["title"].startswith("Product revenue trend")
+    assert product_comparison_payload["widgets"][3]["title"].startswith("Product units trend")
+    assert product_comparison_payload["widgets"][4]["title"].startswith("Product order-count trend")
+    assert product_comparison_payload["widgets"][6]["type"] == "comparison_table"
+    assert "sku" not in product_comparison_payload["widgets"][6]["columns"]
+    assert mixed_product_comparison_payload is not None
+    assert mixed_product_comparison_payload["widgets"][2]["type"] == "line_chart"
+    assert mixed_product_comparison_payload["widgets"][6]["type"] == "comparison_table"
+    assert "sku" not in mixed_product_comparison_payload["widgets"][6]["columns"]
+    overview_window = _resolve_insight_time_window("how many sales was made last month", default_days=1, default_label="today")
+    sales_window = _resolve_insight_time_window("show sales by location for the past month", default_days=1, default_label="today")
+    top_sellers_window = _resolve_insight_time_window("show top sellers from 3 months ago", default_days=7, default_label="last 7 days")
+    all_time_window = _resolve_insight_time_window("what is the highest sales I ever made in a day?", default_days=1, default_label="today")
+    yearly_window = _resolve_insight_time_window("can you analyse my sales data for the past 1 year?", default_days=1, default_label="today")
+    product_window = _resolve_insight_time_window("show sales trend for barcode 8800000001501 over the past year", default_days=365, default_label="last 1 year")
+    variant_window = _resolve_insight_time_window("compare variants of Next Pique Polo Shirt for the past year", default_days=365, default_label="last 1 year")
+    comparison_window = _resolve_insight_time_window("compare Eva Premium Water with barcode 8800000001101 for the past year", default_days=365, default_label="last 1 year")
+    pos_calls = [call for call in executor.calls if call[0].startswith("pos.")]
+    assert pos_calls[0] == (
+        "pos.get_sales_summary",
+        {"days": overview_window["days"], "date": overview_window["anchor_date"], "group_by": "location"},
+    )
+    assert pos_calls[1] == (
+        "pos.get_sales_summary",
+        {"days": overview_window["days"], "date": overview_window["anchor_date"], "group_by": "day"},
+    )
+    assert pos_calls[2] == (
+        "pos.get_top_sellers",
+        {"days": overview_window["days"], "date": overview_window["anchor_date"], "limit": 5},
+    )
+    assert pos_calls[3] == (
+        "pos.get_sales_summary",
+        {"days": sales_window["days"], "date": sales_window["anchor_date"], "group_by": "location"},
+    )
+    assert pos_calls[4][0] == "pos.get_top_sellers"
+    assert pos_calls[4][1]["days"] == top_sellers_window["days"]
+    assert pos_calls[4][1]["date"] == top_sellers_window["anchor_date"]
+    assert pos_calls[5] == (
+        "pos.get_sales_summary",
+        {"days": all_time_window["days"], "date": all_time_window["anchor_date"], "group_by": "day"},
+    )
+    assert pos_calls[6] == (
+        "pos.get_sales_summary",
+        {"days": yearly_window["days"], "date": yearly_window["anchor_date"], "group_by": "location"},
+    )
+    assert pos_calls[7] == (
+        "pos.get_sales_summary",
+        {"days": yearly_window["days"], "date": yearly_window["anchor_date"], "group_by": "day"},
+    )
+    assert pos_calls[8] == (
+        "pos.get_top_sellers",
+        {"days": yearly_window["days"], "date": yearly_window["anchor_date"], "limit": 5},
+    )
+    assert ("product.get_variant_lookup", {"query": "8800000001501", "limit": 1, "active_only": True}) in executor.calls
+    assert pos_calls[9] == (
+        "pos.get_product_sales_trend",
+        {"days": product_window["days"], "date": product_window["anchor_date"], "query": "8800000001501", "group_by": "month", "limit": 10},
+    )
+    assert ("product.get_variant_lookup", {"query": "Next Pique Polo Shirt", "limit": 10, "active_only": True}) in executor.calls
+    assert pos_calls[10] == (
+        "pos.get_product_sales_trend",
+        {
+            "days": variant_window["days"],
+            "date": variant_window["anchor_date"],
+            "query": "Next Pique Polo Shirt",
+            "group_by": "month",
+            "limit": 25,
+            "include_series": True,
+            "include_locations": False,
+            "include_recent": False,
+        },
+    )
+    assert (
+        "pos.get_product_sales_trend",
+        {
+            "days": comparison_window["days"],
+            "date": comparison_window["anchor_date"],
+            "query": "Eva Premium Water",
+            "group_by": "month",
+            "limit": 10,
+            "include_series": False,
+            "include_locations": False,
+            "include_recent": False,
+        },
+    ) in pos_calls
+    assert (
+        "pos.get_product_sales_trend",
+        {
+            "days": comparison_window["days"],
+            "date": comparison_window["anchor_date"],
+            "query": "8800000001101",
+            "group_by": "month",
+            "limit": 10,
+            "include_series": False,
+            "include_locations": False,
+            "include_recent": False,
+        },
+    ) in pos_calls
+
+
+@pytest.mark.asyncio
+async def test_enrich_top_sellers_deduplicates_lookup_queries() -> None:
+    executor = _VariantLookupCountingExecutor()
+
+    payload = await _enrich_top_seller_results_with_variant_context(
+        results_payload={
+            "results": [
+                {
+                    "variant_name": "Eva Premium Water 75cl",
+                    "product_name": "Eva Premium Water 75cl",
+                    "quantity_sold": 16,
+                    "sales_total": 5600.0,
+                },
+                {
+                    "variant_name": "Eva Premium Water 75cl",
+                    "product_name": "Eva Premium Water 75cl",
+                    "quantity_sold": 12,
+                    "sales_total": 4200.0,
+                },
+                {
+                    "variant_name": "Fanta Orange 50cl",
+                    "product_name": "Fanta Orange 50cl",
+                    "quantity_sold": 8,
+                    "sales_total": 3600.0,
+                },
+            ]
+        },
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        limit=3,
+    )
+
+    results = payload["results"]
+    assert isinstance(results, list)
+    assert len(results) == 3
+    product_lookup_calls = [call for call in executor.calls if call[0] == "product.get_variant_lookup"]
+    assert len(product_lookup_calls) == 2
+    assert {call[1]["query"] for call in product_lookup_calls} == {"Eva Premium Water 75cl", "Fanta Orange 50cl"}
+    assert results[0]["image_url"] == "https://example.com/Eva Prem.png"
+    assert results[2]["barcode"] == "FANTA OR-BAR"
+
+
+def test_inventory_visibility_named_insight_from_text_detects_priority_flows() -> None:
+    assert _inventory_visibility_named_insight_from_text("Show out-of-stock products.") == "stock_risk_out_of_stock"
+    assert _inventory_visibility_named_insight_from_text("Show low-stock products.") == "stock_risk_low_stock"
+    assert _inventory_visibility_named_insight_from_text("Show stock risk alerts.") == "stock_risk"
+    assert _inventory_visibility_named_insight_from_text("Show reorder candidates now.") == "reorder_candidates"
+    assert _inventory_visibility_named_insight_from_text("Show stock value changes for the last three months.") == "stock_value_changes"
+    assert _inventory_visibility_named_insight_from_text("Show the realtime dashboard snapshot right now.") == "realtime_snapshot"
+    assert _inventory_visibility_named_insight_from_text("Show zero-balance items that need attention now.") == "stock_risk_out_of_stock"
+    assert _inventory_visibility_named_insight_from_text("What products are missing from the shelf today?") == "stock_risk_out_of_stock"
+    assert _inventory_visibility_named_insight_from_text("Adjust stock for item A") is None
+
+
+def test_build_inventory_stock_risk_insight_returns_risk_widgets() -> None:
+    payload = _build_inventory_stock_risk_insight(
+        {
+            "summary": {
+                "out_of_stock_count": 2,
+                "reorder_count": 3,
+                "low_stock_count": 1,
+                "expiring_count": 0,
+            },
+            "risk_items": {
+                "out_of_stock": [
+                    {
+                        "name": "Cabin Biscuit 200g",
+                        "quantity_available": 0,
+                        "location_name": "Lekki",
+                        "sku": "CAB-200",
+                    }
+                ]
+            },
+        },
+        focus="out_of_stock",
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert payload["widgets"][0]["type"] == "metric_grid"
+    assert payload["widgets"][1]["type"] == "risk_panel"
+    assert payload["widgets"][2]["type"] == "ranked_list"
+    assert payload["data_sources"][0]["endpoint_or_topic"] == "get_stock_risk"
+
+
+def test_users_named_insight_from_text_detects_priority_flows() -> None:
+    assert _users_named_insight_from_text("Show staff activity from audit events") == "staff_activity"
+    assert _users_named_insight_from_text("Show staff activity in June 2026.") == "staff_activity"
+    assert _users_named_insight_from_text("Show support access audit") == "support_access_audit"
+    assert _users_named_insight_from_text("Show permission and security activity") == "permission_security_activity"
+    assert _users_named_insight_from_text("Show recent audit logs for the past month") == "audit_search"
+    assert _users_named_insight_from_text("Show the audit timeline for this workspace") == "audit_timeline"
+    assert _users_named_insight_from_text("Show subscription usage and limits") == "subscription_usage_limits"
+    assert _users_named_insight_from_text("Invite a staff member") is None
+
+
+def test_host_named_insight_from_text_detects_cross_domain_flows() -> None:
+    assert _host_named_insight_from_text("Act as my business analyst and tell me what I am not seeing.") == "business_analyst_review"
+    assert _host_named_insight_from_text("Can you analyze the entire data as a data analyst?") == "business_analyst_review"
+    assert _host_named_insight_from_text("Give me a strategic business review for the past year.") == "business_analyst_review"
+    assert _host_named_insight_from_text("analyse my entire system for the past 1 year") == "business_analyst_review"
+    assert _host_named_insight_from_text("review the whole system for the past year") == "business_analyst_review"
+    assert _host_named_insight_from_text("How many sales was made last month?") == "pos::sales_overview"
+    assert _host_named_insight_from_text("Give me the sales analysis for last month.") == "pos::sales_overview"
+    assert _host_named_insight_from_text("can you analyse my sales data for the past 1 year?") == "pos::sales_overview"
+    assert _host_named_insight_from_text("Show sales trend for barcode 8800000001501 over the past year") == "pos::product_sales_trend"
+    assert _host_named_insight_from_text("Show out-of-stock products.") == "inventory_visibility::stock_risk_out_of_stock"
+    assert _host_named_insight_from_text("Show purchase order lifecycle for the past month") == "inventory_procurement::po_lifecycle"
+    assert _host_named_insight_from_text("Show PO receiving lifecycle for the past 1 year") == "inventory_procurement::receiving_lifecycle"
+    assert _host_named_insight_from_text("Show purchase order receiving timeline last year") == "inventory_procurement::receiving_lifecycle"
+    assert _host_named_insight_from_text("Show staff activity from audit events") == "users::staff_activity"
+    assert _host_named_insight_from_text("Show staff activity in June 2026.") == "users::staff_activity"
+    assert _host_named_insight_from_text("Show global catalog import opportunities") == "product_discovery::import_opportunities"
+    assert _host_named_insight_from_text("Show subscription usage and limits") == "users::subscription_usage_limits"
+    assert _host_named_insight_from_text("Give me a one-screen operational summary for today.") == "cross_domain_ops"
+    assert _host_named_insight_from_text("Which areas are strong and weak across inventory and POS?") == "cross_domain_ops"
+    assert _host_named_insight_from_text("Show side-by-side location performance for today.") == "location_comparison"
+    assert _host_named_insight_from_text("Compare branches by top sellers and stockouts.") == "location_comparison"
+    assert _host_named_insight_from_text("What are the top three actions I should take next?") == "recommendations"
+
+
+def test_build_host_business_analyst_insight_returns_cross_service_widgets() -> None:
+    payload = _build_host_business_analyst_insight(
+        {
+            "_window_label": "last 1 year",
+            "_window_start_date": "2025-07-11",
+            "_window_end_date": "2026-07-10",
+            "currency_code": "NGN",
+            "groups": [
+                {"label": "2026-01-01", "total_sales": 10000, "order_count": 8},
+                {"label": "2026-01-02", "total_sales": 25000, "order_count": 12},
+            ],
+        },
+        {
+            "_window_label": "last 1 year",
+            "groups": [
+                {"label": "Gberigbe Store", "total_sales": 22000, "order_count": 10},
+                {"label": "Airport Road", "total_sales": 13000, "order_count": 10},
+            ],
+        },
+        {
+            "results": [
+                {
+                    "variant_name": "Eva Premium Water 75cl",
+                    "product_name": "Eva Premium Water",
+                    "sales_total": 18000,
+                    "quantity_sold": 60,
+                    "order_count": 9,
+                    "barcode_snapshot": "8800000001501",
+                }
+            ]
+        },
+        {
+            "summary": {
+                "out_of_stock_count": 2,
+                "reorder_count": 4,
+                "expiring_count": 1,
+            }
+        },
+        {"status_counts": {"pending": 2, "received": 3}},
+        {"features": [{"name": "AI coins", "status": "near_limit"}]},
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert "Business analyst review" in payload["summary"]
+    assert payload["widgets"][0]["type"] == "metric_grid"
+    assert payload["widgets"][1]["title"].startswith("Revenue trend")
+    assert payload["widgets"][2]["title"].startswith("Order-count trend")
+    assert payload["widgets"][3]["type"] == "comparison_table"
+    assert payload["widgets"][4]["type"] == "ranked_list"
+    assert payload["widgets"][5]["type"] == "risk_panel"
+    assert payload["widgets"][6]["title"] == "Recommended owner actions"
+    assert payload["widgets"][6]["items"][0]["hide_value"] is True
+    assert payload["widgets"][5]["items"][0]["description"]
+    assert payload["data_sources"][0]["service"] == "pos"
+
+
+def test_latest_insight_follow_up_answer_uses_previous_structured_payload() -> None:
+    payload = _build_host_business_analyst_insight(
+        {
+            "_window_label": "last 1 year",
+            "_window_start_date": "2025-07-11",
+            "_window_end_date": "2026-07-10",
+            "currency_code": "NGN",
+            "groups": [
+                {"label": "2026-01-01", "total_sales": 10000, "order_count": 8},
+                {"label": "2026-01-02", "total_sales": 25000, "order_count": 12},
+            ],
+        },
+        {
+            "_window_label": "last 1 year",
+            "groups": [
+                {"label": "Gberigbe Store", "total_sales": 22000, "order_count": 10},
+                {"label": "Airport Road", "total_sales": 13000, "order_count": 10},
+            ],
+        },
+        {
+            "results": [
+                {
+                    "variant_name": "Eva Premium Water 75cl",
+                    "product_name": "Eva Premium Water",
+                    "sales_total": 18000,
+                    "quantity_sold": 60,
+                    "order_count": 9,
+                    "barcode_snapshot": "8800000001501",
+                }
+            ]
+        },
+        {"summary": {"out_of_stock_count": 2, "reorder_count": 4, "expiring_count": 1}},
+        {"status_counts": {"pending": 2, "received": 3}},
+        {"features": [{"name": "AI coins", "status": "near_limit"}]},
+    )
+    history = [{"role": "assistant", "content": json.dumps(payload)}]
+    frontend_history = [
+        {
+            "role": "assistant",
+            "content": "Business analyst review for last 1 year.",
+            "structured_payload": payload,
+        }
+    ]
+    direct_stream_history = [
+        {
+            "role": "assistant",
+            "content": "Business analyst review for last 1 year.",
+            "structuredPayload": payload,
+        },
+        {"role": "user", "content": "Which location led?"},
+    ]
+    repeated_history = [
+        {"role": "user", "content": "Act as my business analyst and tell me what I am not seeing for the past year"},
+        {
+            "role": "assistant",
+            "content": "Business analyst review for last 1 year.",
+            "structuredPayload": payload,
+        },
+        {"role": "user", "content": "Act as my business analyst and tell me what I am not seeing for the past year"},
+    ]
+
+    assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location led?", history) or "")
+    assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location led?", frontend_history) or "")
+    assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location led?", direct_stream_history) or "")
+    assert "Prioritize replenishment" in (_latest_insight_follow_up_answer("What should I do first?", history) or "")
+    assert "Prioritize replenishment" in (
+        _latest_insight_follow_up_answer("What should I do first?", frontend_history) or ""
+    )
+    assert "Stockouts" in (_latest_insight_follow_up_answer("What are the risks?", history) or "")
+    assert "Eva Premium Water" in (_latest_insight_follow_up_answer("Which products drove revenue?", history) or "")
+    assert "₦35,000.00" in (_latest_insight_follow_up_answer("What was total revenue?", history) or "")
+    assert _latest_insight_follow_up_answer("Give me last month sales instead", history) is None
+
+    procurement_payload = {
+        "kind": "insight_response",
+        "summary": "Purchase-order receiving lifecycle is ready for last 1 year.",
+        "timeframe": {"label": "last 1 year"},
+        "widgets": [
+            {
+                "type": "progress_tracker",
+                "title": "Receiving progress",
+                "steps": [
+                    {"label": "PO-1001", "status": "current", "detail": "Issued with supplier Multipro"},
+                    {"label": "PO-1002", "status": "completed", "detail": "Received with supplier Nestle"},
+                ],
+            }
+        ],
+    }
+    procurement_history = [{"role": "assistant", "content": "Receiving lifecycle ready.", "structuredPayload": procurement_payload}]
+    assert "unfinished receiving work" in (
+        _latest_insight_follow_up_answer("From the receiving lifecycle, what is the bottleneck?", procurement_history) or ""
+    )
+    assert "current: 1" in (
+        _latest_insight_follow_up_answer("From the receiving lifecycle, which statuses need attention?", procurement_history) or ""
+    )
+    assert "PO-1001" in (
+        _latest_insight_follow_up_answer("From the receiving lifecycle, what next action should purchasing take?", procurement_history) or ""
+    )
+
+    staff_payload = {
+        "kind": "insight_response",
+        "summary": "Staff audit activity is ready for last 3 months.",
+        "timeframe": {"label": "last 3 months"},
+        "widgets": [
+            {
+                "type": "ranked_list",
+                "title": "Most frequent staff actions",
+                "items": [{"label": "paid", "value": 8}, {"label": "transferred", "value": 4}],
+            },
+            {
+                "type": "timeline",
+                "title": "Audit events for last 3 months",
+                "events": [
+                    {"title": "Permission posture reviewed", "severity": "high"},
+                    {"title": "POS order paid", "severity": "info"},
+                ],
+            },
+        ],
+    }
+    staff_history = [{"role": "assistant", "content": "Staff activity ready.", "structuredPayload": staff_payload}]
+    assert "does not include a staff-member ranking" in (
+        _latest_insight_follow_up_answer("Who was the most active staff member?", staff_history) or ""
+    )
+    assert "paid with 8 events" in (
+        _latest_insight_follow_up_answer("What activity type happened the most?", staff_history) or ""
+    )
+    assert "Permission posture reviewed" in (
+        _latest_insight_follow_up_answer("Are there any staff activity risks?", staff_history) or ""
+    )
+    mixed_history = [
+        {"role": "assistant", "content": "Staff activity ready.", "structuredPayload": staff_payload},
+        {"role": "assistant", "content": json.dumps(payload)},
+        {
+            "role": "assistant",
+            "content": "Product comparison ready.",
+            "structuredPayload": {
+                "kind": "insight_response",
+                "summary": "Product comparison ready for last 1 year.",
+                "timeframe": {"label": "last 1 year"},
+                "currency_code": "NGN",
+                "widgets": [
+                    {
+                        "type": "comparison_table",
+                        "title": "Product comparison table for last 1 year",
+                        "rows": [
+                            {"product": "Eva Premium Water", "sales_total": 1200, "quantity_sold": 12, "order_count": 3},
+                            {"product": "Coca-Cola", "sales_total": 900, "quantity_sold": 9, "order_count": 2},
+                        ],
+                    }
+                ],
+            },
+        },
+        {"role": "assistant", "content": "Receiving lifecycle ready.", "structuredPayload": procurement_payload},
+    ]
+    assert "paid with 8 events" in (
+        _latest_insight_follow_up_answer(
+            "Going back to the staff activity response, what activity type happened the most?",
+            mixed_history,
+        )
+        or ""
+    )
+    assert "Gberigbe Store" in (
+        _latest_insight_follow_up_answer("Going back to the business analyst review, which location led revenue?", mixed_history) or ""
+    )
+    assert "Eva Premium Water" in (
+        _latest_insight_follow_up_answer("Going back to the product comparison, which product generated more revenue?", mixed_history) or ""
+    )
+    assert "current: 1" in (
+        _latest_insight_follow_up_answer("Going back to the receiving lifecycle, which statuses need attention?", mixed_history) or ""
+    )
+
+    repeated_parts = _latest_repeated_question_response_parts(
+        "Act as my business analyst and tell me what I am not seeing for the past year",
+        repeated_history,
+    )
+    assert repeated_parts
+    assert isinstance(repeated_parts[0], DataPart)
+    assert repeated_parts[0].data["kind"] == "insight_response"
+
+
+def test_build_staff_activity_insight_returns_timeline_widgets() -> None:
+    payload = _build_staff_activity_insight(
+        {
+            "event_count": 7,
+            "actions": [{"key": "login", "count": 3}, {"key": "invite", "count": 2}],
+            "source_services": [{"key": "users", "count": 4}, {"key": "inventory", "count": 3}],
+            "daily_activity": [{"bucket": "2026-07-01", "count": 2}, {"bucket": "2026-07-02", "count": 5}],
+            "recent_events": [{"occurred_at": "2026-07-02T10:00:00Z", "summary": "Staff logged in", "action": "login"}],
+        }
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert payload["widgets"][1]["type"] == "line_chart"
+    assert payload["widgets"][3]["type"] == "timeline"
+
+
+def test_build_permission_security_insight_returns_risk_panel() -> None:
+    payload = _build_permission_security_insight(
+        {
+            "event_count": 4,
+            "actors": [{"key": "Support Agent", "count": 2}],
+            "support_access_grants": [{"key": "grant-1", "count": 1}],
+            "severities": [{"key": "warning", "count": 1}],
+            "recent_events": [{"occurred_at": "2026-07-02T10:00:00Z", "summary": "Support access granted", "action": "grant"}],
+        },
+        support_access_only=True,
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert payload["widgets"][1]["type"] == "risk_panel"
+    assert payload["data_sources"][0]["endpoint_or_topic"] == "get_permission_security_activity"
+
+
+def test_build_realtime_dashboard_snapshot_insight_returns_operational_widgets() -> None:
+    payload = _build_realtime_dashboard_snapshot_insight(
+        {
+            "metrics": {
+                "sales_24h_amount": 12400.5,
+                "sales_24h_orders": 11,
+                "receiving_24h_units": 42,
+                "security_events_24h": 1,
+            },
+            "alerts": {
+                "total_attention_items": 2,
+                "high_severity_24h": 1,
+                "support_access_24h": 1,
+            },
+            "charts": {"sales_amount_by_hour": [{"bucket": "09:00", "value": 3200.0}]},
+            "leaderboards": {"top_products_24h": [{"title": "Cabin Biscuit 200g", "subtitle": "Units sold", "metric_value": 12}]},
+            "feed": [{"occurred_at": "2026-07-01T10:00:00Z", "summary": "Sale completed", "source_service": "pos", "severity": "info"}],
+        },
+        {"unread_count": 3},
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert payload["widgets"][0]["type"] == "metric_grid"
+    assert payload["widgets"][1]["type"] == "line_chart"
+    assert payload["widgets"][3]["type"] == "risk_panel"
+    assert payload["data_sources"][0]["endpoint_or_topic"] == "get_realtime_dashboard_snapshot"
+    assert payload["data_sources"][1]["endpoint_or_topic"] == "get_alert_summary"
+
+
+def test_build_subscription_usage_insight_returns_comparison_table() -> None:
+    payload = _build_subscription_usage_insight(
+        {
+            "subscription": {"status": "TRIAL", "plan": {"name": "Enterprise"}},
+            "features": [
+                {"name": "Staff users", "usage": 8, "limit_value": 10, "remaining": 2, "status": "near_limit"},
+                {"name": "POS terminals", "usage": 3, "limit_value": 10, "remaining": 7, "status": "healthy"},
+            ],
+            "warnings": ["Trial ends soon."],
+        }
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert payload["widgets"][1]["type"] == "comparison_table"
+    assert payload["widgets"][2]["type"] == "risk_panel"
+    assert payload["warnings"] == ["Trial ends soon."]
+
+
+def test_inventory_procurement_named_insight_from_text_detects_priority_flows() -> None:
+    assert _inventory_procurement_named_insight_from_text("Show purchase order lifecycle for the past month") == "po_lifecycle"
+    assert _inventory_procurement_named_insight_from_text("Show purchase order analysis for the last three months") == "po_lifecycle"
+    assert _inventory_procurement_named_insight_from_text("What purchase orders were received last month?") == "receiving_lifecycle"
+    assert _inventory_procurement_named_insight_from_text("Create a purchase order") is None
+
+
+@pytest.mark.asyncio
+async def test_users_named_insight_payload_supports_audit_search_and_timeline() -> None:
+    executor = _RecordingToolExecutor()
+
+    search_payload = await _users_named_insight_payload(
+        insight_key="audit_search",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="show recent audit logs for the past month",
+    )
+    timeline_payload = await _users_named_insight_payload(
+        insight_key="audit_timeline",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="show the audit timeline for this workspace",
+    )
+
+    assert search_payload is not None
+    assert timeline_payload is not None
+    assert executor.calls[0][0] == "audit.search_events"
+    assert executor.calls[0][1]["occurred_from"] == _resolve_insight_time_window("show recent audit logs for the past month", default_days=30, default_label="last 30 days")["start_date"]
+    assert executor.calls[0][1]["occurred_to"] == _resolve_insight_time_window("show recent audit logs for the past month", default_days=30, default_label="last 30 days")["end_date"]
+    assert executor.calls[0][1]["period_label"] == "last month"
+    assert executor.calls[1] == (
+        "audit.get_event_timeline",
+        {"search": "show the audit timeline for this workspace", "limit": 100},
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_named_insight_payload_supports_users_and_product_passthrough() -> None:
+    executor = _RecordingToolExecutor()
+
+    staff_payload = await _host_named_insight_payload(
+        insight_key="users::staff_activity",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="show staff activity from audit events",
+    )
+    import_payload = await _host_named_insight_payload(
+        insight_key="product_discovery::import_opportunities",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="show global catalog import opportunities",
+    )
+
+    assert staff_payload is not None
+    assert import_payload is not None
+    assert executor.calls[0][0] == "audit.get_staff_activity"
+    assert executor.calls[0][1]["date_from"] == _resolve_insight_time_window("show staff activity from audit events", default_days=30, default_label="last 30 days")["start_date"]
+    assert executor.calls[0][1]["date_to"] == _resolve_insight_time_window("show staff activity from audit events", default_days=30, default_label="last 30 days")["end_date"]
+    assert any(call[0] == "product.get_product_dashboard_stats" for call in executor.calls)
+
+
+@pytest.mark.asyncio
+async def test_host_procurement_payload_threads_calendar_windows_and_labels() -> None:
+    executor = _RecordingToolExecutor()
+
+    payload = await _host_named_insight_payload(
+        insight_key="inventory_procurement::po_lifecycle",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="Show purchase order analysis for the last three months.",
+    )
+
+    assert payload is not None
+    window = _resolve_insight_time_window(
+        "Show purchase order analysis for the last three months.",
+        default_days=30,
+        default_label="last 30 days",
+    )
+    assert payload["summary"] == f"Purchase-order lifecycle status is ready for {window['label']}."
+    assert payload["widgets"][0]["title"] == f"PO pipeline for {window['label']}"
+    assert executor.calls[0] == (
+        "inventory.search_purchase_orders",
+        {"limit": 20, "date_from": window["start_date"], "date_to": window["end_date"]},
+    )
+
+
 def test_generic_inventory_setup_language_prefers_onboarding_over_direct_mutation() -> None:
     assert _infer_onboarding_scope_from_text("I want to set up inventory") == "full_setup"
     assert _infer_onboarding_scope_from_text("Help me setup inventory") == "full_setup"
@@ -91,6 +1346,25 @@ def test_host_orchestration_plan_keeps_inventory_grouping_out_of_users_domain() 
     )
 
     assert plan == ["inventory"]
+
+
+def test_infer_domain_agent_name_prefers_pos_for_sales_by_location_queries() -> None:
+    assert _infer_domain_agent_name("Show sales by location today") == "pos"
+    assert _infer_domain_agent_name("Break down today's sales by location") == "pos"
+    assert _infer_domain_agent_name("Show top sellers in seven days") == "pos"
+
+
+def test_host_orchestration_plan_does_not_append_inventory_for_pos_insight_query() -> None:
+    plan = _host_orchestration_plan(
+        "Show sales by location today",
+        [
+            {"name": "inventory"},
+            {"name": "pos"},
+            {"name": "users"},
+        ],
+    )
+
+    assert plan == ["pos"]
 
 
 def test_coerce_delegated_response_treats_plain_text_confirmation_as_input_required() -> None:
@@ -1169,15 +2443,14 @@ async def test_host_inventory_domain_picker_free_text_stays_in_inventory_domain(
 
     events = [event async for event in processor(task, message, None, None)]
 
-    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
-        (
-            "delegate_to_agent",
-            {
-                "request": "show low stock",
-                "agent_name": "inventory",
-            },
-        ),
-    ]
+    assert ("inventory.get_stock_risk", {"limit": 12, "expiring_days": 30}) in fake_langgraph_components.FAKE_TOOL_CALLS
+    assert (
+        "delegate_to_agent",
+        {
+            "request": "show low stock",
+            "agent_name": "inventory",
+        },
+    ) in fake_langgraph_components.FAKE_TOOL_CALLS
 
     delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
     assert delegation_artifact.parts[0].data["selectedAgent"] == "inventory"
@@ -3190,6 +4463,68 @@ async def test_inventory_fulfillment_form_response_executes_reservation_create()
     ]
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert result_artifact.parts[0].text == "Stock reservation created successfully."
+
+
+@pytest.mark.asyncio
+async def test_inventory_fulfillment_form_response_preserves_structural_scope_from_selected_location() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_fulfillment")
+    form_payload = {
+        "interaction_type": "dynamic_form",
+        "workflow": "inventory_fulfillment_mutation",
+        "workflow_stage": "form",
+        "mutation_action": "create_stock_reservation",
+        "fields": [
+            {
+                "name": "stock_location_id",
+                "type": "select",
+                "options": [
+                    {
+                        "value": "loc-1",
+                        "label": "Main Warehouse",
+                        "metadata": {
+                            "structural_location_id": "struct-1",
+                            "structural_location_name": "Main Warehouse",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    form_response = (
+        '{"type":"form_response","data":{"inventory_item_id":"inv-1","stock_location_id":"loc-1","quantity":"2",'
+        '"external_order_type":"sales_order","external_order_id":"showroom-transfer","external_order_line_id":"line-1","notes":"Showroom transfer reservation"},'
+        '"message":"Form submitted successfully"}'
+    )
+    task = Task(
+        id="task-fulfillment-reservation-form-submit-structural-scope",
+        context_id="ctx-fulfillment-reservation-form-submit-structural-scope",
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=form_response)])),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="Reserve 2 units for showroom transfer")]),
+            Message(role=Role.agent, parts=[DataPart(data=form_payload)]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=form_response)])
+
+    _ = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "inventory.create_stock_reservation",
+            {
+                "payload": {
+                    "inventory_item_id": "inv-1",
+                    "stock_location_id": "loc-1",
+                    "structural_location_id": "struct-1",
+                    "reserved_quantity": "2",
+                    "external_order_type": "sales_order",
+                    "external_order_id": "showroom-transfer",
+                    "external_order_line_id": "line-1",
+                    "notes": "Showroom transfer reservation",
+                }
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

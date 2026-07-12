@@ -18,11 +18,35 @@ from kafka_a2a.models import (
     TaskStatusUpdateEvent,
 )
 
+_TASK_SCOPE_METADATA_KEYS = (
+    "scope_mode",
+    "structural_location_id",
+    "structural_location_ids",
+    "stock_location_id",
+    "sync_key",
+    "entity_ids",
+)
+
 
 @dataclass(slots=True)
 class TaskEventRecord:
     sequence: int
     event: TaskEvent
+
+
+def extract_task_scope_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    scoped: dict[str, Any] = {}
+    for key in _TASK_SCOPE_METADATA_KEYS:
+        value = metadata.get(key)
+        if value in (None, "", [], {}, ()):
+            continue
+        if isinstance(value, list):
+            scoped[key] = list(value)
+        else:
+            scoped[key] = value
+    return scoped
 
 
 class TaskStore(Protocol):
@@ -174,6 +198,7 @@ class InMemoryTaskStore:
     async def append_status(self, *, task_id: str, status: TaskStatus) -> TaskStatusUpdateEvent:
         async with self._lock:
             task = self._tasks[task_id]
+            scope_metadata = extract_task_scope_metadata(task.metadata)
             if status.message is not None:
                 status.message.task_id = status.message.task_id or task_id
                 status.message.context_id = status.message.context_id or task.context_id
@@ -193,6 +218,7 @@ class InMemoryTaskStore:
                     TaskState.input_required,
                     TaskState.auth_required,
                 ),
+                metadata=scope_metadata or None,
             )
             task.status = status
             record = self._append_event_locked(task_id, event)
@@ -202,7 +228,13 @@ class InMemoryTaskStore:
     async def append_artifact(self, *, task_id: str, artifact: Artifact) -> TaskArtifactUpdateEvent:
         async with self._lock:
             task = self._tasks[task_id]
-            event = TaskArtifactUpdateEvent(task_id=task_id, context_id=task.context_id, artifact=artifact)
+            scope_metadata = extract_task_scope_metadata(task.metadata)
+            event = TaskArtifactUpdateEvent(
+                task_id=task_id,
+                context_id=task.context_id,
+                artifact=artifact,
+                metadata=scope_metadata or None,
+            )
             task.artifacts.append(artifact)
             record = self._append_event_locked(task_id, event)
             self._fanout_locked(task_id, record)

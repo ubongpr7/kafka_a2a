@@ -5,11 +5,14 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from cryptography.fernet import Fernet
 
 jwt = pytest.importorskip("jwt")
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
+from kafka_a2a.secrets import clear_fernet_cache  # noqa: E402
+from kafka_a2a.errors import A2AError, A2AErrorCode  # noqa: E402
 from kafka_a2a.server.auth import JwtBearerConfig  # noqa: E402
 from kafka_a2a.server.gateway import GatewayConfig, create_gateway_app  # noqa: E402
 
@@ -111,6 +114,25 @@ def test_agent_setup_endpoints_allow_workspace_owner_without_explicit_permission
         assert payload["agent"]["has_api_key"] is True
         assert payload["agent"]["has_tavily_api_key"] is True
 
+        registry_response = client.get(
+            "/agent_api/runtime/agents/registry/",
+            headers=_auth_headers(owner_token),
+        )
+        assert registry_response.status_code == 200
+        registry_payload = registry_response.json()
+        assert registry_payload["agent_count"] >= 6
+        assert {
+            "host",
+            "inventory",
+            "inventory_visibility",
+            "inventory_procurement",
+            "pos_admin",
+            "product_discovery",
+            "users",
+        }.issubset(
+            {item["slug"] for item in registry_payload["agents"]}
+        )
+
 
 def test_agent_setup_endpoints_require_manage_permission_for_non_owner(
     monkeypatch: pytest.MonkeyPatch, tmp_path
@@ -121,6 +143,78 @@ def test_agent_setup_endpoints_require_manage_permission_for_non_owner(
         response = client.get("/agent_api/templates/", headers=_auth_headers(token))
         assert response.status_code == 403
         assert response.json()["detail"] == "Missing permission: manage_agent_settings"
+
+
+def test_management_tavily_credential_returns_live_workspace_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    owner_token = _make_token(user_id="17", profile_id="1", owner_id="17")
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        setup_response = client.post(
+            "/agent_api/management/agent-setup/",
+            headers=_auth_headers(owner_token),
+            json={
+                "name": "Chat GPT",
+                "provider": "chatgpt",
+                "provider_label": "ChatGPT",
+                "version": "gpt-4.1-mini",
+                "api_key": "sk-test-owner",
+                "tavily_api_key": "tvly-owner",
+            },
+        )
+        assert setup_response.status_code == 200
+
+        credential_response = client.get(
+            "/agent_api/management/tavily-credential/",
+            headers=_auth_headers(owner_token),
+        )
+        assert credential_response.status_code == 200
+        assert credential_response.json() == {
+            "profile_id": "1",
+            "has_tavily_api_key": True,
+            "tavily_api_key": "tvly-owner",
+        }
+
+
+def test_management_tavily_credential_falls_back_to_env_when_workspace_secret_is_unusable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    owner_token = _make_token(user_id="17", profile_id="1", owner_id="17")
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-env-fallback")
+    monkeypatch.setenv("KA2A_FERNET_KEY", Fernet.generate_key().decode())
+    clear_fernet_cache()
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        setup_response = client.post(
+            "/agent_api/management/agent-setup/",
+            headers=_auth_headers(owner_token),
+            json={
+                "name": "Chat GPT",
+                "provider": "chatgpt",
+                "provider_label": "ChatGPT",
+                "version": "gpt-4.1-mini",
+                "api_key": "sk-test-owner",
+                "tavily_api_key": "tvly-owner",
+            },
+        )
+        assert setup_response.status_code == 200
+
+        # Simulate a runtime that can no longer decrypt the stored workspace secret.
+        monkeypatch.delenv("KA2A_FERNET_KEY", raising=False)
+        monkeypatch.delenv("FERNET_KEY", raising=False)
+        clear_fernet_cache()
+
+        credential_response = client.get(
+            "/agent_api/management/tavily-credential/",
+            headers=_auth_headers(owner_token),
+        )
+        assert credential_response.status_code == 200
+        assert credential_response.json() == {
+            "profile_id": "1",
+            "has_tavily_api_key": True,
+            "tavily_api_key": "tvly-env-fallback",
+        }
 
 
 def test_runtime_registry_hides_private_agents_from_other_workspace_users(
@@ -452,6 +546,253 @@ def test_conversation_activities_persist_delegation_and_final_status(
         activities = detail.json()["activities"]
         assert any(item["kind"] == "delegation" for item in activities)
         assert any(item["state"] == "input-required" for item in activities)
+
+
+def test_conversation_websocket_completed_response_spends_one_coin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    manager_token = _make_token(
+        user_id="72",
+        profile_id="42",
+        owner_id="99",
+        permissions=["manage_agent_settings", "interact_with_agent"],
+    )
+    spend_calls: list[dict[str, object]] = []
+
+    async def _fake_stream_message(self, **_: object):
+        async def _stream():
+            yield _FakeEvent(
+                {
+                    "kind": "task",
+                    "id": "task-72",
+                    "contextId": "ctx-72",
+                    "status": {"state": "working"},
+                },
+                kind="task",
+                id="task-72",
+                context_id="ctx-72",
+                status=SimpleNamespace(state="working"),
+            )
+            artifact_payload = {
+                "name": "result",
+                "parts": [
+                    {
+                        "kind": "data",
+                        "data": {
+                            "widgets": [{"type": "metric_grid", "title": "Sales Snapshot", "data": []}],
+                        },
+                    }
+                ],
+            }
+            yield _FakeEvent(
+                {
+                    "kind": "artifact-update",
+                    "taskId": "task-72",
+                    "contextId": "ctx-72",
+                    "artifact": artifact_payload,
+                },
+                kind="artifact-update",
+                task_id="task-72",
+                context_id="ctx-72",
+                artifact=SimpleNamespace(model_dump=lambda **__: artifact_payload),
+            )
+            yield _FakeEvent(
+                {
+                    "kind": "status-update",
+                    "taskId": "task-72",
+                    "contextId": "ctx-72",
+                    "status": {"state": "completed", "message": {"role": "assistant", "parts": []}},
+                    "final": True,
+                },
+                kind="status-update",
+                task_id="task-72",
+                context_id="ctx-72",
+                status=SimpleNamespace(state="completed", message=SimpleNamespace(model_dump=lambda **__: {"role": "assistant", "parts": []})),
+                final=True,
+            )
+
+        return _stream()
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.chat.views.spend_intera_coins_for_a2a_completion",
+        lambda **kwargs: spend_calls.append(kwargs) or {"balance": 99},
+    )
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        templates = client.get("/agent_api/templates/", headers=_auth_headers(manager_token))
+        template = templates.json()[0]
+        install_response = client.post(
+            f"/agent_api/templates/{template['id']}/install/",
+            headers=_auth_headers(manager_token),
+            json={"slug": "billing-host", "name": "Billing Host"},
+        )
+        assert install_response.status_code == 200
+
+        created = client.post(
+            "/conversations",
+            headers=_auth_headers(manager_token),
+            json={"agent_slug": "billing-host", "title": "Billing thread"},
+        )
+        assert created.status_code == 200
+        conversation_id = created.json()["conversation"]["id"]
+
+        with client.websocket_connect(f"/ws/conversations/{conversation_id}?token={manager_token}") as websocket:
+            assert websocket.receive_json()["type"] == "conversation.snapshot"
+            websocket.send_json({"type": "message.send", "text": "Show sales by location for last month."})
+            for _ in range(20):
+                envelope = websocket.receive_json()
+                if envelope.get("type") == "message.created" and envelope.get("message", {}).get("structuredPayload"):
+                    break
+
+    assert spend_calls == [
+        {
+            "profile_id": "42",
+            "task_id": "task-72",
+            "conversation_id": conversation_id,
+            "prompt_text": "Show sales by location for last month.",
+        }
+    ]
+
+
+def test_conversation_websocket_input_required_does_not_spend_until_completion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    manager_token = _make_token(
+        user_id="73",
+        profile_id="43",
+        owner_id="99",
+        permissions=["manage_agent_settings", "interact_with_agent"],
+    )
+    spend_calls: list[dict[str, object]] = []
+    stream_calls = {"value": 0}
+    continue_calls = {"value": 0}
+
+    async def _fake_stream_message(self, **_: object):
+        stream_calls["value"] += 1
+
+        async def _stream():
+            final_message = {
+                "role": "assistant",
+                "messageId": "msg-73-a",
+                "parts": [{"kind": "text", "text": "Please confirm before I continue."}],
+            }
+            yield _FakeEvent(
+                {
+                    "kind": "task",
+                    "id": "task-73",
+                    "contextId": "ctx-73",
+                    "status": {"state": "working"},
+                },
+                kind="task",
+                id="task-73",
+                context_id="ctx-73",
+                status=SimpleNamespace(state="working"),
+            )
+            yield _FakeEvent(
+                {
+                    "kind": "status-update",
+                    "taskId": "task-73",
+                    "contextId": "ctx-73",
+                    "status": {"state": "input-required", "message": final_message},
+                    "final": True,
+                },
+                kind="status-update",
+                task_id="task-73",
+                context_id="ctx-73",
+                status=SimpleNamespace(state="input-required", message=SimpleNamespace(model_dump=lambda **__: final_message)),
+                final=True,
+            )
+
+        return _stream()
+
+    async def _fake_continue_task_stream(self, **_: object):
+        continue_calls["value"] += 1
+
+        async def _stream():
+            artifact_payload = {
+                "name": "result",
+                "parts": [{"kind": "data", "data": {"widgets": [{"type": "timeline", "events": []}]}}],
+            }
+            yield _FakeEvent(
+                {
+                    "kind": "artifact-update",
+                    "taskId": "task-73",
+                    "contextId": "ctx-73",
+                    "artifact": artifact_payload,
+                },
+                kind="artifact-update",
+                task_id="task-73",
+                context_id="ctx-73",
+                artifact=SimpleNamespace(model_dump=lambda **__: artifact_payload),
+            )
+            yield _FakeEvent(
+                {
+                    "kind": "status-update",
+                    "taskId": "task-73",
+                    "contextId": "ctx-73",
+                    "status": {"state": "completed", "message": {"role": "assistant", "parts": []}},
+                    "final": True,
+                },
+                kind="status-update",
+                task_id="task-73",
+                context_id="ctx-73",
+                status=SimpleNamespace(state="completed", message=SimpleNamespace(model_dump=lambda **__: {"role": "assistant", "parts": []})),
+                final=True,
+            )
+
+        return _stream()
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.continue_task_stream", _fake_continue_task_stream)
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.chat.views.spend_intera_coins_for_a2a_completion",
+        lambda **kwargs: spend_calls.append(kwargs) or {"balance": 98},
+    )
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        templates = client.get("/agent_api/templates/", headers=_auth_headers(manager_token))
+        template = templates.json()[0]
+        install_response = client.post(
+            f"/agent_api/templates/{template['id']}/install/",
+            headers=_auth_headers(manager_token),
+            json={"slug": "approval-host", "name": "Approval Host"},
+        )
+        assert install_response.status_code == 200
+
+        created = client.post(
+            "/conversations",
+            headers=_auth_headers(manager_token),
+            json={"agent_slug": "approval-host", "title": "Approval thread"},
+        )
+        assert created.status_code == 200
+        conversation_id = created.json()["conversation"]["id"]
+
+        with client.websocket_connect(f"/ws/conversations/{conversation_id}?token={manager_token}") as websocket:
+            assert websocket.receive_json()["type"] == "conversation.snapshot"
+            websocket.send_json({"type": "message.send", "text": "Start the PO receiving review for last month."})
+            for _ in range(20):
+                envelope = websocket.receive_json()
+                if envelope.get("type") == "task.status" and envelope.get("final") is True:
+                    break
+            assert spend_calls == []
+
+            websocket.send_json({"type": "message.send", "text": "{\"approved\":true}"})
+            for _ in range(20):
+                envelope = websocket.receive_json()
+                if envelope.get("type") == "message.created" and envelope.get("message", {}).get("structuredPayload"):
+                    break
+
+    assert stream_calls["value"] == 1
+    assert continue_calls["value"] == 1
+    assert spend_calls == [
+        {
+            "profile_id": "43",
+            "task_id": "task-73",
+            "conversation_id": conversation_id,
+            "prompt_text": "{\"approved\":true}",
+        }
+    ]
 
 
 def test_conversation_websocket_rebuilds_structured_history_for_follow_up(
@@ -792,3 +1133,407 @@ def test_conversation_plain_text_breaks_out_of_closed_interaction_prompt(
 
         assert stream_message_calls["value"] == 2
         assert continue_calls["value"] == 0
+
+
+def test_gateway_stream_returns_handled_transport_error_with_cors_headers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    token = _make_token(user_id="17", profile_id="1", owner_id="17")
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.agents.services.AgentControlPlaneService.runtime_agent_config",
+        lambda self, *, access, slug: {"runtime_name": "host"},
+    )
+
+    async def _fake_stream_message(self, **_: object):
+        raise RuntimeError("KafkaConnectionError: Connection at kafka.interaims.com:443 closed")
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        response = client.post(
+            "/stream",
+            headers={"Origin": "http://localhost:3000", **_auth_headers(token)},
+            json={"text": "hello", "agentName": "host", "historyLength": 6},
+        )
+
+    assert response.status_code == 503
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert response.json() == {
+        "detail": "A2A gateway is temporarily unavailable while the agent transport reconnects."
+    }
+
+
+def test_gateway_stream_emits_final_failed_status_update_when_iterator_crashes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    token = _make_token(user_id="17", profile_id="1", owner_id="17")
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.agents.services.AgentControlPlaneService.runtime_agent_config",
+        lambda self, *, access, slug: {"runtime_name": "host"},
+    )
+
+    async def _fake_stream_message(self, **_: object):
+        async def _stream():
+            yield _FakeEvent(
+                {
+                    "kind": "task",
+                    "id": "task-stream-failure",
+                    "contextId": "ctx-stream-failure",
+                    "status": {"state": "working"},
+                },
+                kind="task",
+                id="task-stream-failure",
+                context_id="ctx-stream-failure",
+                status=SimpleNamespace(state="working"),
+            )
+            raise RuntimeError("KafkaConnectionError: Connection at kafka.interaims.com:443 closed")
+
+        return _stream()
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        response = client.post(
+            "/stream",
+            headers={"Origin": "http://localhost:3000", **_auth_headers(token)},
+            json={"text": "hello", "agentName": "host", "historyLength": 6},
+        )
+
+    assert response.status_code == 200
+    lines = [line for line in response.text.splitlines() if line.startswith("data:")]
+    assert len(lines) == 2
+    assert '"kind":"task"' in lines[0]
+    assert '"kind":"status-update"' in lines[1]
+    assert '"state":"failed"' in lines[1]
+    assert '"taskId":"task-stream-failure"' in lines[1]
+    assert '"contextId":"ctx-stream-failure"' in lines[1]
+    assert "A2A gateway is temporarily unavailable while the agent transport reconnects." in lines[1]
+
+
+def test_gateway_continue_stream_returns_handled_transport_error_with_cors_headers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    token = _make_token(user_id="17", profile_id="1", owner_id="17")
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.agents.services.AgentControlPlaneService.runtime_agent_config",
+        lambda self, *, access, slug: {"runtime_name": "host"},
+    )
+
+    async def _fake_continue_task_stream(self, **_: object):
+        raise RuntimeError("KafkaConnectionError: Connection at kafka.interaims.com:443 closed")
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.continue_task_stream", _fake_continue_task_stream)
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        response = client.post(
+            "/tasks/task-123/continue/stream",
+            headers={"Origin": "http://localhost:3000", **_auth_headers(token)},
+            json={"text": "continue", "historyLength": 6},
+        )
+
+    assert response.status_code == 503
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert response.json() == {
+        "detail": "A2A gateway is temporarily unavailable while the agent transport reconnects."
+    }
+
+
+def test_gateway_stream_maps_a2a_permission_denied_to_http_403(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    token = _make_token(user_id="17", profile_id="1", owner_id="17")
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.agents.services.AgentControlPlaneService.runtime_agent_config",
+        lambda self, *, access, slug: {"runtime_name": "host"},
+    )
+
+    async def _fake_stream_message(self, **_: object):
+        raise A2AError(code=A2AErrorCode.PERMISSION_DENIED, message="Permission denied")
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        response = client.post(
+            "/stream",
+            headers={"Origin": "http://localhost:3000", **_auth_headers(token)},
+            json={"text": "hello", "agentName": "host", "historyLength": 6},
+        )
+
+    assert response.status_code == 403
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert response.json() == {"detail": "Permission denied"}
+
+
+def test_gateway_stream_requires_authentication(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    async def _fake_stream_message(self, **_: object):
+        raise AssertionError("stream_message should not be called without authentication")
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        response = client.post(
+            "/stream",
+            headers={"Origin": "http://localhost:3000"},
+            json={"text": "hello", "agentName": "host", "historyLength": 6},
+        )
+
+    assert response.status_code == 401
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert response.json() == {"detail": "Authentication required"}
+
+
+def test_gateway_stream_uses_stream_specific_timeout_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    token = _make_token(user_id="17", profile_id="1", owner_id="17")
+    monkeypatch.setenv("KA2A_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("KA2A_CONTROL_PLANE_STORE_PATH", str(tmp_path / "control-plane.json"))
+    monkeypatch.setenv("KA2A_CHAT_STORE", "memory")
+    monkeypatch.setenv("KA2A_RUNTIME_SHARED_TOKEN", RUNTIME_SYNC_TOKEN)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("KA2A_DATABASE_URL", raising=False)
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.start", _noop_async)
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stop", _noop_async)
+    monkeypatch.setattr("kafka_a2a.registry.directory.KafkaAgentDirectory.start", _noop_async)
+    monkeypatch.setattr("kafka_a2a.registry.directory.KafkaAgentDirectory.stop", _noop_async)
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.agents.services.AgentControlPlaneService.runtime_agent_config",
+        lambda self, *, access, slug: {"runtime_name": "host"},
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _fake_stream_message(self, **kwargs: object):
+        captured.update(kwargs)
+
+        async def _stream():
+            yield _FakeEvent(
+                {
+                    "kind": "status-update",
+                    "status": {"state": "completed"},
+                },
+                kind="status-update",
+                status=SimpleNamespace(state="completed"),
+            )
+
+        return _stream()
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+
+    app = create_gateway_app(
+        GatewayConfig(
+            bootstrap_servers="localhost:9092",
+            default_agent="host",
+            stream_request_timeout_s=123.0,
+            jwt=JwtBearerConfig(
+                secret=JWT_SECRET,
+                algorithms=["HS256"],
+                user_claim="sub",
+                include_claims=True,
+            ),
+        )
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/stream",
+            headers={"Origin": "http://localhost:3000", **_auth_headers(token)},
+            json={"text": "hello", "agentName": "host", "historyLength": 6},
+        )
+
+    assert response.status_code == 200
+    assert captured["timeout_s"] == 123.0
+
+
+def test_gateway_stream_completed_response_spends_one_coin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    token = _make_token(user_id="18", profile_id="2", owner_id="18")
+    spend_calls: list[dict[str, object]] = []
+    monkeypatch.setenv("KA2A_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("KA2A_CONTROL_PLANE_STORE_PATH", str(tmp_path / "control-plane.json"))
+    monkeypatch.setenv("KA2A_CHAT_STORE", "memory")
+    monkeypatch.setenv("KA2A_RUNTIME_SHARED_TOKEN", RUNTIME_SYNC_TOKEN)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("KA2A_DATABASE_URL", raising=False)
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.start", _noop_async)
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stop", _noop_async)
+    monkeypatch.setattr("kafka_a2a.registry.directory.KafkaAgentDirectory.start", _noop_async)
+    monkeypatch.setattr("kafka_a2a.registry.directory.KafkaAgentDirectory.stop", _noop_async)
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.agents.services.AgentControlPlaneService.runtime_agent_config",
+        lambda self, *, access, slug: {"runtime_name": "host"},
+    )
+    monkeypatch.setattr(
+        "kafka_a2a.server.gateway.spend_intera_coins_for_a2a_completion",
+        lambda **kwargs: spend_calls.append(kwargs) or {"balance": 97},
+    )
+
+    async def _fake_stream_message(self, **_: object):
+        async def _stream():
+            yield _FakeEvent(
+                {
+                    "kind": "task",
+                    "id": "task-18",
+                    "contextId": "ctx-18",
+                    "status": {"state": "working"},
+                },
+                kind="task",
+                id="task-18",
+                context_id="ctx-18",
+                status=SimpleNamespace(state="working"),
+            )
+            yield _FakeEvent(
+                {
+                    "kind": "artifact-update",
+                    "taskId": "task-18",
+                    "contextId": "ctx-18",
+                    "artifact": {
+                        "name": "result",
+                        "parts": [{"kind": "data", "data": {"widgets": [{"type": "bar_chart", "data": []}]}}],
+                    },
+                },
+                kind="artifact-update",
+                task_id="task-18",
+                context_id="ctx-18",
+                artifact=SimpleNamespace(
+                    model_dump=lambda **__: {
+                        "name": "result",
+                        "parts": [{"kind": "data", "data": {"widgets": [{"type": "bar_chart", "data": []}]}}],
+                    }
+                ),
+            )
+            yield _FakeEvent(
+                {
+                    "kind": "status-update",
+                    "taskId": "task-18",
+                    "contextId": "ctx-18",
+                    "status": {"state": "completed", "message": {"role": "assistant", "parts": []}},
+                    "final": True,
+                },
+                kind="status-update",
+                task_id="task-18",
+                context_id="ctx-18",
+                status=SimpleNamespace(state="completed", message=SimpleNamespace(model_dump=lambda **__: {"role": "assistant", "parts": []})),
+                final=True,
+            )
+
+        return _stream()
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+
+    app = create_gateway_app(
+        GatewayConfig(
+            bootstrap_servers="localhost:9092",
+            default_agent="host",
+            jwt=JwtBearerConfig(
+                secret=JWT_SECRET,
+                algorithms=["HS256"],
+                user_claim="sub",
+                include_claims=True,
+            ),
+        )
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/stream",
+            headers=_auth_headers(token),
+            json={"text": "Show top sellers for last month.", "agentName": "host", "historyLength": 6},
+        )
+
+    assert response.status_code == 200
+    assert spend_calls == [
+        {
+            "profile_id": "2",
+            "task_id": "task-18",
+            "conversation_id": None,
+            "prompt_text": "Show top sellers for last month.",
+        }
+    ]
+
+
+def test_gateway_stream_failed_response_does_not_spend_coin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    token = _make_token(user_id="19", profile_id="3", owner_id="19")
+    spend_calls: list[dict[str, object]] = []
+    monkeypatch.setenv("KA2A_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("KA2A_CONTROL_PLANE_STORE_PATH", str(tmp_path / "control-plane.json"))
+    monkeypatch.setenv("KA2A_CHAT_STORE", "memory")
+    monkeypatch.setenv("KA2A_RUNTIME_SHARED_TOKEN", RUNTIME_SYNC_TOKEN)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("KA2A_DATABASE_URL", raising=False)
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.start", _noop_async)
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stop", _noop_async)
+    monkeypatch.setattr("kafka_a2a.registry.directory.KafkaAgentDirectory.start", _noop_async)
+    monkeypatch.setattr("kafka_a2a.registry.directory.KafkaAgentDirectory.stop", _noop_async)
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.agents.services.AgentControlPlaneService.runtime_agent_config",
+        lambda self, *, access, slug: {"runtime_name": "host"},
+    )
+    monkeypatch.setattr(
+        "kafka_a2a.server.gateway.spend_intera_coins_for_a2a_completion",
+        lambda **kwargs: spend_calls.append(kwargs) or {"balance": 96},
+    )
+
+    async def _fake_stream_message(self, **_: object):
+        async def _stream():
+            yield _FakeEvent(
+                {
+                    "kind": "task",
+                    "id": "task-19",
+                    "contextId": "ctx-19",
+                    "status": {"state": "working"},
+                },
+                kind="task",
+                id="task-19",
+                context_id="ctx-19",
+                status=SimpleNamespace(state="working"),
+            )
+            yield _FakeEvent(
+                {
+                    "kind": "status-update",
+                    "taskId": "task-19",
+                    "contextId": "ctx-19",
+                    "status": {
+                        "state": "failed",
+                        "message": {"role": "assistant", "parts": [{"kind": "text", "text": "Unable to complete request."}]},
+                    },
+                    "final": True,
+                },
+                kind="status-update",
+                task_id="task-19",
+                context_id="ctx-19",
+                status=SimpleNamespace(
+                    state="failed",
+                    message=SimpleNamespace(model_dump=lambda **__: {"role": "assistant", "parts": [{"kind": "text", "text": "Unable to complete request."}]}),
+                ),
+                final=True,
+            )
+
+        return _stream()
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+
+    app = create_gateway_app(
+        GatewayConfig(
+            bootstrap_servers="localhost:9092",
+            default_agent="host",
+            jwt=JwtBearerConfig(
+                secret=JWT_SECRET,
+                algorithms=["HS256"],
+                user_claim="sub",
+                include_claims=True,
+            ),
+        )
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/stream",
+            headers=_auth_headers(token),
+            json={"text": "Show stock value changes for last month.", "agentName": "host", "historyLength": 6},
+        )
+
+    assert response.status_code == 200
+    assert spend_calls == []

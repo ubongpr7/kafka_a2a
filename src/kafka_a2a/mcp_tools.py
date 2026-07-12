@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import logging
 import os
@@ -137,6 +138,13 @@ def _build_mcp_failure_message(
     if argument_keys:
         details.append(f"argument_keys={_format_log_kv(argument_keys)}")
     return f"MCP {operation} failed during {phase} for " + ", ".join(details) + f": {error}"
+
+
+def _is_ignorable_cleanup_error(error: Exception) -> bool:
+    message = _strip(str(error).lower())
+    if not message:
+        return False
+    return "connection is closed" in message
 
 
 def _to_camel(name: str) -> str:
@@ -491,6 +499,8 @@ async def _run_mcp_session(
     }
     phase = "connect_stream"
     started_at = time.monotonic()
+    result: Any = None
+    callback_succeeded = False
 
     _log_mcp_operation("info", "session_start", **log_fields)
     try:
@@ -507,6 +517,7 @@ async def _run_mcp_session(
                     phase = "session_operation"
                     _log_mcp_operation("info", "session_initialized", **log_fields)
                     result = await callback(session)
+                    callback_succeeded = True
                     _log_mcp_operation(
                         "info",
                         "session_success",
@@ -515,8 +526,18 @@ async def _run_mcp_session(
                         result_type=type(result).__name__,
                         result_preview=_result_preview(result),
                     )
-                    return result
     except Exception as exc:
+        if callback_succeeded and _is_ignorable_cleanup_error(exc):
+            _log_mcp_operation(
+                "warning",
+                "session_cleanup_ignored",
+                **log_fields,
+                phase=phase,
+                elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return result
         _log_mcp_operation(
             "warning",
             "session_failed",
@@ -538,6 +559,7 @@ async def _run_mcp_session(
                 error=exc,
             )
         ) from exc
+    return result
 
 
 def _parse_remote_tool_specs(result: Any) -> list[_RemoteToolSpec]:
@@ -633,6 +655,607 @@ def _compact_tool_arguments(value: Any) -> Any:
         compacted_list = [_compact_tool_arguments(item) for item in value]
         return [item for item in compacted_list if item is not None]
     return value
+
+
+_INVENTORY_SCOPE_REQUIRED_READ_TOOLS = {
+    "list_inventory_items",
+    "search_inventory_items",
+    "get_inventory_item_details",
+    "get_inventory_alerts",
+    "search_stock_balances",
+    "get_stock_analytics",
+}
+
+_INVENTORY_SCOPE_REQUIRED_WRITE_TOOLS = {
+    "create_stock_reservation",
+    "transfer_location_stock",
+    "adjust_inventory_item_stock",
+}
+
+_LOCATION_SCOPED_ORDER_WRITE_TOOLS = {
+    "receive_purchase_order_items",
+    "reserve_sales_order",
+    "release_sales_order",
+    "ship_sales_order",
+    "dispatch_return_order",
+}
+
+_INVENTORY_MULTI_SCOPE_ADMIN_PERMISSIONS = {
+    "manage_inventory_item_settings",
+    "view_inventory_item_reports",
+    "can_view_dashboard",
+    "create_stock_location",
+    "update_stock_location",
+    "delete_stock_location",
+}
+
+_TOOL_PERMISSIONS_OWNER_ROLES = {
+    "admin",
+    "administrator",
+    "manager",
+    "owner",
+    "super_admin",
+    "superadmin",
+}
+
+_WORKSPACE_SCOPED_TOOL_WORKSPACE_FIELDS = {
+    "search_events": "workspace_id",
+    "get_event_timeline": "workspace_id",
+    "get_staff_activity": "workspace_id",
+    "get_product_activity": "workspace_id",
+    "get_pos_activity": "workspace_id",
+    "get_purchase_order_activity": "workspace_id",
+    "get_realtime_dashboard_snapshot": "workspace_id",
+    "get_permission_security_activity": "workspace_id",
+    "get_usage_and_limits": "profile_id",
+    "get_alert_summary": "workspace_id",
+}
+
+_WORKSPACE_SCOPED_TOOL_NAMES = set(_WORKSPACE_SCOPED_TOOL_WORKSPACE_FIELDS.keys())
+
+_TOOL_PERMISSION_REQUIREMENTS: dict[str, set[str]] = {
+    "search_events": {"view_audit_trail", "view_support_access_audit"},
+    "get_event_timeline": {"view_audit_trail", "view_support_access_audit"},
+    "get_staff_activity": {"view_audit_trail", "view_support_access_audit"},
+    "get_product_activity": {"view_audit_trail", "view_support_access_audit"},
+    "get_pos_activity": {"view_audit_trail", "view_support_access_audit"},
+    "get_purchase_order_activity": {"view_audit_trail", "view_support_access_audit"},
+    "get_realtime_dashboard_snapshot": {"view_audit_trail", "view_support_access_audit"},
+    "get_permission_security_activity": {"view_audit_trail", "view_support_access_audit"},
+    "get_usage_and_limits": {"workspace_owner"},
+}
+
+_INVENTORY_MULTI_SCOPE_ADMIN_ROLES = {
+    "admin",
+    "administrator",
+    "inventory_admin",
+    "inventory_manager",
+    "manager",
+    "owner",
+    "super_admin",
+    "superadmin",
+}
+
+
+def _nested_metadata_value(source: Any, path: str) -> Any:
+    current = source
+    for segment in path.split("."):
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(segment)
+        if current is None:
+            return None
+    return current
+
+
+def _first_metadata_value(sources: list[Mapping[str, Any]], paths: list[str]) -> Any:
+    for source in sources:
+        for path in paths:
+            value = _nested_metadata_value(source, path)
+            if value not in (None, "", [], {}, ()):
+                return value
+    return None
+
+
+def _tool_context_sources(ctx: ToolContext) -> list[Mapping[str, Any]]:
+    sources: list[Mapping[str, Any]] = []
+    if isinstance(ctx.metadata, Mapping):
+        sources.append(ctx.metadata)
+    principal_claims = ctx.principal.claims if ctx.principal else None
+    if isinstance(principal_claims, Mapping):
+        sources.append(principal_claims)
+    return sources
+
+
+def _tool_context_structural_location_id(ctx: ToolContext) -> str | None:
+    sources = _tool_context_sources(ctx)
+    value = _first_metadata_value(
+        sources,
+        [
+            "primary_structural_location_id",
+            "structural_location_id",
+            "default_structural_location_id",
+            "scope.primary_structural_location_id",
+            "scope.structural_location_id",
+            "bootstrap.scope.primary_structural_location_id",
+            "bootstrap.scope.structural_location_id",
+        ],
+    )
+    return _strip(str(value)) if value not in (None, "") else None
+
+
+def _tool_context_role(ctx: ToolContext) -> str | None:
+    sources = _tool_context_sources(ctx)
+    value = _first_metadata_value(
+        sources,
+        [
+            "role",
+            "session.role",
+            "bootstrap.session.role",
+            "user.role",
+        ],
+    )
+    return _strip(str(value).lower()) if value not in (None, "") else None
+
+
+def _tool_context_permissions(ctx: ToolContext) -> set[str]:
+    sources = _tool_context_sources(ctx)
+    raw = _first_metadata_value(
+        sources,
+        [
+            "permissions",
+            "session.permissions",
+            "bootstrap.session.permissions",
+            "user.permissions",
+        ],
+    )
+    if isinstance(raw, str):
+        return {item.strip() for item in raw.split(",") if item.strip()}
+    if isinstance(raw, (list, tuple, set)):
+        return {str(item).strip() for item in raw if str(item).strip()}
+    return set()
+
+
+def _tool_context_workspace_id(ctx: ToolContext) -> str | None:
+    principal = ctx.principal
+    if principal is not None:
+        value = _strip(principal.tenant_id)
+        if value:
+            return value
+    sources = _tool_context_sources(ctx)
+    raw = _first_metadata_value(
+        sources,
+        [
+            "workspace_id",
+            "profile_id",
+            "active_profile_id",
+            "session.workspace_id",
+            "session.profile_id",
+            "session.active_profile_id",
+            "bootstrap.profile_id",
+            "bootstrap.workspace_id",
+        ],
+    )
+    return _strip(str(raw)) if raw not in (None, "", [], {}, ()) else None
+
+
+def _tool_context_has_permission(ctx: ToolContext, permissions: set[str]) -> bool:
+    if not permissions:
+        return True
+    if _tool_context_is_workspace_owner(ctx):
+        return True
+    role = _tool_context_role(ctx)
+    if role in _TOOL_PERMISSIONS_OWNER_ROLES:
+        return True
+    active_permissions = _tool_context_permissions(ctx)
+    return bool(active_permissions.intersection(permissions))
+
+
+def _coerce_workspace_candidates(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = _strip(value)
+        return [normalized] if normalized else []
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            normalized = _strip(str(item))
+            if normalized and normalized not in out:
+                out.append(normalized)
+        return out
+    return []
+
+
+def _collect_workspace_ids(value: Any, *, target_fields: set[str]) -> list[str]:
+    values: list[str] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            key_name = str(key).lower()
+            if key_name in target_fields:
+                values.extend(_coerce_workspace_candidates(item))
+            else:
+                values.extend(_collect_workspace_ids(item, target_fields=target_fields))
+    elif isinstance(value, list):
+        for item in value:
+            values.extend(_collect_workspace_ids(item, target_fields=target_fields))
+    return values
+
+
+def _tool_context_workspace_id_match(
+    remote_tool_name: str,
+    arguments: Mapping[str, Any],
+    ctx: ToolContext,
+) -> tuple[bool, dict[str, Any]]:
+    workspace_field = _WORKSPACE_SCOPED_TOOL_WORKSPACE_FIELDS.get(remote_tool_name)
+    if workspace_field is None:
+        return True, {}
+
+    target_workspace_id = _tool_context_workspace_id(ctx)
+    if target_workspace_id is None:
+        return True, {}
+
+    target_fields = {workspace_field, _to_camel(workspace_field), _to_camel(workspace_field).replace("_", "")}
+    request_workspace_values = _collect_workspace_ids(arguments, target_fields=target_fields)
+
+    if request_workspace_values:
+        mismatches = [value for value in request_workspace_values if value != target_workspace_id]
+        if mismatches:
+            return (
+                False,
+                {
+                    "tool": remote_tool_name,
+                    "expected_workspace_id": target_workspace_id,
+                    "requested_workspace_ids": sorted(set(request_workspace_values)),
+                },
+            )
+        return True, {}
+
+    if workspace_field in ("profile_id", "workspaceId", "workspace_id"):
+        workspace_inject = target_workspace_id if target_workspace_id != "" else None
+        if workspace_inject:
+            return True, {workspace_field: workspace_inject}
+
+    return True, {}
+
+
+def _assert_tool_access(remote_tool_name: str, arguments: Mapping[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    required_permissions = _TOOL_PERMISSION_REQUIREMENTS.get(remote_tool_name)
+    if required_permissions:
+        if not _tool_context_has_permission(ctx=ctx, permissions=required_permissions):
+            if remote_tool_name == "get_usage_and_limits":
+                raise RuntimeError(
+                    f"Tool '{remote_tool_name}' requires workspace ownership or explicit workspace-level permission."
+                )
+            if "view_support_access_audit" in required_permissions:
+                raise RuntimeError(
+                    f"Tool '{remote_tool_name}' requires the '{'view_support_access_audit'}' permission to inspect security/audit data."
+                )
+            raise RuntimeError(f"Tool '{remote_tool_name}' requires audit access permission to execute.")
+
+    allowed, injected = _tool_context_workspace_id_match(
+        remote_tool_name=remote_tool_name,
+        arguments=arguments,
+        ctx=ctx,
+    )
+    if not allowed:
+        raise RuntimeError(
+            "Tool '{tool}' cannot access requested workspace data. "
+            "Expected workspace '{expected}', got: {requested}.".format(
+                tool=remote_tool_name,
+                expected=injected.get("expected_workspace_id", "<unknown>"),
+                requested=",".join(injected.get("requested_workspace_ids", [])),
+            )
+        )
+    return injected
+
+
+def _tool_context_is_workspace_owner(ctx: ToolContext) -> bool:
+    principal = ctx.principal
+    if principal is None:
+        return False
+    sources = _tool_context_sources(ctx)
+    owner_id = _first_metadata_value(
+        sources,
+        [
+            "owner_id",
+            "session.owner_id",
+            "bootstrap.session.owner_id",
+            "workspace.owner_id",
+        ],
+    )
+    owner = _strip(str(owner_id)) if owner_id not in (None, "") else None
+    return bool(owner and _strip(principal.user_id) == owner)
+
+
+def _tool_context_allows_inventory_multi_scope(ctx: ToolContext) -> bool:
+    if _tool_context_is_workspace_owner(ctx):
+        return True
+    role = _tool_context_role(ctx)
+    if role in _INVENTORY_MULTI_SCOPE_ADMIN_ROLES:
+        return True
+    permissions = _tool_context_permissions(ctx)
+    return bool(permissions.intersection(_INVENTORY_MULTI_SCOPE_ADMIN_PERMISSIONS))
+
+
+def _tool_context_terminal_scope_required(ctx: ToolContext) -> bool:
+    sources = _tool_context_sources(ctx)
+    scope_mode = _strip(
+        str(
+            _first_metadata_value(
+                sources,
+                [
+                    "scope_mode",
+                    "scope.scope_mode",
+                    "bootstrap.scope.scope_mode",
+                ],
+            )
+            or ""
+        ).lower()
+    )
+    role = _strip(
+        str(
+            _first_metadata_value(
+                sources,
+                [
+                    "role",
+                    "session.role",
+                    "bootstrap.session.role",
+                ],
+            )
+            or ""
+        ).lower()
+    )
+    device_mode = _strip(
+        str(
+            _first_metadata_value(
+                sources,
+                [
+                    "device_mode",
+                    "session.device_mode",
+                    "bootstrap.session.device_mode",
+                ],
+            )
+            or ""
+        ).lower()
+    )
+    if scope_mode == "terminal_location":
+        return True
+    if role == "cashier":
+        return True
+    return device_mode == "terminal"
+
+
+def _normalize_text_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        normalized = _strip(value)
+        return [normalized] if normalized else []
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        normalized = _strip(str(item))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def _inventory_request_widens_scope(arguments: Mapping[str, Any]) -> bool:
+    structural_scope_ids = _normalize_text_list(arguments.get("structural_location_ids"))
+    scope_mode = _strip(str(arguments.get("scope") or "")).lower() if arguments.get("scope") is not None else None
+    return bool(structural_scope_ids) or scope_mode in {"all", "all_locations"}
+
+
+def _collect_scalar_ids(value: Any) -> list[tuple[str, str]]:
+    collected: list[tuple[str, str]] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            key_name = str(key)
+            if key_name.endswith("_id"):
+                normalized = _strip(str(item))
+                if normalized:
+                    collected.append((key_name, normalized))
+                    continue
+            if key_name.endswith("_ids"):
+                for normalized in _normalize_text_list(item):
+                    collected.append((key_name, normalized))
+                continue
+            collected.extend(_collect_scalar_ids(item))
+        return collected
+    if isinstance(value, list):
+        for item in value:
+            collected.extend(_collect_scalar_ids(item))
+    return collected
+
+
+def _inventory_sync_metadata(remote_tool_name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    compact_arguments = _compact_tool_arguments(arguments)
+    scalar_ids = _collect_scalar_ids(compact_arguments)
+    structural_ids = sorted(
+        {
+            value
+            for key, value in scalar_ids
+            if key in {"structural_location_id", "structural_location_ids"}
+        }
+    )
+    leaf_ids = sorted(
+        {
+            value
+            for key, value in scalar_ids
+            if key in {"stock_location_id", "stock_location_ids"}
+        }
+    )
+    entity_ids = sorted(
+        {
+            f"{key}:{value}"
+            for key, value in scalar_ids
+            if key
+            not in {
+                "structural_location_id",
+                "structural_location_ids",
+                "stock_location_id",
+                "stock_location_ids",
+                "profile_id",
+            }
+        }
+    )
+    digest_payload = json.dumps(compact_arguments, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(f"{remote_tool_name}:{digest_payload}".encode("utf-8")).hexdigest()[:16]
+    key_parts = [f"op={remote_tool_name}"]
+    if structural_ids:
+        key_parts.append("struct=" + ",".join(structural_ids))
+    if leaf_ids:
+        key_parts.append("leaf=" + ",".join(leaf_ids))
+    if entity_ids:
+        key_parts.append("entities=" + ",".join(entity_ids[:8]))
+    key_parts.append(f"digest={digest}")
+    return {
+        "sync_key": "|".join(key_parts),
+        "structural_location_ids": structural_ids,
+        "stock_location_ids": leaf_ids,
+        "entity_ids": entity_ids,
+    }
+
+
+def _location_scoped_sync_metadata(remote_tool_name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    compact_arguments = _compact_tool_arguments(arguments)
+    scalar_ids = _collect_scalar_ids(compact_arguments)
+    structural_ids = sorted(
+        {
+            value
+            for key, value in scalar_ids
+            if key in {"structural_location_id", "structural_location_ids"}
+        }
+    )
+    leaf_ids = sorted(
+        {
+            value
+            for key, value in scalar_ids
+            if key in {"stock_location_id", "stock_location_ids", "location_id", "location_ids"}
+        }
+    )
+    entity_ids = sorted(
+        {
+            f"{key}:{value}"
+            for key, value in scalar_ids
+            if key
+            not in {
+                "structural_location_id",
+                "structural_location_ids",
+                "stock_location_id",
+                "stock_location_ids",
+                "location_id",
+                "location_ids",
+                "profile_id",
+            }
+        }
+    )
+    digest_payload = json.dumps(compact_arguments, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(f"{remote_tool_name}:{digest_payload}".encode("utf-8")).hexdigest()[:16]
+    key_parts = [f"op={remote_tool_name}"]
+    if structural_ids:
+        key_parts.append("struct=" + ",".join(structural_ids))
+    if leaf_ids:
+        key_parts.append("leaf=" + ",".join(leaf_ids))
+    if entity_ids:
+        key_parts.append("entities=" + ",".join(entity_ids[:8]))
+    key_parts.append(f"digest={digest}")
+    return {
+        "sync_key": "|".join(key_parts),
+        "structural_location_ids": structural_ids,
+        "stock_location_ids": leaf_ids,
+        "entity_ids": entity_ids,
+    }
+
+
+def _with_inventory_structural_scope(
+    *,
+    remote_tool_name: str,
+    arguments: dict[str, Any],
+    ctx: ToolContext,
+) -> dict[str, Any]:
+    scoped_arguments = deepcopy(arguments or {})
+    scope_id = _tool_context_structural_location_id(ctx)
+    scope_required = _tool_context_terminal_scope_required(ctx)
+    widened_scope = _inventory_request_widens_scope(scoped_arguments)
+
+    if remote_tool_name in _INVENTORY_SCOPE_REQUIRED_READ_TOOLS:
+        if widened_scope:
+            if not _tool_context_allows_inventory_multi_scope(ctx):
+                raise RuntimeError(
+                    f"Inventory tool '{remote_tool_name}' can only widen structural scope for administrative contexts."
+                )
+            return scoped_arguments
+        if _strip(str(scoped_arguments.get("structural_location_id") or "")):
+            return scoped_arguments
+        if scope_id:
+            scoped_arguments["structural_location_id"] = scope_id
+            return scoped_arguments
+        if scope_required:
+            raise RuntimeError(
+                f"Inventory tool '{remote_tool_name}' requires a structural location scope for terminal or cashier execution."
+            )
+        return scoped_arguments
+
+    if remote_tool_name in _INVENTORY_SCOPE_REQUIRED_WRITE_TOOLS:
+        payload = scoped_arguments.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+            scoped_arguments["payload"] = payload
+        payload_scope_id = _strip(str(payload.get("structural_location_id") or ""))
+        effective_scope_id = payload_scope_id or scope_id
+        if effective_scope_id:
+            payload["structural_location_id"] = effective_scope_id
+        elif scope_required:
+            raise RuntimeError(
+                f"Inventory tool '{remote_tool_name}' requires a structural location scope for terminal or cashier execution."
+            )
+
+        if remote_tool_name == "adjust_inventory_item_stock":
+            adjustments = payload.get("adjustments")
+            if isinstance(adjustments, list):
+                for item in adjustments:
+                    if isinstance(item, dict) and effective_scope_id and not _strip(str(item.get("structural_location_id") or "")):
+                        item["structural_location_id"] = effective_scope_id
+        if remote_tool_name == "transfer_location_stock":
+            transfers = payload.get("transfers")
+            if isinstance(transfers, list):
+                for item in transfers:
+                    if isinstance(item, dict) and effective_scope_id and not _strip(str(item.get("structural_location_id") or "")):
+                        item["structural_location_id"] = effective_scope_id
+        return scoped_arguments
+
+    return scoped_arguments
+
+
+def _with_location_scoped_order_structural_scope(
+    *,
+    remote_tool_name: str,
+    arguments: dict[str, Any],
+    ctx: ToolContext,
+) -> dict[str, Any]:
+    if remote_tool_name not in _LOCATION_SCOPED_ORDER_WRITE_TOOLS:
+        return deepcopy(arguments or {})
+
+    scoped_arguments = deepcopy(arguments or {})
+    payload = scoped_arguments.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+        scoped_arguments["payload"] = payload
+
+    scope_id = _tool_context_structural_location_id(ctx)
+    payload_scope_id = _strip(str(payload.get("structural_location_id") or ""))
+    effective_scope_id = payload_scope_id or scope_id
+    if effective_scope_id:
+        payload["structural_location_id"] = effective_scope_id
+    elif _tool_context_terminal_scope_required(ctx):
+        raise RuntimeError(
+            f"Order tool '{remote_tool_name}' requires a structural location scope for terminal or cashier execution."
+        )
+    return scoped_arguments
 
 
 async def _list_remote_tools(*, server_url: str, headers: Mapping[str, str], timeout_s: float) -> list[_RemoteToolSpec]:
@@ -937,15 +1560,59 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
     async def list_tools(self, *, ctx: ToolContext) -> list[ToolSpec]:
         return [item.to_tool_spec() for item in await self._resolved_tools(ctx=ctx)]
 
+    def _configured_route_for_name(self, name: str) -> _ConfiguredToolSpec | None:
+        allowed = set(self._cfg.tools or [])
+        if not allowed:
+            return None
+        prefix = self._cfg.tool_name_prefix or ""
+        requested = str(name or "").strip()
+        remote_name = requested[len(prefix) :] if prefix and requested.startswith(prefix) else requested
+        exposed_name = f"{prefix}{remote_name}"
+        if requested not in allowed and remote_name not in allowed and exposed_name not in allowed:
+            return None
+        return _ConfiguredToolSpec(
+            exposed_name=exposed_name,
+            remote_name=remote_name,
+            description="Configured MCP tool",
+            input_schema={},
+        )
+
     async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
-        tools = await self._resolved_tools(ctx=ctx)
-        route = next((item for item in tools if item.exposed_name == name), None)
+        route = self._configured_route_for_name(name)
+        if route is None:
+            tools = await self._resolved_tools(ctx=ctx)
+            route = next((item for item in tools if item.exposed_name == name), None)
         if route is None:
             raise RuntimeError(f"Tool '{name}' is not available from MCP server '{self._cfg.id}'.")
 
+        workspace_injected_arguments = _assert_tool_access(
+            remote_tool_name=route.remote_name,
+            arguments=arguments or {},
+            ctx=ctx,
+        )
         server_url, headers, connection = self._resolve_request_target(ctx=ctx)
-        compact_arguments = _compact_tool_arguments(arguments or {})
+        scoped_arguments = _with_inventory_structural_scope(
+            remote_tool_name=route.remote_name,
+            arguments={**(arguments or {}), **workspace_injected_arguments},
+            ctx=ctx,
+        )
+        scoped_arguments = _with_location_scoped_order_structural_scope(
+            remote_tool_name=route.remote_name,
+            arguments=scoped_arguments,
+            ctx=ctx,
+        )
+        compact_arguments = _compact_tool_arguments(scoped_arguments)
         argument_keys = sorted(str(key) for key in compact_arguments.keys() if str(key).strip())
+        sync_metadata = (
+            _location_scoped_sync_metadata(route.remote_name, compact_arguments)
+            if route.remote_name
+            in (
+                _INVENTORY_SCOPE_REQUIRED_READ_TOOLS
+                | _INVENTORY_SCOPE_REQUIRED_WRITE_TOOLS
+                | _LOCATION_SCOPED_ORDER_WRITE_TOOLS
+            )
+            else None
+        )
         _log_mcp_operation(
             "info",
             "call_tool_start",
@@ -958,6 +1625,10 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             argument_keys=argument_keys,
             connection_id=connection.id if connection is not None else None,
             connection_scope=connection.connection_scope if connection is not None else None,
+            sync_key=sync_metadata.get("sync_key") if sync_metadata else None,
+            structural_location_ids=sync_metadata.get("structural_location_ids") if sync_metadata else None,
+            stock_location_ids=sync_metadata.get("stock_location_ids") if sync_metadata else None,
+            entity_ids=sync_metadata.get("entity_ids")[:8] if sync_metadata else None,
         )
         try:
             result = await _call_remote_tool(
@@ -979,6 +1650,7 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
                 argument_keys=argument_keys,
                 connection_id=connection.id if connection is not None else None,
                 error=str(exc),
+                sync_key=sync_metadata.get("sync_key") if sync_metadata else None,
             )
             raise RuntimeError(
                 f"MCP call_tool failed for agent '{self._agent_name}' on server '{self._cfg.id}' "
@@ -994,6 +1666,9 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             remote_tool=route.remote_name,
             result_type=type(result).__name__,
             connection_id=connection.id if connection is not None else None,
+            sync_key=sync_metadata.get("sync_key") if sync_metadata else None,
+            structural_location_ids=sync_metadata.get("structural_location_ids") if sync_metadata else None,
+            stock_location_ids=sync_metadata.get("stock_location_ids") if sync_metadata else None,
         )
         return result
 
@@ -1025,6 +1700,19 @@ class CompositeToolExecutor(ToolExecutor):
 
     def list_tool_failures(self) -> list[dict[str, Any]]:
         return [dict(item) for item in self._last_list_tool_failures]
+
+    def _direct_executor_for_tool_name(self, name: str) -> ToolExecutor | None:
+        namespace, separator, _ = str(name or "").partition(".")
+        if not namespace or not separator:
+            return None
+        expected_prefix = f"{namespace}."
+        for executor in self._executors:
+            metadata = self._executor_debug_metadata(executor)
+            server_id = str(metadata.get("server_id") or "").strip()
+            tool_name_prefix = str(metadata.get("tool_name_prefix") or "").strip()
+            if server_id == namespace or tool_name_prefix == expected_prefix:
+                return executor
+        return None
 
     async def _resolve_routes(self, *, ctx: ToolContext) -> tuple[list[ToolSpec], dict[str, ToolExecutor]]:
         tools: list[ToolSpec] = []
@@ -1087,6 +1775,26 @@ class CompositeToolExecutor(ToolExecutor):
         return tools
 
     async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
+        direct_executor = self._direct_executor_for_tool_name(name)
+        if direct_executor is not None:
+            _log_mcp_operation(
+                "info",
+                "composite_call_tool_direct_route",
+                exposed_tool=name,
+                executor=self._executor_debug_metadata(direct_executor).get("executor_label"),
+                argument_keys=sorted(str(key) for key in (arguments or {}).keys()),
+            )
+            try:
+                return await direct_executor.call_tool(name=name, arguments=arguments or {}, ctx=ctx)
+            except Exception as exc:
+                _log_mcp_operation(
+                    "warning",
+                    "composite_call_tool_direct_route_failed",
+                    exposed_tool=name,
+                    executor=self._executor_debug_metadata(direct_executor).get("executor_label"),
+                    error=str(exc),
+                )
+
         _, routes = await self._resolve_routes(ctx=ctx)
         executor = routes.get(name)
         if executor is None:

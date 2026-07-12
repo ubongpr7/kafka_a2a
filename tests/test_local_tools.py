@@ -48,6 +48,19 @@ async def test_local_interaction_tool_executor_lists_expected_tools() -> None:
     names = {tool.name for tool in tools}
 
     assert "create_confirmation_request" in names
+    assert "create_insight_response" in names
+    assert "render_metric_grid" in names
+    assert "render_bar_chart" in names
+    assert "render_donut_chart" in names
+    assert "render_line_chart" in names
+    assert "render_ranked_list" in names
+    assert "render_risk_panel" in names
+    assert "render_comparison_table" in names
+    assert "render_timeline" in names
+    assert "render_progress_tracker" in names
+    assert "render_action_form" in names
+    assert "render_confirmation_card" in names
+    assert "render_entity_preview" in names
     assert "create_searchable_selection" in names
     assert "create_wizard_flow" in names
     assert "delegate_to_agent" in names
@@ -74,6 +87,33 @@ async def test_local_interaction_tool_executor_returns_interaction_payload() -> 
 
     assert result["interaction_type"] == "confirmation_request"
     assert result["approve_text"] == "Delete"
+
+
+@pytest.mark.asyncio
+async def test_local_interaction_tool_executor_returns_insight_payload() -> None:
+    executor = LocalInteractionToolExecutor(delegation_backend=_FakeDelegationBackend())
+
+    result = await executor.call_tool(
+        name="create_insight_response",
+        arguments={
+            "summary": "Sales are strongest at Lekki today.",
+            "widgets": [
+                {
+                    "type": "metric_grid",
+                    "title": "Today",
+                    "data": [{"label": "Sales", "value": 12}],
+                }
+            ],
+            "data_sources": [{"service": "pos", "endpoint_or_topic": "get_sales_summary", "freshness": "live"}],
+            "permissions_checked": ["view_pos_reports"],
+            "confidence": "high",
+        },
+        ctx=ToolContext(),
+    )
+
+    assert result["kind"] == "insight_response"
+    assert result["summary"] == "Sales are strongest at Lekki today."
+    assert result["widgets"][0]["type"] == "metric_grid"
 
 
 @pytest.mark.asyncio
@@ -187,6 +227,78 @@ def test_kafka_delegation_backend_accepts_human_friendly_agent_aliases() -> None
     selected = backend._select_agent(cards=cards, request="show product counts", agent_name="Product Discovery")
 
     assert selected.name == "product_discovery"
+
+
+def test_kafka_delegation_backend_prefers_pos_admin_for_sales_by_location_queries() -> None:
+    backend = KafkaDelegationBackend()
+    cards = [
+        AgentCard(
+            name="inventory",
+            description="Inventory router agent.",
+            url="kafka://inventory",
+            version="0.1.0",
+            metadata={"ka2aRuntime": {"publicSlug": "inventory"}},
+        ),
+        AgentCard(
+            name="inventory_fulfillment",
+            description="Inventory fulfillment specialist for sales orders and transfers.",
+            url="kafka://inventory_fulfillment",
+            version="0.1.0",
+        ),
+        AgentCard(
+            name="pos_admin",
+            description="POS admin specialist for sales reporting and terminal activity.",
+            url="kafka://pos_admin",
+            version="0.1.0",
+        ),
+        AgentCard(
+            name="inventory_visibility",
+            description="Inventory visibility specialist for stock posture and alerts.",
+            url="kafka://inventory_visibility",
+            version="0.1.0",
+        ),
+    ]
+
+    selected = backend._select_agent(cards=cards, request="Show sales by location today", agent_name=None)
+
+    assert selected.name == "pos_admin"
+
+
+def test_kafka_delegation_backend_prefers_pos_admin_for_revenue_location_queries() -> None:
+    backend = KafkaDelegationBackend()
+    cards = [
+        AgentCard(
+            name="inventory",
+            description="Inventory router agent.",
+            url="kafka://inventory",
+            version="0.1.0",
+            metadata={"ka2aRuntime": {"publicSlug": "inventory"}},
+        ),
+        AgentCard(
+            name="pos_admin",
+            description="POS admin specialist for sales reporting and terminal activity.",
+            url="kafka://pos_admin",
+            version="0.1.0",
+        ),
+        AgentCard(
+            name="users",
+            description="Users specialist for staff and subscription insights.",
+            url="kafka://users",
+            version="0.1.0",
+        ),
+    ]
+
+    selected = backend._select_agent(cards=cards, request="Compare revenue across locations today", agent_name=None)
+
+    assert selected.name == "pos_admin"
+
+    selected_with_router_hint = backend._select_agent(
+        cards=cards,
+        request="Show sales by location today",
+        agent_name="inventory",
+    )
+
+    assert selected_with_router_hint.name == "pos_admin"
 
 
 def test_kafka_delegation_backend_uses_agent_specific_client_ids(monkeypatch: pytest.MonkeyPatch) -> None:

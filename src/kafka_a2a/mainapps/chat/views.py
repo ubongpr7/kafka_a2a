@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from kafka_a2a.client import Ka2aClient
+from kafka_a2a.intera_coins import A2ACompletionChargeTracker, spend_intera_coins_for_a2a_completion
 from kafka_a2a.memory import KA2A_CONVERSATION_HISTORY_METADATA_KEY
 from kafka_a2a.mainapps.agents.services import AgentControlPlaneService
 from kafka_a2a.mainapps.agents.services import AgentRuntimeAccessContext
@@ -217,7 +218,7 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         profile_id: str,
         user_id: str,
         history_length: int | None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         limit = max(0, int(history_length)) if history_length is not None else None
         detail = await deps.chat_store.get_conversation_detail(
             conversation_id=conversation_id,
@@ -228,15 +229,19 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         if detail is None:
             return []
 
-        history: list[dict[str, str]] = []
+        history: list[dict[str, Any]] = []
         for item in detail.messages:
             role = str(item.role or "").strip().lower()
             if role not in {"user", "assistant", "system"}:
                 continue
             content = _history_content_for_message(item)
-            if not content:
+            structured_payload = item.structured_payload if isinstance(item.structured_payload, dict) else None
+            if not content and not structured_payload:
                 continue
-            history.append({"role": role, "content": content})
+            entry: dict[str, Any] = {"role": role, "content": content}
+            if structured_payload:
+                entry["structured_payload"] = structured_payload
+            history.append(entry)
         return history
 
     async def _append_activity(
@@ -541,6 +546,11 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
             )
 
         assistant_persisted = False
+        charge_tracker = A2ACompletionChargeTracker(
+            profile_id=profile_id,
+            conversation_id=conversation.id,
+            prompt_text=text,
+        )
         try:
             async for event in stream:
                 payload: Any = event
@@ -631,6 +641,15 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
                             kind=ConversationMessageKind.structured.value if structured_payload else ConversationMessageKind.text.value,
                         )
                         assistant_persisted = True
+                    pending_charge = charge_tracker.evaluate(payload if isinstance(payload, dict) else None)
+                    if pending_charge is not None:
+                        await run_in_threadpool(
+                            spend_intera_coins_for_a2a_completion,
+                            profile_id=pending_charge.profile_id,
+                            task_id=pending_charge.task_id,
+                            conversation_id=pending_charge.conversation_id,
+                            prompt_text=pending_charge.prompt_text,
+                        )
                     continue
 
                 if kind == "artifact-update":
@@ -689,6 +708,7 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
                             kind=ConversationMessageKind.structured.value if structured_payload else ConversationMessageKind.text.value,
                         )
                         assistant_persisted = True
+                    charge_tracker.evaluate(payload if isinstance(payload, dict) else None)
             await websocket.send_json({"type": "typing.stopped"})
         except Exception:
             await websocket.send_json({"type": "typing.stopped"})

@@ -431,6 +431,20 @@ def build_agents_router(
         require_permission(auth, "manage_agent_settings")
         return await run_in_threadpool(service.get_workspace_ai_setup, profile_id=auth.profile_id)
 
+    @router.get("/management/tavily-credential/")
+    async def get_workspace_tavily_credential(request: Request):
+        auth = _auth_context(request)
+        require_permission(auth, "manage_agent_settings")
+        tavily_api_key = await run_in_threadpool(
+            service.resolve_workspace_tavily_api_key,
+            profile_id=auth.profile_id,
+        )
+        return {
+            "profile_id": auth.profile_id,
+            "has_tavily_api_key": bool(tavily_api_key),
+            "tavily_api_key": tavily_api_key,
+        }
+
     @router.post("/management/agent-setup/")
     async def save_workspace_ai_setup(body: dict[str, Any], request: Request):
         auth = _auth_context(request)

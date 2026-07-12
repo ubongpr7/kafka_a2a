@@ -254,25 +254,26 @@ def test_prod_config_splits_heavy_domains_into_focused_subagents() -> None:
     config_path = Path(__file__).resolve().parents[1] / "mcp-tools.prod.json"
 
     expected = {
-        "product_discovery": ("products", 12),
-        "product_catalog_admin": ("products", 20),
-        "product_merchandising": ("products", 24),
-        "product_pricing": ("products", 22),
-        "inventory_visibility": ("inventory", 18),
-        "inventory_setup": ("inventory", 21),
-        "inventory_procurement": ("inventory", 18),
-        "inventory_fulfillment": ("inventory", 29),
-        "pos_live": ("pos", 30),
-        "pos_admin": ("pos", 20),
+        "product_discovery": (["products", "audit"], 15),
+        "product_catalog_admin": (["products"], 20),
+        "product_merchandising": (["products"], 24),
+        "product_pricing": (["products"], 22),
+        "inventory_visibility": (["inventory", "audit", "notifications"], 23),
+        "inventory_setup": (["inventory"], 21),
+        "inventory_procurement": (["inventory", "purchasing", "audit"], 21),
+        "inventory_fulfillment": (["inventory"], 29),
+        "pos_live": (["pos", "audit"], 30),
+        "pos_admin": (["pos", "audit"], 23),
     }
 
-    for agent_name, (server_id, max_tools) in expected.items():
+    for agent_name, (server_ids, max_tools) in expected.items():
         cfg = MultiMcpToolExecutorConfig.from_env(
             {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": agent_name}
         )
-        assert [server.id for server in cfg.servers] == [server_id]
-        assert len(cfg.servers[0].tools or []) <= max_tools
-        assert len(cfg.servers[0].tools or []) > 0
+        assert [server.id for server in cfg.servers] == server_ids
+        tool_count = sum(len(server.tools or []) for server in cfg.servers)
+        assert tool_count <= max_tools
+        assert tool_count > 0
 
 
 @pytest.mark.asyncio
@@ -437,6 +438,814 @@ async def test_multi_mcp_executor_omits_none_arguments_before_remote_call(
     }
     assert calls[-1]["argument_keys"] == ["limit"]
     assert calls[-1]["arguments"] == {"limit": 25}
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_injects_structural_scope_for_inventory_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        call = {
+            "server_url": server_url,
+            "headers": dict(headers),
+            "timeout_s": timeout_s,
+            "operation": operation,
+            "remote_tool": remote_tool,
+            "argument_keys": list(argument_keys or []),
+        }
+        calls.append(call)
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "create_stock_reservation", "description": "Create stock reservation"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                call["tool_name"] = name
+                call["arguments"] = dict(arguments or {})
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["create_stock_reservation"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    result = await executor.call_tool(
+        name="inventory.create_stock_reservation",
+        arguments={
+            "payload": {
+                "inventory_item_id": "inv-1",
+                "stock_location_id": "loc-1",
+                "reserved_quantity": "2",
+            }
+        },
+        ctx=ToolContext(
+            principal=Principal(user_id="cashier-1", tenant_id="profile-1", claims={"role": "cashier"}),
+            metadata={"scope_mode": "TERMINAL_LOCATION", "primary_structural_location_id": "struct-1"},
+        ),
+    )
+
+    assert result == {
+        "tool": "create_stock_reservation",
+        "arguments": {
+            "payload": {
+                "inventory_item_id": "inv-1",
+                "stock_location_id": "loc-1",
+                "reserved_quantity": "2",
+                "structural_location_id": "struct-1",
+            }
+        },
+    }
+    assert calls[-1]["arguments"]["payload"]["structural_location_id"] == "struct-1"
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_rejects_terminal_inventory_call_without_structural_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "search_inventory_items", "description": "Search inventory items"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["search_inventory_items"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    with pytest.raises(RuntimeError, match="requires a structural location scope"):
+        await executor.call_tool(
+            name="inventory.search_inventory_items",
+            arguments={"query": "perfume"},
+            ctx=ToolContext(
+                principal=Principal(user_id="cashier-1", tenant_id="profile-1", claims={"role": "cashier"}),
+                metadata={"scope_mode": "TERMINAL_LOCATION"},
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_rejects_multi_location_inventory_scope_for_non_admin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "search_inventory_items", "description": "Search inventory items"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["search_inventory_items"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    with pytest.raises(RuntimeError, match="can only widen structural scope for administrative contexts"):
+        await executor.call_tool(
+            name="inventory.search_inventory_items",
+            arguments={
+                "query": "perfume",
+                "scope": "all_locations",
+                "structural_location_ids": ["struct-1", "struct-2"],
+            },
+            ctx=ToolContext(
+                principal=Principal(
+                    user_id="staff-1",
+                    tenant_id="profile-1",
+                    claims={"role": "staff", "permissions": ["read_inventory_item"]},
+                ),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_allows_admin_multi_location_inventory_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        call = {
+            "server_url": server_url,
+            "headers": dict(headers),
+            "timeout_s": timeout_s,
+            "operation": operation,
+            "remote_tool": remote_tool,
+            "argument_keys": list(argument_keys or []),
+        }
+        calls.append(call)
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "search_inventory_items", "description": "Search inventory items"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                call["tool_name"] = name
+                call["arguments"] = dict(arguments or {})
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["search_inventory_items"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    result = await executor.call_tool(
+        name="inventory.search_inventory_items",
+        arguments={
+            "query": "perfume",
+            "scope": "all_locations",
+            "structural_location_ids": ["struct-1", "struct-2"],
+        },
+        ctx=ToolContext(
+            principal=Principal(
+                user_id="manager-1",
+                tenant_id="profile-1",
+                claims={"role": "manager", "permissions": ["manage_inventory_item_settings"]},
+            ),
+        ),
+    )
+
+    assert result == {
+        "tool": "search_inventory_items",
+        "arguments": {
+            "query": "perfume",
+            "scope": "all_locations",
+            "structural_location_ids": ["struct-1", "struct-2"],
+        },
+    }
+    assert calls[-1]["arguments"]["structural_location_ids"] == ["struct-1", "struct-2"]
+    assert "structural_location_id" not in calls[-1]["arguments"]
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_enforces_audit_tool_permission_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_mcp_session_with_capture(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        call: dict[str, Any] = {
+            "server_url": server_url,
+            "headers": dict(headers),
+            "operation": operation,
+            "remote_tool": remote_tool,
+            "argument_keys": list(argument_keys or []),
+        }
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "search_events", "description": "Search audit events"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                call["arguments"] = dict(arguments or {})
+                calls.append(call)
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session_with_capture)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="audit",
+                    server_url="http://audit-mcp:8000/mcp",
+                    tool_name_prefix="audit.",
+                    tools=["search_events"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    result = await executor.call_tool(
+        name="audit.search_events",
+        arguments={"query": "support"},
+        ctx=ToolContext(
+            principal=Principal(
+                user_id="owner-1",
+                tenant_id="workspace-1",
+                claims={"permissions": ["view_audit_trail"], "owner_id": "owner-1"},
+            )
+        ),
+    )
+
+    assert result["tool"] == "search_events"
+    assert calls[-1]["arguments"]["query"] == "support"
+    assert calls[-1]["arguments"]["workspace_id"] == "workspace-1"
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_denies_audit_tool_without_required_permissions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "get_permission_security_activity", "description": "Get permission/security audit activity"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="audit",
+                    server_url="http://audit-mcp:8000/mcp",
+                    tool_name_prefix="audit.",
+                    tools=["get_permission_security_activity"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    with pytest.raises(RuntimeError, match="requires"):
+        await executor.call_tool(
+            name="audit.get_permission_security_activity",
+            arguments={"limit": 10},
+            ctx=ToolContext(
+                principal=Principal(
+                    user_id="staff-1",
+                    tenant_id="workspace-1",
+                    claims={"permissions": ["view_inventory_reports"]},
+                )
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_denies_audit_tool_partial_permission_with_owner_only_workspace_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "get_permission_security_activity", "description": "Get permission/security audit activity"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="audit",
+                    server_url="http://audit-mcp:8000/mcp",
+                    tool_name_prefix="audit.",
+                    tools=["get_permission_security_activity"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    with pytest.raises(RuntimeError, match="requires"):
+        await executor.call_tool(
+            name="audit.get_permission_security_activity",
+            arguments={"limit": 10},
+            ctx=ToolContext(
+                principal=Principal(
+                    user_id="staff-1",
+                    tenant_id="workspace-1",
+                    claims={"permissions": ["read_pos"], "role": "cashier"},
+                )
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_blocks_workspace_mismatch_on_workspace_scoped_mcp_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "search_events", "description": "Search audit events"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="audit",
+                    server_url="http://audit-mcp:8000/mcp",
+                    tool_name_prefix="audit.",
+                    tools=["search_events"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    with pytest.raises(RuntimeError, match="cannot access requested workspace"):
+        await executor.call_tool(
+            name="audit.search_events",
+            arguments={"query": "support", "workspace_id": "workspace-2"},
+            ctx=ToolContext(
+                principal=Principal(
+                    user_id="owner-2",
+                    tenant_id="workspace-1",
+                    claims={"permissions": ["view_audit_trail"], "owner_id": "owner-1"},
+                )
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_logs_deterministic_inventory_sync_key(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "create_stock_reservation", "description": "Create stock reservation"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["create_stock_reservation"],
+                )
+            ]
+        )
+    )
+
+    caplog.set_level(logging.INFO, logger="kafka_a2a.mcp_tools")
+
+    await executor.list_tools(ctx=ToolContext())
+    await executor.call_tool(
+        name="inventory.create_stock_reservation",
+        arguments={
+            "payload": {
+                "inventory_item_id": "inv-1",
+                "stock_location_id": "leaf-9",
+                "reserved_quantity": "2",
+            }
+        },
+        ctx=ToolContext(
+            principal=Principal(user_id="cashier-1", tenant_id="profile-1", claims={"role": "cashier"}),
+            metadata={"scope_mode": "TERMINAL_LOCATION", "primary_structural_location_id": "struct-7"},
+        ),
+    )
+
+    assert "event=call_tool_start" in caplog.text
+    assert "sync_key=op=create_stock_reservation|struct=struct-7|leaf=leaf-9|entities=inventory_item_id:inv-1|digest=" in caplog.text
+    assert "structural_location_ids=[struct-7]" in caplog.text
+    assert "stock_location_ids=[leaf-9]" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_injects_structural_scope_for_location_scoped_order_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        call = {
+            "server_url": server_url,
+            "headers": dict(headers),
+            "timeout_s": timeout_s,
+            "operation": operation,
+            "remote_tool": remote_tool,
+            "argument_keys": list(argument_keys or []),
+        }
+        calls.append(call)
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "reserve_sales_order", "description": "Reserve stock for a sales order"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                call["tool_name"] = name
+                call["arguments"] = dict(arguments or {})
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["reserve_sales_order"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    result = await executor.call_tool(
+        name="inventory.reserve_sales_order",
+        arguments={
+            "sales_order_id": "so-1",
+            "payload": {
+                "reservation_items": [
+                    {"line_item_id": "line-1", "location_id": "leaf-4", "quantity": "2"},
+                ],
+                "notes": "Reserve for cashier terminal",
+            },
+        },
+        ctx=ToolContext(
+            principal=Principal(user_id="cashier-1", tenant_id="profile-1", claims={"role": "cashier"}),
+            metadata={"scope_mode": "TERMINAL_LOCATION", "primary_structural_location_id": "struct-4"},
+        ),
+    )
+
+    assert result == {
+        "tool": "reserve_sales_order",
+        "arguments": {
+            "sales_order_id": "so-1",
+            "payload": {
+                "reservation_items": [
+                    {"line_item_id": "line-1", "location_id": "leaf-4", "quantity": "2"},
+                ],
+                "notes": "Reserve for cashier terminal",
+                "structural_location_id": "struct-4",
+            },
+        },
+    }
+    assert calls[-1]["arguments"]["payload"]["structural_location_id"] == "struct-4"
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_rejects_terminal_location_scoped_order_call_without_structural_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "dispatch_return_order", "description": "Dispatch a return order"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["dispatch_return_order"],
+                )
+            ]
+        )
+    )
+
+    await executor.list_tools(ctx=ToolContext())
+    with pytest.raises(RuntimeError, match="requires a structural location scope"):
+        await executor.call_tool(
+            name="inventory.dispatch_return_order",
+            arguments={
+                "return_order_id": "ro-1",
+                "payload": {
+                    "return_items": [
+                        {"return_line_item_id": "ret-1", "location_id": "leaf-8", "quantity": "1"},
+                    ]
+                },
+            },
+            ctx=ToolContext(
+                principal=Principal(user_id="cashier-1", tenant_id="profile-1", claims={"role": "cashier"}),
+                metadata={"scope_mode": "TERMINAL_LOCATION"},
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_logs_deterministic_location_scoped_order_sync_key(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "receive_purchase_order_items", "description": "Receive purchase order items"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["receive_purchase_order_items"],
+                )
+            ]
+        )
+    )
+
+    caplog.set_level(logging.INFO, logger="kafka_a2a.mcp_tools")
+
+    await executor.list_tools(ctx=ToolContext())
+    await executor.call_tool(
+        name="inventory.receive_purchase_order_items",
+        arguments={
+            "purchase_order_id": "po-5",
+            "payload": {
+                "items": [
+                    {"line_item_id": "pol-9", "location_id": "leaf-6", "quantity_received": "4"},
+                ],
+                "notes": "Receive against scoped branch",
+            },
+        },
+        ctx=ToolContext(
+            principal=Principal(user_id="cashier-1", tenant_id="profile-1", claims={"role": "cashier"}),
+            metadata={"scope_mode": "TERMINAL_LOCATION", "primary_structural_location_id": "struct-6"},
+        ),
+    )
+
+    assert "event=call_tool_start" in caplog.text
+    assert "sync_key=op=receive_purchase_order_items|struct=struct-6|leaf=leaf-6|entities=line_item_id:pol-9,purchase_order_id:po-5|digest=" in caplog.text
+    assert "structural_location_ids=[struct-6]" in caplog.text
+    assert "stock_location_ids=[leaf-6]" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -895,6 +1704,68 @@ async def test_run_mcp_session_logs_and_wraps_transport_failure(
     assert "operation=list_tools" in caplog.text
     assert "server_url=https://inventory.mcp.example/mcp" in caplog.text
     assert "header_names=[authorization]" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_mcp_session_returns_result_when_cleanup_connection_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from kafka_a2a import mcp_tools
+
+    class _AsyncClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self) -> "_AsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            _ = exc_type, exc, tb
+            return False
+
+    class _ClientSession:
+        def __init__(self, read_stream: Any, write_stream: Any) -> None:
+            _ = read_stream, write_stream
+
+        async def __aenter__(self) -> "_ClientSession":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            _ = exc_type, exc, tb
+            return False
+
+        async def initialize(self) -> None:
+            return None
+
+        async def list_tools(self) -> Any:
+            return {"tools": [{"name": "search_inventory_items"}]}
+
+    @asynccontextmanager
+    async def fake_streamable_http_client(server_url: str, http_client: Any = None) -> Any:
+        _ = server_url, http_client
+        yield object(), object(), None
+        raise RuntimeError("the connection is closed")
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "_require_mcp",
+        lambda: (SimpleNamespace(AsyncClient=_AsyncClient), _ClientSession, fake_streamable_http_client),
+    )
+
+    with caplog.at_level(logging.INFO, logger="kafka_a2a.mcp_tools"):
+        result = await mcp_tools._run_mcp_session(
+            server_url="https://inventory.mcp.example/mcp",
+            headers={"authorization": "Bearer secret"},
+            timeout_s=12.0,
+            operation="list_tools",
+            callback=lambda session: session.list_tools(),
+        )
+
+    assert result == {"tools": [{"name": "search_inventory_items"}]}
+    assert "event=session_success" in caplog.text
+    assert "event=session_cleanup_ignored" in caplog.text
+    assert "error=the connection is closed" in caplog.text
 
 
 @pytest.mark.asyncio

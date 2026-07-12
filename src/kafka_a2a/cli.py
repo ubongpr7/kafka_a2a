@@ -412,6 +412,9 @@ def _run_gateway(args: argparse.Namespace) -> None:
                 os.getenv("KA2A_GATEWAY_REQUEST_TIMEOUT_S"),
                 os.getenv("KA2A_REQUEST_TIMEOUT_S"),
             ),
+            stream_request_timeout_s=(
+                _parse_optional_timeout_s(os.getenv("KA2A_GATEWAY_STREAM_REQUEST_TIMEOUT_S")) or 120.0
+            ),
             jwt=jwt,
         )
     )

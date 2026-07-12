@@ -424,6 +424,7 @@ class Ka2aAgent:
                     sender=self.card.name,
                     recipient=env.sender,
                     payload=response.to_jsonrpc_dict(),
+                    **env.scope_fields(),
                 ),
                 key=str(env.correlation_id).encode("utf-8") if env.correlation_id is not None else None,
             )
@@ -443,6 +444,7 @@ class Ka2aAgent:
                 sender=self.card.name,
                 recipient=env.sender,
                 payload=response.to_jsonrpc_dict(),
+                **env.scope_fields(),
             ),
             key=str(req.id).encode("utf-8"),
         )
@@ -484,16 +486,11 @@ class Ka2aAgent:
                 await self._store.set_push_notification_config(
                     task_id=task.id, config=p.configuration.push_notification_config
                 )
-            processor_metadata = await self._processor_metadata_for_request(
-                task=task,
-                configuration=p.configuration,
-                request_metadata=request_metadata or None,
-            )
-            self._start_processing(
+            self._start_processing_after_preparation(
                 task=task,
                 message=p.message,
                 configuration=p.configuration,
-                metadata=processor_metadata,
+                request_metadata=request_metadata or None,
             )
             return task.model_dump(by_alias=True, exclude_none=True)
 
@@ -649,17 +646,25 @@ class Ka2aAgent:
                     include_task=False,
                 )
 
-            processor_metadata = await self._processor_metadata_for_request(
-                task=task,
-                configuration=p.configuration,
-                request_metadata=request_metadata or None,
-            )
-            self._start_processing(
-                task=task,
-                message=user_message,
-                configuration=p.configuration,
-                metadata=processor_metadata,
-            )
+            if method == METHOD_TASKS_CONTINUE_STREAM:
+                self._start_processing_after_preparation(
+                    task=task,
+                    message=user_message,
+                    configuration=p.configuration,
+                    request_metadata=request_metadata or None,
+                )
+            else:
+                processor_metadata = await self._processor_metadata_for_request(
+                    task=task,
+                    configuration=p.configuration,
+                    request_metadata=request_metadata or None,
+                )
+                self._start_processing(
+                    task=task,
+                    message=user_message,
+                    configuration=p.configuration,
+                    metadata=processor_metadata,
+                )
             updated = await self._store.get_task(task.id)
             assert updated is not None
             return updated.model_dump(by_alias=True, exclude_none=True)
@@ -994,6 +999,51 @@ class Ka2aAgent:
                 self._processing.pop(task.id, None)
 
         self._processing[task.id] = asyncio.create_task(_run())
+
+    def _start_processing_after_preparation(
+        self,
+        *,
+        task: Task,
+        message: Message,
+        configuration: TaskConfiguration | None,
+        request_metadata: dict[str, Any] | None,
+    ) -> None:
+        async def _prepare() -> None:
+            trace_id = trace_id_from_metadata(request_metadata)
+            try:
+                processor_metadata = await self._processor_metadata_for_request(
+                    task=task,
+                    configuration=configuration,
+                    request_metadata=request_metadata,
+                )
+                self._start_processing(
+                    task=task,
+                    message=message,
+                    configuration=configuration,
+                    metadata=processor_metadata,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "task_prepare_failed",
+                    extra={
+                        "agent": self.card.name,
+                        "taskId": task.id,
+                        "contextId": task.context_id,
+                        **({"traceId": trace_id} if trace_id else {}),
+                    },
+                )
+                failed_event = await self._store.append_status(
+                    task_id=task.id,
+                    status=TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(role=Role.agent, parts=[TextPart(text=str(exc))]),
+                    ),
+                )
+                self._enqueue_push(task_id=task.id, event=failed_event)
+
+        asyncio.create_task(_prepare())
 
     async def _begin_stream(
         self,

@@ -23,6 +23,11 @@ Routing guidance:
 - Product create/update/delete, bulk seeding, exports, variant administration -> product catalog admin specialist
 - Featured or quick-sale toggles, variant visibility, product attributes, media attachments -> product merchandising specialist
 - Price history, price trends, pricing rules, pricing strategies, purchase-price history, bulk price updates -> product pricing specialist
+- Route these named insight flows directly to product discovery:
+  - global catalog import opportunities
+  - variant lookup
+  - top catalog matches
+  - product performance or catalog gaps
 
 Response style:
 - Be concise and operational.

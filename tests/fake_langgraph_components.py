@@ -537,6 +537,7 @@ class FakeToolExecutor(ToolExecutor):
                                 "properties": {
                                     "inventory_item_id": {"type": "string"},
                                     "stock_location_id": {"type": "string"},
+                                    "structural_location_id": {"type": "string"},
                                     "reserved_quantity": {"type": "string"},
                                     "external_order_type": {"type": "string"},
                                     "external_order_id": {"type": "string"},
@@ -566,6 +567,7 @@ class FakeToolExecutor(ToolExecutor):
                                 "type": "object",
                                 "properties": {
                                     "transfers": {"type": "array"},
+                                    "structural_location_id": {"type": "string"},
                                     "reason": {"type": "string"},
                                     "notes": {"type": "string"},
                                 },
@@ -586,6 +588,7 @@ class FakeToolExecutor(ToolExecutor):
                                 "type": "object",
                                 "properties": {
                                     "adjustments": {"type": "array"},
+                                    "structural_location_id": {"type": "string"},
                                     "reason": {"type": "string"},
                                     "notes": {"type": "string"},
                                 },
@@ -1299,12 +1302,16 @@ class FakeToolExecutor(ToolExecutor):
                         "name": "Main Warehouse",
                         "location_type": "Warehouse",
                         "physical_address": "Lagos",
+                        "structural_location_id": "struct-1",
+                        "structural_location_name": "Main Warehouse",
                     },
                     {
                         "id": "loc-2",
                         "name": "Front Store",
                         "location_type": "Store",
                         "physical_address": "Abuja",
+                        "structural_location_id": "struct-2",
+                        "structural_location_name": "Front Store",
                     },
                 ],
             }

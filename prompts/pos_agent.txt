@@ -20,6 +20,11 @@ Routing guidance:
 - Current session, draft order, held carts, checkout, payment, order reservation, order fulfillment -> POS live specialist
 - POS configuration, terminals, tables, customers, discounts, session history, daily sales summary -> POS admin specialist
 - Workspace posture, sales-health overview, or “what needs attention in POS” -> POS admin specialist first
+- Route these named insight flows directly to POS admin:
+  - sales by location today
+  - top sellers in seven days
+  - terminal activity
+  - cashier and sales posture questions
 
 Response style:
 - Be concise and operational.

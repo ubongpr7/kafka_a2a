@@ -318,7 +318,12 @@ class AgentControlPlaneService:
             if refreshed:
                 state.tool_servers = updated_servers
                 self._cache_clear()
-                return self._store.save(state)
+                state = self._store.save(state)
+
+            seed_sync = self.sync_seed_catalog_from_seed()
+            if seed_sync.get("updated", 0) > 0:
+                self._cache_clear()
+                return self._store.load()
             return state
         state = build_seed_state(self._settings)
         return self._store.save(state)
@@ -459,15 +464,42 @@ class AgentControlPlaneService:
             exclude={"updated_at"},
         )
 
+    @staticmethod
+    def _workspace_seed_template_slugs(templates: list[AgentTemplate]) -> set[str]:
+        templates_by_slug = {
+            template.slug: template
+            for template in templates
+            if template.allow_workspace_installs
+        }
+        required = {
+            template.slug
+            for template in templates
+            if template.is_featured and template.allow_workspace_installs
+        }
+        pending = list(required)
+
+        while pending:
+            slug = pending.pop()
+            template = templates_by_slug.get(slug)
+            if template is None:
+                continue
+            runtime_metadata = ((template.metadata or {}).get("runtime") or {})
+            for downstream_slug in runtime_metadata.get("allowed_downstream_slugs") or []:
+                if not isinstance(downstream_slug, str):
+                    continue
+                normalized = downstream_slug.strip()
+                if not normalized or normalized in required or normalized not in templates_by_slug:
+                    continue
+                required.add(normalized)
+                pending.append(normalized)
+
+        return required
+
     def sync_seed_catalog_from_seed(self) -> dict[str, Any]:
         state = self._store.load()
         seeded_state = build_seed_state(self._settings)
         changes: list[dict[str, str]] = []
-        seeded_featured_template_slugs = {
-            template.slug
-            for template in seeded_state.templates
-            if template.is_featured and template.allow_workspace_installs
-        }
+        seeded_workspace_template_slugs = self._workspace_seed_template_slugs(seeded_state.templates)
 
         current_presets_by_key = {item.key: item for item in state.instruction_presets}
         updated_presets: list[object] = []
@@ -532,7 +564,7 @@ class AgentControlPlaneService:
                 if agent.profile == profile_id
             }
             for template in updated_templates:
-                if template.slug not in seeded_featured_template_slugs:
+                if template.slug not in seeded_workspace_template_slugs:
                     continue
                 if profile_agents.get(template.slug) is not None:
                     continue
@@ -1598,6 +1630,9 @@ class AgentControlPlaneService:
                 ai.tavily_api_key = _encrypt_secret(str(data.get("tavily_api_key") or "").strip())
         self._upsert_record("workspace_ai_settings", ai)
         self._cache_clear()
+        # A newly configured workspace should immediately receive the default
+        # featured agents that the runtime expects to expose.
+        self.sync_seed_catalog_from_seed()
         return self.get_workspace_ai_setup(profile_id=profile_id)
 
     def _parse_users_service_ai_settings_payload(
@@ -1864,12 +1899,11 @@ class AgentControlPlaneService:
 
     def resolve_workspace_tavily_api_key(self, *, profile_id: str) -> str:
         ai = self._get_workspace_ai_settings_record(profile_id=profile_id)
-        if ai is None:
-            return ""
-        api_key = _decrypt_secret(ai.tavily_api_key)
-        if api_key.startswith("gAAAA"):
-            return ""
-        return api_key
+        if ai is not None:
+            api_key = _decrypt_secret(ai.tavily_api_key)
+            if api_key and not api_key.startswith("gAAAA"):
+                return api_key
+        return _resolve_env_secret("TAVILY_API_KEY")
 
     def _workspace_agent_payloads(self, agents: list[WorkspaceAgent]) -> list[dict[str, Any]]:
         if not agents:
@@ -2188,7 +2222,7 @@ class AgentControlPlaneService:
         if not agents:
             return []
         payloads = self._workspace_agent_payloads(agents)
-        agents_by_slug = {agent.slug: agent for agent in agents}
+        agents_by_id = {agent.id: agent for agent in agents}
         connections_by_profile_and_server: dict[tuple[str, str], list[WorkspaceToolConnection]] = {}
         profile_ids = sorted({agent.profile for agent in agents})
         if profile_ids:
@@ -2204,8 +2238,8 @@ class AgentControlPlaneService:
                 if isinstance(template.metadata, dict):
                     template_runtime_by_id[template.id] = deepcopy(template.metadata.get("runtime") or {})
         for read_payload in payloads:
-            slug = str(read_payload.get("slug") or "").strip()
-            agent = agents_by_slug.get(slug)
+            agent_id = str(read_payload.get("id") or "").strip()
+            agent = agents_by_id.get(agent_id)
             if agent is None:
                 continue
             template_runtime = template_runtime_by_id.get(agent.source_template_id or "", {})

@@ -12,6 +12,12 @@ from typing import Any
 from urllib import parse
 from urllib import error, request
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from a2a_eval_corpus import GENERATED_SCENARIOS, GENERATED_SUITES
+
 
 DEFAULT_BASE_URL = "http://localhost:7006"
 DEFAULT_TIMEOUT_S = 240.0
@@ -51,6 +57,7 @@ class Scenario:
     area: str
     agent: str
     text: str
+    expect_all: tuple[str, ...] = ()
     expect_any: tuple[str, ...] = ()
     reject_any: tuple[str, ...] = ()
     continue_texts: tuple[str, ...] = ()
@@ -101,6 +108,7 @@ MARKET_READINESS_39: tuple[str, ...] = (
 
 SCENARIO_SUITES: dict[str, tuple[str, ...]] = {
     "market_readiness_39": MARKET_READINESS_39,
+    **GENERATED_SUITES,
 }
 
 
@@ -615,6 +623,7 @@ def _scenario_matrix() -> list[Scenario]:
             text="Search POS orders.",
             expect_any=("POS order", "No POS order", "no POS order"),
         ),
+        *[Scenario(**payload) for payload in GENERATED_SCENARIOS],
     ]
 
 
@@ -913,6 +922,9 @@ def _scenario_passed(result: dict[str, Any], scenario: Scenario) -> tuple[bool, 
     for rejected in scenario.reject_any:
         if rejected.lower() in full_text.lower():
             return False, f"rejected text matched: {rejected}"
+    missing_required = [expected for expected in scenario.expect_all if expected.lower() not in full_text.lower()]
+    if missing_required:
+        return False, f"missing required markers: {tuple(missing_required)}"
     if scenario.expect_any:
         for expected in scenario.expect_any:
             if expected.lower() in full_text.lower():

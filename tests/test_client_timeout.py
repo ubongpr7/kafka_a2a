@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
+from kafka_a2a.models import Message, TextPart
 from kafka_a2a.protocol import RpcResponse
 
 
@@ -47,3 +48,27 @@ async def test_call_with_timeout_still_times_out() -> None:
 
     with pytest.raises(asyncio.TimeoutError):
         await client.call(agent_name="host", method="ping", params={"ok": True})
+
+
+@pytest.mark.asyncio
+async def test_stream_message_allows_timeout_override() -> None:
+    client: Ka2aClient | None = None
+
+    async def _on_send(*, topic: str, envelope) -> None:
+        assert client is not None
+        await asyncio.sleep(0.02)
+        response = RpcResponse(id=str(envelope.correlation_id), result={"kind": "status-update", "status": {"state": "completed"}})
+        client._pending[str(envelope.correlation_id)].set_result(response)
+        await client._streams[str(envelope.correlation_id)].put(response)
+
+    transport = _FakeTransport(on_send=_on_send)
+    client = Ka2aClient(transport=transport, config=Ka2aClientConfig(client_id="test-client", request_timeout_s=0.01))
+
+    stream = await client.stream_message(
+        agent_name="host",
+        message=Message(role="user", parts=[TextPart(text="hello")]),
+        timeout_s=0.1,
+    )
+    first = await anext(stream)
+
+    assert first.status.state == "completed"

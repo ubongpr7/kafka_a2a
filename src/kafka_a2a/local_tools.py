@@ -7,7 +7,7 @@ import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Protocol, Union, get_args, get_origin
+from typing import Any, Dict, List, Protocol, Union, get_args, get_origin
 from uuid import uuid4
 
 from kafka_a2a.agent_filter import card_public_slug, filter_agent_cards
@@ -34,6 +34,7 @@ UTILITY_MODULES: tuple[str, ...] = (
     "kafka_a2a.utilities.mcp.advanced_interaction_tools",
     "kafka_a2a.utilities.mcp.extra_collab_tools",
     "kafka_a2a.utilities.mcp.helper_tools",
+    "kafka_a2a.utilities.mcp.insight_widget_tools",
 )
 
 QUERY_TOKEN_ALLOWLIST: set[str] = {"pos", "sku", "api", "ui"}
@@ -83,6 +84,20 @@ QUERY_TOKEN_STOPWORDS: set[str] = {
     "with",
     "you",
     "your",
+}
+
+GENERIC_ROUTER_PUBLIC_SLUGS: set[str] = {
+    "host",
+    "inventory",
+    "onboarding",
+    "pos",
+    "product",
+    "users",
+}
+
+GENERIC_ROUTER_PUBLIC_SLUG_LOOKUPS: set[str] = {
+    "".join(ch for ch in slug.lower() if ch.isalnum())
+    for slug in GENERIC_ROUTER_PUBLIC_SLUGS
 }
 
 
@@ -212,6 +227,62 @@ def _score_card(card: AgentCard, query: str) -> int:
             score += sum(1 for token in tokens if token in ex)
 
     return score
+
+
+def _preferred_agent_slugs_for_query(query: str) -> list[str]:
+    raw = (query or "").strip().lower()
+    token_text = " ".join(_query_tokens(query, max_tokens=24))
+    if not raw and not token_text:
+        return []
+
+    def _has(*phrases: str) -> bool:
+        return any(phrase in raw or phrase in token_text for phrase in phrases)
+
+    if _has("sales by location", "top sellers", "cashier performance", "payment mix", "sales summary"):
+        return ["pos_admin", "pos"]
+    if (
+        _has("today")
+        and _has("location", "locations", "branch", "branches")
+        and _has("sales", "revenue", "orders", "order count", "basket", "average basket", "gross sales")
+    ):
+        return ["pos_admin", "pos"]
+    if _has("terminal activity", "terminal health", "offline sync", "pos activity"):
+        return ["pos_admin", "pos_live", "pos"]
+    if _has("out-of-stock", "out of stock", "low stock", "stock risk", "reorder", "dashboard snapshot"):
+        return ["inventory_visibility", "inventory"]
+    if _has("receiving lifecycle", "receiving timeline", "po receiving", "purchase order activity", "receiving exceptions"):
+        return ["inventory_procurement", "inventory"]
+    if _has("staff activity", "support access audit", "permission security", "subscription usage", "subscription limits"):
+        return ["users"]
+    if _has("global catalog import", "catalog import opportunities", "variant lookup", "catalog gaps"):
+        return ["product_discovery", "product"]
+    return []
+
+
+def _match_preferred_agent(cards: list[AgentCard], query: str) -> AgentCard | None:
+    preferred_slugs = _preferred_agent_slugs_for_query(query)
+    if not preferred_slugs:
+        return None
+
+    cards_by_slug = {
+        _normalize_agent_lookup(card_public_slug(card)): card
+        for card in cards
+    }
+    cards_by_name = {
+        _normalize_agent_lookup(card.name): card
+        for card in cards
+    }
+
+    for preferred_slug in preferred_slugs:
+        normalized = _normalize_agent_lookup(preferred_slug)
+        card = cards_by_slug.get(normalized) or cards_by_name.get(normalized)
+        if card is not None:
+            return card
+    return None
+
+
+def _is_generic_router_card(card: AgentCard) -> bool:
+    return _normalize_agent_lookup(card_public_slug(card)) in GENERIC_ROUTER_PUBLIC_SLUG_LOOKUPS
 
 
 def _part_to_payload(part: Any) -> dict[str, Any]:
@@ -567,15 +638,26 @@ class KafkaDelegationBackend:
 
     def _select_agent(self, *, cards: list[AgentCard], request: str, agent_name: str | None) -> AgentCard:
         if agent_name:
+            matched_requested: AgentCard | None = None
             for card in cards:
                 if card.name == agent_name or _card_matches_requested_agent(card, agent_name):
-                    return card
+                    matched_requested = card
+                    break
+            if matched_requested is not None:
+                preferred = _match_preferred_agent(cards, request)
+                if preferred is not None and preferred.name != matched_requested.name and _is_generic_router_card(matched_requested):
+                    return preferred
+                return matched_requested
             raise RuntimeError(f"Requested agent '{agent_name}' is not registered.")
 
         if not cards:
             raise RuntimeError("No downstream specialist agents are registered.")
         if len(cards) == 1:
             return cards[0]
+
+        preferred = _match_preferred_agent(cards, request)
+        if preferred is not None:
+            return preferred
 
         scored = sorted(((card, _score_card(card, request)) for card in cards), key=lambda item: item[1], reverse=True)
         selected, score = scored[0]

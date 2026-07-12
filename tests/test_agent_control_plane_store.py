@@ -284,6 +284,31 @@ def test_service_lists_seeded_external_mcp_tool_servers(tmp_path: Path) -> None:
     assert google["metadata"]["provider"] == "Google"
 
 
+def test_ensure_seeded_refreshes_seed_catalog_tools(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    store = JsonAgentControlPlaneStore(settings.control_plane_store_path)
+    service = AgentControlPlaneService(store=store, settings=settings)
+
+    initial_state = service.ensure_seeded()
+    initial_tool_count = len(initial_state.tools)
+    assert initial_tool_count > 0
+    assert all(item.key != "products.test_agentic_tool_discovery" for item in initial_state.tools)
+
+    config_path = tmp_path / "mcp-tools-sync.json"
+    config = json.loads((settings.repo_root / "kafka_a2a" / "mcp-tools.local.json").read_text(encoding="utf-8"))
+    for server in config["agents"]["product_catalog_admin"]["servers"]:
+        if server.get("ref") == "products":
+            server["tools"].append("test_agentic_tool_discovery")
+            break
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    monkeypatch.setenv("KA2A_MCP_CONFIG_PATH", str(config_path))
+
+    refreshed_state = service.ensure_seeded()
+
+    assert len(refreshed_state.tools) == initial_tool_count + 1
+    assert any(item.key == "products.test_agentic_tool_discovery" for item in refreshed_state.tools)
+
+
 def test_service_sync_local_agent_transports_updates_seeded_templates_and_workspace_agents(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     store = JsonAgentControlPlaneStore(settings.control_plane_store_path)

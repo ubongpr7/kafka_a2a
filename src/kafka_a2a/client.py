@@ -43,7 +43,7 @@ from kafka_a2a.protocol import (
     TaskListParams,
     TaskQueryParams,
 )
-from kafka_a2a.transport.kafka import EnvelopeType, KafkaEnvelope, KafkaTransport, TopicNamer
+from kafka_a2a.transport.kafka import EnvelopeType, KafkaEnvelope, KafkaTransport, TopicNamer, _extract_envelope_scope_fields
 
 
 StreamResult = Task | Message | TaskStatusUpdateEvent | TaskArtifactUpdateEvent
@@ -183,13 +183,15 @@ class Ka2aClient:
         self._pending[request_id] = fut
 
         req = RpcRequest(id=request_id, method=method, params=params)
+        req_payload = req.model_dump(by_alias=True, exclude_none=True)
         env = KafkaEnvelope(
             type=EnvelopeType.request,
             correlation_id=request_id,
             sender=self.client_id,
             recipient=agent_name,
             reply_to=self.reply_topic,
-            payload=req.model_dump(by_alias=True, exclude_none=True),
+            payload=req_payload,
+            **_extract_envelope_scope_fields(req_payload),
         )
         await self._transport.send(topic=self._topics.agent_requests(agent_name), envelope=env)
 
@@ -342,6 +344,7 @@ class Ka2aClient:
         message: Message,
         configuration: TaskConfiguration | None = None,
         metadata: dict[str, Any] | None = None,
+        timeout_s: float | None = None,
     ) -> AsyncIterator[StreamResult]:
         request_id = str(uuid4())
         self._streams[request_id] = asyncio.Queue()
@@ -362,7 +365,7 @@ class Ka2aClient:
         )
         await self._transport.send(topic=self._topics.agent_requests(agent_name), envelope=env)
 
-        timeout = self._cfg.request_timeout_s
+        timeout = timeout_s if timeout_s is not None else self._cfg.request_timeout_s
         resp = await _await_with_optional_timeout(fut, timeout)
         if resp.error is not None:
             self._streams.pop(request_id, None)
@@ -442,6 +445,7 @@ class Ka2aClient:
         message: Message,
         configuration: TaskConfiguration | None = None,
         metadata: dict[str, Any] | None = None,
+        timeout_s: float | None = None,
     ) -> AsyncIterator[StreamResult]:
         request_id = str(uuid4())
         self._streams[request_id] = asyncio.Queue()
@@ -465,7 +469,7 @@ class Ka2aClient:
         )
         await self._transport.send(topic=self._topics.agent_requests(agent_name), envelope=env)
 
-        timeout = self._cfg.request_timeout_s
+        timeout = timeout_s if timeout_s is not None else self._cfg.request_timeout_s
         resp = await _await_with_optional_timeout(fut, timeout)
         if resp.error is not None:
             self._streams.pop(request_id, None)

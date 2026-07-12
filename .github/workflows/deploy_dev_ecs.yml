@@ -1,0 +1,273 @@
+name: Deploy Dev ECS
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-dev-ecs-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+      ECS_DEPLOY_TARGETS: ${{ secrets.ECS_DEPLOY_TARGETS }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      ECS_TASK_SUBNET_IDS: ${{ secrets.ECS_TASK_SUBNET_IDS }}
+      ECS_TASK_SECURITY_GROUP_IDS: ${{ secrets.ECS_TASK_SECURITY_GROUP_IDS }}
+      ECS_TASK_ASSIGN_PUBLIC_IP: ${{ secrets.ECS_TASK_ASSIGN_PUBLIC_IP }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Deploy Contract
+        run: |
+          test -f .aws/ecs/task-definitions.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path('.aws/ecs/task-definitions.json').read_text())
+          targets = manifest.get('targets')
+          if not isinstance(targets, dict) or not targets:
+              raise SystemExit('Manifest must define at least one ECS target.')
+
+          deploy_targets = json.loads(os.environ['ECS_DEPLOY_TARGETS'])
+          missing = [item['target'] for item in deploy_targets if item['target'] not in targets]
+          if missing:
+              raise SystemExit(f'Manifest is missing deploy targets: {missing}')
+          PY
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login To Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve Image And Build Settings
+        id: build_meta
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path('.aws/ecs/task-definitions.json').read_text())
+          build = manifest.get('build') or {}
+          dockerfile = str(build.get('dockerfile') or 'Dockerfile')
+          context = str(build.get('context') or '.')
+          args = build.get('args') or {}
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write(f'dockerfile={dockerfile}\n')
+              fh.write(f'context={context}\n')
+              fh.write(
+                  'build_args_b64=' +
+                  base64.b64encode(json.dumps(args, separators=(',', ':')).encode('utf-8')).decode('ascii') +
+                  '\n'
+              )
+          PY
+
+      - name: Ensure ECR Repository Exists
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null
+
+      - name: Check Existing Image Tag
+        id: image_check
+        run: |
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build And Push Image
+        if: steps.image_check.outputs.exists != 'true'
+        env:
+          IMAGE_URI: ${{ steps.build_meta.outputs.image_uri }}
+          DOCKERFILE: ${{ steps.build_meta.outputs.dockerfile }}
+          BUILD_CONTEXT: ${{ steps.build_meta.outputs.context }}
+          BUILD_ARGS_B64: ${{ steps.build_meta.outputs.build_args_b64 }}
+        run: |
+          python3 - <<'PY' > /tmp/build-args.txt
+          import base64
+          import json
+          import os
+
+          args = json.loads(base64.b64decode(os.environ['BUILD_ARGS_B64']).decode('utf-8')) if os.environ.get('BUILD_ARGS_B64') else {}
+          for key, value in args.items():
+              print(f'--build-arg={key}={value}')
+          PY
+          mapfile -t BUILD_ARGS < /tmp/build-args.txt
+          docker build -f "$DOCKERFILE" -t "$IMAGE_URI" "${BUILD_ARGS[@]}" "$BUILD_CONTEXT"
+          docker push "$IMAGE_URI"
+
+      - name: Reuse Existing Image
+        if: steps.image_check.outputs.exists == 'true'
+        run: echo "Using existing immutable image tag for ${GITHUB_SHA}"
+
+      - name: Register Task Definitions And Deploy
+        env:
+          IMAGE_URI: ${{ steps.build_meta.outputs.image_uri }}
+        run: |
+          python3 - <<'PY'
+          import copy
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          region = os.environ['AWS_REGION']
+          cluster = os.environ['ECS_CLUSTER']
+          image_uri = os.environ['IMAGE_URI']
+          deploy_targets = json.loads(os.environ['ECS_DEPLOY_TARGETS'])
+          manifest = json.loads(Path('.aws/ecs/task-definitions.json').read_text())
+          manifest_targets = manifest.get('targets') or {}
+          render_dir = Path('.aws/ecs/rendered')
+          render_dir.mkdir(parents=True, exist_ok=True)
+
+          target_map = {}
+          for item in deploy_targets:
+              target = item['target']
+              target_map[target] = item
+
+          def aws_json(*args: str) -> dict:
+              cmd = ['aws', *args, '--region', region, '--output', 'json']
+              return json.loads(subprocess.check_output(cmd, text=True))
+
+          def aws_text(*args: str) -> str:
+              cmd = ['aws', *args, '--region', region, '--output', 'text']
+              return subprocess.check_output(cmd, text=True).strip()
+
+          services = [item['service'] for item in deploy_targets]
+          described = aws_json('ecs', 'describe-services', '--cluster', cluster, '--services', *services)
+          failures = described.get('failures') or []
+          if failures:
+              raise SystemExit(f'Unable to describe ECS services: {json.dumps(failures)}')
+
+          services_by_name = {service['serviceName']: service for service in described['services']}
+          if len(services_by_name) != len(services):
+              missing = sorted(set(services) - set(services_by_name))
+              raise SystemExit(f'Missing ECS services in cluster {cluster}: {missing}')
+
+          registered_task_arns: dict[str, str] = {}
+          for target, target_info in target_map.items():
+              if target not in manifest_targets:
+                  raise SystemExit(f'Manifest missing target {target}')
+              spec = copy.deepcopy(manifest_targets[target])
+              for container in spec.get('containerDefinitions', []):
+                  container['image'] = image_uri
+              task_file = render_dir / f'{target}.json'
+              task_file.write_text(json.dumps(spec, indent=2) + '\n')
+              response = aws_json('ecs', 'register-task-definition', '--cli-input-json', f'file://{task_file}')
+              registered_task_arns[target] = response['taskDefinition']['taskDefinitionArn']
+              print(f'Registered {target}: {registered_task_arns[target]}')
+
+          migration = manifest.get('migration') or {}
+          migration_command = migration.get('command')
+          migration_target = migration.get('target')
+          migration_container_name = migration.get('container_name')
+
+          if migration_command:
+              if not migration_target or migration_target not in target_map:
+                  raise SystemExit(f'Invalid migration target: {migration_target}')
+              if not migration_container_name:
+                  raise SystemExit('Migration container_name must be set when migration command is present.')
+
+              target_service_name = target_map[migration_target]['service']
+              target_service = services_by_name[target_service_name]
+              network_configuration = {
+                  'awsvpcConfiguration': target_service['networkConfiguration']['awsvpcConfiguration']
+              }
+              overrides = {
+                  'containerOverrides': [
+                      {
+                          'name': migration_container_name,
+                          'command': migration_command,
+                      }
+                  ]
+              }
+              run_task = aws_json(
+                  'ecs',
+                  'run-task',
+                  '--cluster', cluster,
+                  '--task-definition', registered_task_arns[migration_target],
+                  '--launch-type', 'FARGATE',
+                  '--network-configuration', json.dumps(network_configuration, separators=(',', ':')),
+                  '--overrides', json.dumps(overrides, separators=(',', ':')),
+              )
+              failures = run_task.get('failures') or []
+              if failures:
+                  raise SystemExit(f'Migration task failed to start: {json.dumps(failures)}')
+              task_arn = run_task['tasks'][0]['taskArn']
+              subprocess.check_call([
+                  'aws', 'ecs', 'wait', 'tasks-stopped',
+                  '--cluster', cluster,
+                  '--tasks', task_arn,
+                  '--region', region,
+              ])
+              task_description = aws_json('ecs', 'describe-tasks', '--cluster', cluster, '--tasks', task_arn)
+              task = task_description['tasks'][0]
+              container_status = [
+                  {
+                      'name': container['name'],
+                      'exitCode': container.get('exitCode'),
+                      'reason': container.get('reason'),
+                      'lastStatus': container.get('lastStatus'),
+                  }
+                  for container in task.get('containers', [])
+              ]
+              migration_status = next((item for item in container_status if item['name'] == migration_container_name), None)
+              if migration_status is None:
+                  raise SystemExit(f'Migration container not found in task status: {json.dumps(container_status)}')
+              if migration_status['exitCode'] != 0:
+                  raise SystemExit(f'Migration task failed: {json.dumps(container_status)}')
+              unexpected_failures = [
+                  item for item in container_status
+                  if item['name'] != migration_container_name and item['exitCode'] not in (0, None, 137)
+              ]
+              if unexpected_failures:
+                  raise SystemExit(f'Migration sidecar task failed unexpectedly: {json.dumps(container_status)}')
+              print(f'Migration task succeeded for target {migration_target}: {task_arn}')
+          else:
+              print('No migration command configured; skipping one-off migration task.')
+
+          for target, target_info in target_map.items():
+              service_name = target_info['service']
+              task_definition_arn = registered_task_arns[target]
+              aws_json(
+                  'ecs', 'update-service',
+                  '--cluster', cluster,
+                  '--service', service_name,
+                  '--task-definition', task_definition_arn,
+                  '--force-new-deployment',
+              )
+              subprocess.check_call([
+                  'aws', 'ecs', 'wait', 'services-stable',
+                  '--cluster', cluster,
+                  '--services', service_name,
+                  '--region', region,
+              ])
+              print(f'Service stabilized: {service_name}')
+          PY

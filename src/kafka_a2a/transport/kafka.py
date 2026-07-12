@@ -26,6 +26,78 @@ def _to_camel(name: str) -> str:
     return parts[0] + "".join(word[:1].upper() + word[1:] for word in parts[1:])
 
 
+def _normalize_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _normalize_text_list(value: Any) -> list[str] | None:
+    if not isinstance(value, (list, tuple, set)):
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        normalized = _normalize_text(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out or None
+
+
+def _extract_envelope_scope_fields(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    candidates: list[dict[str, Any]] = [payload]
+    params = payload.get("params")
+    if isinstance(params, dict):
+        candidates.append(params)
+        metadata = params.get("metadata")
+        if isinstance(metadata, dict):
+            candidates.append(metadata)
+
+    def first_text(*keys: str) -> str | None:
+        for source in candidates:
+            for key in keys:
+                normalized = _normalize_text(source.get(key))
+                if normalized:
+                    return normalized
+        return None
+
+    def first_text_list(*keys: str) -> list[str] | None:
+        for source in candidates:
+            for key in keys:
+                normalized = _normalize_text_list(source.get(key))
+                if normalized:
+                    return normalized
+        return None
+
+    scope_fields: dict[str, Any] = {}
+    scope_mode = first_text("scope_mode", "scopeMode", "scope")
+    structural_location_id = first_text("structural_location_id", "structuralLocationId", "primary_structural_location_id")
+    structural_location_ids = first_text_list("structural_location_ids", "structuralLocationIds")
+    stock_location_id = first_text("stock_location_id", "stockLocationId")
+    sync_key = first_text("sync_key", "syncKey", "idempotency_key", "idempotencyKey")
+    entity_ids = first_text_list("entity_ids", "entityIds")
+
+    if scope_mode:
+        scope_fields["scope_mode"] = scope_mode
+    if structural_location_id:
+        scope_fields["structural_location_id"] = structural_location_id
+    if structural_location_ids:
+        scope_fields["structural_location_ids"] = structural_location_ids
+    if stock_location_id:
+        scope_fields["stock_location_id"] = stock_location_id
+    if sync_key:
+        scope_fields["sync_key"] = sync_key
+    if entity_ids:
+        scope_fields["entity_ids"] = entity_ids
+    return scope_fields
+
+
 class Ka2aWireModel(BaseModel):
     model_config = ConfigDict(
         alias_generator=_to_camel,
@@ -57,7 +129,29 @@ class KafkaEnvelope(Ka2aWireModel):
     reply_to: str | None = None
     created_at: datetime = Field(default_factory=_utc_now)
     content_type: str = "application/json"
+    scope_mode: str | None = None
+    structural_location_id: str | None = None
+    structural_location_ids: list[str] | None = None
+    stock_location_id: str | None = None
+    sync_key: str | None = None
+    entity_ids: list[str] | None = None
     payload: Any
+
+    def scope_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        if self.scope_mode:
+            fields["scope_mode"] = self.scope_mode
+        if self.structural_location_id:
+            fields["structural_location_id"] = self.structural_location_id
+        if self.structural_location_ids:
+            fields["structural_location_ids"] = list(self.structural_location_ids)
+        if self.stock_location_id:
+            fields["stock_location_id"] = self.stock_location_id
+        if self.sync_key:
+            fields["sync_key"] = self.sync_key
+        if self.entity_ids:
+            fields["entity_ids"] = list(self.entity_ids)
+        return fields
 
     def to_bytes(self) -> bytes:
         return dumps(self)
@@ -76,6 +170,18 @@ def _parse_bool(value: str | None, *, default: bool = False) -> bool:
     if value in ("0", "false", "no", "n", "off"):
         return False
     return default
+
+
+def _parse_int(value: str | None, *, default: int, minimum: int | None = None) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        return max(minimum, parsed)
+    return parsed
 
 
 @dataclass(slots=True)
@@ -395,11 +501,33 @@ class KafkaTransport:
         auto_offset_reset: str = "latest",
         enable_auto_commit: bool = True,
     ) -> AIOKafkaConsumer:
+        session_timeout_ms = _parse_int(os.getenv("KA2A_KAFKA_SESSION_TIMEOUT_MS"), default=45000, minimum=6000)
+        heartbeat_interval_ms = _parse_int(os.getenv("KA2A_KAFKA_HEARTBEAT_INTERVAL_MS"), default=15000, minimum=1000)
+        if heartbeat_interval_ms >= session_timeout_ms:
+            heartbeat_interval_ms = max(1000, session_timeout_ms // 3)
         return AIOKafkaConsumer(
             *topics,
             group_id=group_id,
             auto_offset_reset=auto_offset_reset,
             enable_auto_commit=enable_auto_commit,
+            auto_commit_interval_ms=_parse_int(
+                os.getenv("KA2A_KAFKA_AUTO_COMMIT_INTERVAL_MS"),
+                default=30000,
+                minimum=1000,
+            ),
+            heartbeat_interval_ms=heartbeat_interval_ms,
+            session_timeout_ms=session_timeout_ms,
+            max_poll_interval_ms=_parse_int(
+                os.getenv("KA2A_KAFKA_MAX_POLL_INTERVAL_MS"),
+                default=600000,
+                minimum=session_timeout_ms,
+            ),
+            request_timeout_ms=_parse_int(
+                os.getenv("KA2A_KAFKA_REQUEST_TIMEOUT_MS"),
+                default=60000,
+                minimum=session_timeout_ms,
+            ),
+            retry_backoff_ms=_parse_int(os.getenv("KA2A_KAFKA_RETRY_BACKOFF_MS"), default=500, minimum=100),
             **self._config.aiokafka_kwargs(),
         )
 

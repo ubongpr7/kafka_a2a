@@ -32,6 +32,38 @@
       "auth": {
         "mode": "forward_bearer"
       }
+    },
+    {
+      "id": "audit",
+      "serverUrl": "https://audit.mcp.interaims.com/mcp/",
+      "toolNamePrefix": "audit.",
+      "auth": {
+        "mode": "forward_bearer"
+      }
+    },
+    {
+      "id": "notifications",
+      "serverUrl": "https://notifications.mcp.interaims.com/mcp/",
+      "toolNamePrefix": "notifications.",
+      "auth": {
+        "mode": "forward_bearer"
+      }
+    },
+    {
+      "id": "subscriptions",
+      "serverUrl": "https://subscriptions.mcp.interaims.com/mcp/",
+      "toolNamePrefix": "subscriptions.",
+      "auth": {
+        "mode": "forward_bearer"
+      }
+    },
+    {
+      "id": "purchasing",
+      "serverUrl": "https://inventory.mcp.interaims.com/mcp/",
+      "toolNamePrefix": "purchasing.",
+      "auth": {
+        "mode": "forward_bearer"
+      }
     }
   ],
   "agents": {
@@ -89,7 +121,92 @@
             "remove_company_staff",
             "list_company_roles",
             "list_company_groups",
+            "get_staff_profile",
+            "get_role_assignments",
             "get_staff_permissions_summary"
+          ]
+        },
+        {
+          "ref": "audit",
+          "tools": [
+            "search_events",
+            "get_event_timeline",
+            "get_staff_activity",
+            "get_permission_security_activity"
+          ]
+        },
+        {
+          "ref": "subscriptions",
+          "tools": [
+            "get_usage_and_limits"
+          ]
+        }
+      ]
+    },
+    "host": {
+      "servers": [
+        {
+          "ref": "pos",
+          "tools": [
+            "get_sales_summary",
+            "get_top_sellers",
+            "get_product_sales_trend",
+            "get_pos_daily_summary",
+            "get_terminal_activity"
+          ]
+        },
+        {
+          "ref": "inventory",
+          "tools": [
+            "get_stock_risk",
+            "get_stock_analytics",
+            "get_reorder_candidates",
+            "get_stock_movements",
+            "search_stock_locations",
+            "search_purchase_orders",
+            "get_purchase_order_analytics"
+          ]
+        },
+        {
+          "ref": "products",
+          "tools": [
+            "search_product_variants",
+            "get_product_dashboard_stats",
+            "get_product_stock_alerts",
+            "get_variant_lookup",
+            "get_top_catalog_matches"
+          ]
+        },
+        {
+          "ref": "audit",
+          "tools": [
+            "search_events",
+            "get_event_timeline",
+            "get_staff_activity",
+            "get_product_activity",
+            "get_pos_activity",
+            "get_purchase_order_activity",
+            "get_realtime_dashboard_snapshot",
+            "get_permission_security_activity"
+          ]
+        },
+        {
+          "ref": "notifications",
+          "tools": [
+            "get_alert_summary"
+          ]
+        },
+        {
+          "ref": "purchasing",
+          "tools": [
+            "get_po_pipeline",
+            "get_receiving_exceptions"
+          ]
+        },
+        {
+          "ref": "subscriptions",
+          "tools": [
+            "get_usage_and_limits"
           ]
         }
       ]
@@ -109,7 +226,16 @@
           "get_product_attributes",
           "get_product_attribute_values",
           "get_product_dashboard_stats",
-          "get_product_stock_alerts"
+          "get_product_stock_alerts",
+          "get_variant_lookup",
+          "get_top_catalog_matches"
+        ]
+      },
+      {
+        "ref": "audit",
+        "tools": [
+          "get_product_activity",
+          "get_event_timeline"
         ]
       }
       ]
@@ -216,10 +342,27 @@
             "search_stock_serials",
             "search_stock_reservations",
             "search_stock_movements",
+            "get_stock_movements",
             "get_stock_analytics",
+            "get_stock_risk",
+            "get_reorder_candidates",
             "get_inventory_item_tracking_history",
             "search_expiring_inventory_items",
             "search_low_inventory_items"
+          ]
+        },
+        {
+          "ref": "audit",
+          "tools": [
+            "search_events",
+            "get_event_timeline",
+            "get_realtime_dashboard_snapshot"
+          ]
+        },
+        {
+          "ref": "notifications",
+          "tools": [
+            "get_alert_summary"
           ]
         }
       ]
@@ -276,6 +419,20 @@
             "remove_purchase_order_line_item",
             "download_purchase_order_pdf",
             "resend_purchase_order_email"
+          ]
+        },
+        {
+          "ref": "purchasing",
+          "tools": [
+            "get_po_pipeline",
+            "get_receiving_exceptions"
+          ]
+        },
+        {
+          "ref": "audit",
+          "tools": [
+            "get_purchase_order_activity",
+            "get_event_timeline"
           ]
         }
       ]
@@ -351,6 +508,13 @@
             "search_pos_customers",
             "search_pos_tables"
           ]
+        },
+        {
+          "ref": "audit",
+          "tools": [
+            "get_pos_activity",
+            "get_event_timeline"
+          ]
         }
       ]
     },
@@ -367,6 +531,10 @@
             "search_pos_discounts",
             "list_pos_sessions",
             "get_pos_session_details",
+            "get_sales_summary",
+            "get_top_sellers",
+            "get_product_sales_trend",
+            "get_terminal_activity",
             "create_pos_configuration",
             "update_pos_configuration",
             "create_pos_terminal",
@@ -377,6 +545,13 @@
             "update_pos_table",
             "create_pos_discount",
             "update_pos_discount"
+          ]
+        },
+        {
+          "ref": "audit",
+          "tools": [
+            "get_pos_activity",
+            "get_event_timeline"
           ]
         }
       ]

@@ -17,7 +17,7 @@ from kafka_a2a.models import (
     TaskStatus,
     TaskStatusUpdateEvent,
 )
-from kafka_a2a.runtime.task_store import TaskEventRecord
+from kafka_a2a.runtime.task_store import TaskEventRecord, extract_task_scope_metadata
 
 
 def _require_redis() -> Any:
@@ -229,6 +229,7 @@ class RedisTaskStore:
         task = await self.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
+        scope_metadata = extract_task_scope_metadata(task.metadata)
 
         if status.message is not None:
             status.message.task_id = status.message.task_id or task_id
@@ -250,6 +251,7 @@ class RedisTaskStore:
                 TaskState.input_required,
                 TaskState.auth_required,
             ),
+            metadata=scope_metadata or None,
         )
         task.status = status
 
@@ -267,8 +269,14 @@ class RedisTaskStore:
         task = await self.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
+        scope_metadata = extract_task_scope_metadata(task.metadata)
 
-        event = TaskArtifactUpdateEvent(task_id=task_id, context_id=task.context_id, artifact=artifact)
+        event = TaskArtifactUpdateEvent(
+            task_id=task_id,
+            context_id=task.context_id,
+            artifact=artifact,
+            metadata=scope_metadata or None,
+        )
         task.artifacts.append(artifact)
 
         seq = int(await self._redis.incr(self._seq_key(task_id)))

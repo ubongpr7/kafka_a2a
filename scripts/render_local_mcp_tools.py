@@ -13,6 +13,10 @@ LOCAL_SERVER_URLS = {
     "products": "http://product_mcp:8000/mcp/",
     "inventory": "http://inventory_mcp:8000/mcp/",
     "pos": "http://pos_mcp:8000/mcp/",
+    "audit": "http://audit_mcp:8000/mcp/",
+    "notifications": "http://notifications_mcp:8000/mcp/",
+    "subscriptions": "http://subscriptions_mcp:8000/mcp/",
+    "purchasing": "http://inventory_mcp:8000/mcp/",
 }
 
 

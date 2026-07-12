@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import json
 import importlib
+import logging
 import os
 import re
+from calendar import monthrange
 from collections.abc import AsyncIterator, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, TypedDict
+from urllib.parse import quote
 
 from kafka_a2a.context_memory import ContextMemory, ContextMemoryStore, InMemoryContextMemoryStore, RedisContextMemoryStore
 from kafka_a2a.memory import KA2A_CONVERSATION_HISTORY_METADATA_KEY
@@ -32,6 +36,8 @@ from kafka_a2a.prompts import resolve_system_prompt_from_env
 from kafka_a2a.settings import Ka2aSettings
 from kafka_a2a.tenancy import extract_principal
 from kafka_a2a.tools import ToolContext, ToolExecutor, ToolSpec
+
+logger = logging.getLogger(__name__)
 
 
 def _require_lang() -> Any:
@@ -85,13 +91,16 @@ def _render_tool_prompt_block(tools: list[ToolSpec]) -> str:
         + "- Use tools only when they are necessary to complete the user's request.\n"
         + "- For greetings or small talk, answer normally in plain text.\n"
         + "- If the user asks what you can do, what help is available, or wants a list of options to choose from, prefer an interaction tool such as create_multiple_choice.\n"
-        + "- Use interaction/formatting tools only when the frontend needs structured UI such as a form, selection, confirmation, wizard, or table.\n"
+        + "- For read-only analytics, summaries, timelines, dashboards, risks, or comparisons, prefer render_* widget tools plus create_insight_response instead of long prose.\n"
+        + "- Use interaction/formatting tools only when the frontend needs structured UI such as a form, selection, confirmation, wizard, table, or insight widget.\n"
+        + "- Keep insight responses widget-first and prose-light. The summary should be one sentence or less.\n"
+        + "- Never perform a mutation without an explicit confirmation tool step first.\n"
         + "- If you need a tool, respond with STRICT JSON only (no markdown).\n"
         + '- Output MUST be either a single object or a list of objects shaped like: {"kind":"tool-call","name":"...","arguments":{...}}.\n'
         + '- Never output bare tool names or pseudo-tool JSON such as {"kind":"list_available_agents"} or {"kind":"create_dynamic_form"}.\n'
         + '- Never output legacy wrappers such as {"tool_code":"..."} or print(create_multiple_choice(...)) or print(delegate_to_agent(...)).\n'
         + "- You may call multiple tools in one response.\n"
-        + "- After tool results are provided, respond normally with your final answer unless the tool itself is a deliberate frontend interaction payload.\n"
+        + "- After tool results are provided, respond normally with your final answer unless the tool result is already a deliberate frontend interaction payload or insight_response.\n"
         + _render_relation_prompt_block(tools)
     )
 
@@ -233,6 +242,924 @@ def _normalize_user_text(value: str) -> str:
     return " ".join(text.split())
 
 
+def _text_matches_all_terms(text: str, *patterns: str) -> bool:
+    if not text:
+        return False
+    return all(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+class InsightTimeWindow(TypedDict):
+    start_date: str
+    end_date: str
+    anchor_date: str
+    days: int
+    label: str
+    period: str
+
+
+_NUMBER_WORDS: dict[str, int] = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+_MONTH_NAME_TO_NUMBER: dict[str, int] = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+_QUARTER_WORD_TO_NUMBER: dict[str, int] = {
+    "q1": 1,
+    "first": 1,
+    "1st": 1,
+    "q2": 2,
+    "second": 2,
+    "2nd": 2,
+    "q3": 3,
+    "third": 3,
+    "3rd": 3,
+    "q4": 4,
+    "fourth": 4,
+    "4th": 4,
+}
+
+
+def _parse_relative_count(raw_value: str | None) -> int | None:
+    value = str(raw_value or "").strip().lower()
+    if not value:
+        return None
+    if value.isdigit():
+        return max(1, int(value))
+    return _NUMBER_WORDS.get(value)
+
+
+def _parse_iso_date(raw_value: str | None) -> date | None:
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).date()
+    except ValueError:
+        return None
+
+
+def _month_label(month_number: int) -> str:
+    return date(2000, month_number, 1).strftime("%B")
+
+
+def _calendar_window_for_named_month(*, month_name: str, year_value: str) -> tuple[date, date, str] | None:
+    month_number = _MONTH_NAME_TO_NUMBER.get(str(month_name or "").strip().lower())
+    if month_number is None:
+        return None
+    try:
+        year = int(str(year_value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    start = date(year, month_number, 1)
+    end = date(year, month_number, monthrange(year, month_number)[1])
+    return start, end, f"{_month_label(month_number)} {year}"
+
+
+def _calendar_window_for_named_quarter(*, quarter_token: str, year_value: str) -> tuple[date, date, str] | None:
+    normalized_token = str(quarter_token or "").strip().lower().replace(" quarter", "")
+    quarter_number = _QUARTER_WORD_TO_NUMBER.get(normalized_token)
+    if quarter_number is None:
+        return None
+    try:
+        year = int(str(year_value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    start_month = ((quarter_number - 1) * 3) + 1
+    start = date(year, start_month, 1)
+    end_month = start_month + 2
+    end = date(year, end_month, monthrange(year, end_month)[1])
+    return start, end, f"Q{quarter_number} {year}"
+
+
+def _days_for_time_unit(count: int, unit: str) -> int:
+    normalized_unit = str(unit or "").strip().lower()
+    if normalized_unit == "day":
+        return max(1, count)
+    if normalized_unit == "week":
+        return max(1, count * 7)
+    if normalized_unit == "month":
+        return max(1, count * 30)
+    if normalized_unit == "year":
+        return max(1, count * 365)
+    if normalized_unit == "quarter":
+        return max(1, count * 90)
+    return max(1, count)
+
+
+def _start_of_month(target_date: date) -> date:
+    return target_date.replace(day=1)
+
+
+def _end_of_month(target_date: date) -> date:
+    return target_date.replace(day=monthrange(target_date.year, target_date.month)[1])
+
+
+def _start_of_year(target_date: date) -> date:
+    return target_date.replace(month=1, day=1)
+
+
+def _end_of_year(target_date: date) -> date:
+    return target_date.replace(month=12, day=31)
+
+
+def _start_of_quarter(target_date: date) -> date:
+    quarter_month = ((target_date.month - 1) // 3) * 3 + 1
+    return target_date.replace(month=quarter_month, day=1)
+
+
+def _end_of_quarter(target_date: date) -> date:
+    start = _start_of_quarter(target_date)
+    end_month = start.month + 2
+    return date(start.year, end_month, monthrange(start.year, end_month)[1])
+
+
+def _shift_calendar_months(base_date: date, months: int) -> date:
+    month_index = (base_date.month - 1) + months
+    year = base_date.year + (month_index // 12)
+    month = (month_index % 12) + 1
+    day = min(base_date.day, monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _calendar_window_for_recent_period(today: date, count: int, unit: str) -> tuple[date, date] | None:
+    normalized_unit = str(unit or "").strip().lower()
+    if normalized_unit == "month":
+        start = _start_of_month(_shift_calendar_months(today, -(count - 1)))
+        return start, today
+    if normalized_unit == "quarter":
+        start = _start_of_quarter(_shift_calendar_months(_start_of_quarter(today), -((count - 1) * 3)))
+        return start, today
+    if normalized_unit == "year":
+        start = date(today.year - (count - 1), 1, 1)
+        return start, today
+    return None
+
+
+def _calendar_window_for_previous_period(today: date, unit: str) -> tuple[date, date] | None:
+    normalized_unit = str(unit or "").strip().lower()
+    if normalized_unit == "month":
+        anchor = _shift_calendar_months(today, -1)
+        return _start_of_month(anchor), _end_of_month(anchor)
+    if normalized_unit == "quarter":
+        anchor = _shift_calendar_months(_start_of_quarter(today), -3)
+        return _start_of_quarter(anchor), _end_of_quarter(anchor)
+    if normalized_unit == "year":
+        year = today.year - 1
+        return date(year, 1, 1), date(year, 12, 31)
+    return None
+
+
+def _calendar_window_for_ago_period(today: date, count: int, unit: str) -> tuple[date, date] | None:
+    normalized_unit = str(unit or "").strip().lower()
+    if normalized_unit == "month":
+        anchor = _shift_calendar_months(today, -count)
+        return _start_of_month(anchor), _end_of_month(anchor)
+    if normalized_unit == "quarter":
+        anchor = _shift_calendar_months(_start_of_quarter(today), -(count * 3))
+        return _start_of_quarter(anchor), _end_of_quarter(anchor)
+    if normalized_unit == "year":
+        year = today.year - count
+        return date(year, 1, 1), date(year, 12, 31)
+    return None
+
+
+def _build_time_window(*, start: date, end: date, label: str) -> InsightTimeWindow:
+    if end < start:
+        start, end = end, start
+    days = max(1, (end - start).days + 1)
+    return {
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "anchor_date": end.isoformat(),
+        "days": days,
+        "label": label,
+        "period": f"{days}d",
+    }
+
+
+def _resolve_insight_time_window(
+    text: str,
+    *,
+    default_days: int,
+    default_label: str,
+) -> InsightTimeWindow:
+    normalized = _normalize_user_text(text)
+    today = datetime.now(timezone.utc).date()
+    if not normalized:
+        return _build_time_window(
+            start=today - timedelta(days=max(0, default_days - 1)),
+            end=today,
+            label=default_label,
+        )
+
+    if "today" in normalized:
+        return _build_time_window(start=today, end=today, label="today")
+    if "yesterday" in normalized:
+        target_date = today - timedelta(days=1)
+        return _build_time_window(start=target_date, end=target_date, label="yesterday")
+
+    if "this week" in normalized:
+        start = today - timedelta(days=today.weekday())
+        return _build_time_window(start=start, end=today, label="this week")
+    if "this month" in normalized:
+        start = today.replace(day=1)
+        return _build_time_window(start=start, end=today, label="this month")
+    if "this quarter" in normalized:
+        start = _start_of_quarter(today)
+        return _build_time_window(start=start, end=today, label="this quarter")
+    if "this year" in normalized:
+        start = _start_of_year(today)
+        return _build_time_window(start=start, end=today, label="this year")
+    if any(token in normalized for token in ("all time", "of all time", "ever", "historical", "historically", "lifetime")):
+        return _build_time_window(start=today - timedelta(days=3650), end=today, label="all time")
+
+    explicit_range_match = re.search(
+        r"\b(?:from|between)\s+(\d{4}-\d{2}-\d{2})\s+(?:to|and)\s+(\d{4}-\d{2}-\d{2})\b",
+        normalized,
+    )
+    if explicit_range_match:
+        start = _parse_iso_date(explicit_range_match.group(1))
+        end = _parse_iso_date(explicit_range_match.group(2))
+        if start is not None and end is not None:
+            return _build_time_window(start=start, end=end, label=f"{start.isoformat()} to {end.isoformat()}")
+
+    named_month_match = re.search(
+        r"\b(?:in|for|during)\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{4})\b",
+        normalized,
+    )
+    if named_month_match:
+        month_window = _calendar_window_for_named_month(
+            month_name=named_month_match.group(1),
+            year_value=named_month_match.group(2),
+        )
+        if month_window is not None:
+            return _build_time_window(start=month_window[0], end=month_window[1], label=month_window[2])
+
+    named_quarter_match = re.search(
+        r"\b(?:in|for|during)\s+(q[1-4]|first(?:\s+quarter)?|1st(?:\s+quarter)?|second(?:\s+quarter)?|2nd(?:\s+quarter)?|third(?:\s+quarter)?|3rd(?:\s+quarter)?|fourth(?:\s+quarter)?|4th(?:\s+quarter)?)\s+(\d{4})\b",
+        normalized,
+    )
+    if named_quarter_match:
+        quarter_window = _calendar_window_for_named_quarter(
+            quarter_token=named_quarter_match.group(1),
+            year_value=named_quarter_match.group(2),
+        )
+        if quarter_window is not None:
+            return _build_time_window(start=quarter_window[0], end=quarter_window[1], label=quarter_window[2])
+
+    count_match = re.search(
+        r"\b(last|previous|past|over the past|for the past|in the past)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(day|week|month|quarter|year)s?\b",
+        normalized,
+    )
+    if count_match:
+        prefix = str(count_match.group(1) or "last").strip().lower()
+        count = _parse_relative_count(count_match.group(2)) or 1
+        unit = str(count_match.group(3) or "day")
+        if prefix in {"last", "previous"} and unit in {"month", "quarter", "year"}:
+            calendar_window = _calendar_window_for_recent_period(today, count, unit)
+            if calendar_window is not None:
+                return _build_time_window(
+                    start=calendar_window[0],
+                    end=calendar_window[1],
+                    label=f"last {count} {unit}{'' if count == 1 else 's'}",
+                )
+        days = _days_for_time_unit(count, unit)
+        return _build_time_window(
+            start=today - timedelta(days=max(0, days - 1)),
+            end=today,
+            label=f"last {count} {unit}{'' if count == 1 else 's'}",
+        )
+
+    simple_match = re.search(r"\b(past|last|previous)\s+(day|week|month|quarter|year)\b", normalized)
+    if simple_match:
+        prefix = str(simple_match.group(1) or "last").strip().lower()
+        unit = str(simple_match.group(2) or "day")
+        if prefix in {"last", "previous"} and unit in {"month", "quarter", "year"}:
+            calendar_window = _calendar_window_for_previous_period(today, unit)
+            if calendar_window is not None:
+                label = "last quarter" if unit == "quarter" else f"last {unit}"
+                return _build_time_window(
+                    start=calendar_window[0],
+                    end=calendar_window[1],
+                    label=label,
+                )
+        days = _days_for_time_unit(1, unit)
+        label = "last quarter" if unit == "quarter" else f"last {unit}"
+        return _build_time_window(
+            start=today - timedelta(days=max(0, days - 1)),
+            end=today,
+            label=label,
+        )
+
+    ago_match = re.search(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(day|week|month|quarter|year)s?\s+ago\b",
+        normalized,
+    )
+    if ago_match:
+        count = _parse_relative_count(ago_match.group(1)) or 1
+        unit = str(ago_match.group(2) or "day")
+        if unit in {"month", "quarter", "year"}:
+            calendar_window = _calendar_window_for_ago_period(today, count, unit)
+            if calendar_window is not None:
+                return _build_time_window(
+                    start=calendar_window[0],
+                    end=calendar_window[1],
+                    label=f"{count} {unit}{'' if count == 1 else 's'} ago",
+                )
+        anchor = today - timedelta(days=_days_for_time_unit(count, unit))
+        days = 1 if unit == "day" else _days_for_time_unit(1, unit)
+        return _build_time_window(
+            start=anchor - timedelta(days=max(0, days - 1)),
+            end=anchor,
+            label=f"{count} {unit}{'' if count == 1 else 's'} ago",
+        )
+
+    seven_day_match = re.search(r"\b(seven|7)\s+days?\b", normalized)
+    if seven_day_match:
+        return _build_time_window(
+            start=today - timedelta(days=6),
+            end=today,
+            label="last 7 days",
+        )
+
+    return _build_time_window(
+        start=today - timedelta(days=max(0, default_days - 1)),
+        end=today,
+        label=default_label,
+    )
+
+
+def _strong_domain_agent_override(query: str) -> str | None:
+    text = _normalize_user_text(query)
+    if not text:
+        return None
+    if any(token in text for token in ("sales", "revenue", "order count", "orders made", "gross sales", "avg basket")):
+        return "pos"
+    if _text_matches_all_terms(text, r"\bsales?\b", r"\blocation\b"):
+        return "pos"
+    if _text_matches_all_terms(text, r"\b(top|best)\s+sellers?\b"):
+        return "pos"
+    if _text_matches_all_terms(text, r"\bout[\s-]*of[\s-]*stock\b", r"\bproducts?\b"):
+        return "inventory"
+    if _text_matches_all_terms(text, r"\bstaff\b", r"\bactivity\b"):
+        return "users"
+    if _text_matches_all_terms(text, r"\bsupport\b", r"\baccess\b", r"\baudit\b"):
+        return "users"
+    if _text_matches_all_terms(text, r"\bsubscription\b", r"\b(usage|limit|limits)\b"):
+        return "users"
+    if _text_matches_all_terms(text, r"\b(global|catalog)\b", r"\bimport\b"):
+        return "product"
+    if _text_matches_all_terms(text, r"\b(purchase order|po)\b", r"\b(receiving|lifecycle|timeline)\b"):
+        return "inventory"
+    return None
+
+
+def _latest_history_insight_payload(history: Any) -> dict[str, Any] | None:
+    payloads = _history_insight_payloads(history)
+    return payloads[-1] if payloads else None
+
+
+def _history_insight_payloads(history: Any) -> list[dict[str, Any]]:
+    if not isinstance(history, list):
+        return []
+    payloads: list[dict[str, Any]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"assistant", "agent", "ai"}:
+            continue
+        for key in ("structured_payload", "structuredPayload", "payload", "data"):
+            payload_candidate = item.get(key)
+            if isinstance(payload_candidate, dict):
+                if str(payload_candidate.get("kind") or "").strip() == "insight_response":
+                    payloads.append(payload_candidate)
+                    break
+                nested = payload_candidate.get("structured_payload")
+                if isinstance(nested, dict) and str(nested.get("kind") or "").strip() == "insight_response":
+                    payloads.append(nested)
+                    break
+        else:
+            content = item.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            try:
+                payload = json.loads(content)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and str(payload.get("kind") or "").strip() == "insight_response":
+                payloads.append(payload)
+                continue
+            if isinstance(payload, dict):
+                nested = payload.get("structured_payload") or payload.get("payload") or payload.get("data")
+                if isinstance(nested, dict) and str(nested.get("kind") or "").strip() == "insight_response":
+                    payloads.append(nested)
+    return payloads
+
+
+def _payload_search_text(payload: dict[str, Any]) -> str:
+    try:
+        return json.dumps(payload, default=str).lower()
+    except Exception:
+        return str(payload).lower()
+
+
+def _select_history_insight_payload(user_text: str, history: Any) -> dict[str, Any] | None:
+    payloads = _history_insight_payloads(history)
+    if not payloads:
+        return None
+    text = _normalize_user_text(user_text)
+    wants_business = any(term in text for term in ("business", "analyst", "analysis", "analyze", "analyse", "entire system", "whole system", "owner review", "first analysis", "first review"))
+    wants_comparison = any(term in text for term in ("comparison", "compare", "product comparison", "variant comparison")) or (
+        any(term in text for term in ("product", "variant"))
+        and any(term in text for term in ("revenue", "sales", "units", "quantity", "orders", "generated", "sold", "leader", "led", "best"))
+    )
+    wants_procurement = any(term in text for term in ("purchase order", "procurement", "po ", "receiving", "supplier"))
+    wants_staff = any(term in text for term in ("staff", "audit", "activity", "user"))
+
+    if wants_business:
+        terms = ("business analyst review", "recommended owner actions", "revenue posture", "entire system")
+    elif wants_comparison:
+        terms = ("product comparison table", "product revenue ranking", "product units trend", "variant comparison")
+    elif wants_procurement:
+        terms = ("receiving progress", "receiving lifecycle", "receiving activity", "purchase-order receiving")
+    elif wants_staff:
+        terms = ("staff audit activity", "most frequent staff actions", "audit events for", "staff activity")
+    else:
+        return payloads[-1]
+
+    scored: list[tuple[int, int, dict[str, Any]]] = []
+    for index, payload in enumerate(payloads):
+        haystack = _payload_search_text(payload)
+        score = sum(1 for term in terms if term in haystack)
+        if score:
+            scored.append((score, index, payload))
+    if scored:
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return scored[0][2]
+    if wants_business or wants_comparison or wants_procurement or wants_staff:
+        return None
+    return payloads[-1]
+
+
+def _is_new_scoped_insight_request(text: str) -> bool:
+    if not text or text.startswith(("going back", "based on", "from that")):
+        return False
+    starts_like_request = bool(
+        re.search(r"^(show|give|get|analyse|analyze|review|summari[sz]e|compare|list|find|tell me|what are|which are)\b", text)
+    )
+    if not starts_like_request:
+        return False
+    has_scope = bool(re.search(r"\b(today|yesterday|last|past|this month|this year|date|between|from)\b", text))
+    has_domain = bool(
+        re.search(
+            r"\b(sales?|products?|variants?|purchase orders?|po|procurement|receiving|staff|audit|activity|stock|inventory|system|business analyst)\b",
+            text,
+        )
+    )
+    return has_scope and has_domain
+
+
+def _latest_repeated_question_response_parts(user_text: str, history: Any) -> list[Any] | None:
+    current = _normalize_user_text(user_text)
+    if not current or not isinstance(history, list):
+        return None
+    scoped_insight_request = _is_new_scoped_insight_request(current)
+
+    prior_user_index: int | None = None
+    for index in range(len(history) - 1, -1, -1):
+        item = history[index]
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = item.get("content")
+        if role not in {"user", "human"} or not isinstance(content, str):
+            continue
+        if _normalize_user_text(content) == current:
+            prior_user_index = index
+            # The last entry is usually the current user message in direct stream history.
+            if index < len(history) - 1:
+                break
+
+    if prior_user_index is None:
+        return None
+
+    for item in history[prior_user_index + 1 :]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"assistant", "agent", "ai"}:
+            continue
+        structured_payload = item.get("structured_payload") or item.get("structuredPayload")
+        if isinstance(structured_payload, dict) and structured_payload:
+            return [DataPart(data=structured_payload)]
+        if scoped_insight_request:
+            continue
+        content = item.get("content")
+        if isinstance(content, str) and content.strip():
+            return [TextPart(text=content.strip())]
+    return None
+
+
+def _insight_widget_by_title(payload: dict[str, Any], *title_terms: str) -> dict[str, Any] | None:
+    widgets = payload.get("widgets")
+    if not isinstance(widgets, list):
+        return None
+    normalized_terms = [term.strip().lower() for term in title_terms if term.strip()]
+    for widget in widgets:
+        if not isinstance(widget, dict):
+            continue
+        title = str(widget.get("title") or "").strip().lower()
+        if all(term in title for term in normalized_terms):
+            return widget
+    return None
+
+
+def _insight_metric_value(payload: dict[str, Any], label: str) -> Any:
+    label_lower = label.strip().lower()
+    for widget in payload.get("widgets") or []:
+        if not isinstance(widget, dict) or str(widget.get("type") or "") != "metric_grid":
+            continue
+        for item in widget.get("data") or []:
+            if isinstance(item, dict) and str(item.get("label") or "").strip().lower() == label_lower:
+                return item.get("value")
+    return None
+
+
+def _format_plain_money(value: Any, payload: dict[str, Any]) -> str:
+    currency_code = "NGN"
+    for widget in payload.get("widgets") or []:
+        if isinstance(widget, dict):
+            currency_code = str(widget.get("currency_code") or widget.get("currency") or currency_code).upper()
+    symbol = {
+        "NGN": "₦",
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£",
+        "JPY": "¥",
+        "CAD": "C$",
+        "AUD": "A$",
+        "GHS": "₵",
+        "KES": "KSh",
+        "ZAR": "R",
+    }.get(currency_code, f"{currency_code} ")
+    try:
+        return f"{symbol}{float(value or 0):,.2f}"
+    except Exception:
+        return str(value or "")
+
+
+def _format_plain_number(value: Any) -> str:
+    try:
+        numeric = float(value or 0)
+    except Exception:
+        return str(value or "")
+    return f"{numeric:,.0f}" if numeric.is_integer() else f"{numeric:,.2f}"
+
+
+def _insight_procurement_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    widget = (
+        _insight_widget_by_title(payload, "receiving", "progress")
+        or _insight_widget_by_title(payload, "purchase", "progress")
+        or _insight_widget_by_title(payload, "po", "progress")
+        or _insight_widget_by_title(payload, "receiving", "lifecycle")
+    )
+    if not isinstance(widget, dict):
+        return []
+    items = widget.get("items") if isinstance(widget.get("items"), list) else []
+    rows = widget.get("rows") if isinstance(widget.get("rows"), list) else []
+    steps = widget.get("steps") if isinstance(widget.get("steps"), list) else []
+    source = items or rows or steps
+    return [item for item in source if isinstance(item, dict)]
+
+
+def _insight_item_label(item: dict[str, Any]) -> str:
+    for key in ("label", "title", "reference", "name", "id"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return "item"
+
+
+def _insight_item_status(item: dict[str, Any]) -> str:
+    for key in ("status", "state", "badge", "stage"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _insight_ranked_items(payload: dict[str, Any], *title_terms: str) -> list[dict[str, Any]]:
+    widget = _insight_widget_by_title(payload, *title_terms)
+    if not isinstance(widget, dict):
+        return []
+    items = widget.get("items") if isinstance(widget.get("items"), list) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _insight_timeline_events(payload: dict[str, Any], *title_terms: str) -> list[dict[str, Any]]:
+    widget = _insight_widget_by_title(payload, *title_terms)
+    if not isinstance(widget, dict):
+        return []
+    events = widget.get("events") if isinstance(widget.get("events"), list) else []
+    return [event for event in events if isinstance(event, dict)]
+
+
+def _insight_comparison_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    table = _insight_widget_by_title(payload, "product", "comparison", "table") or _insight_widget_by_title(
+        payload,
+        "comparison",
+        "table",
+    )
+    rows = table.get("rows") if isinstance(table, dict) else []
+    if isinstance(rows, list) and len(rows) >= 2:
+        return [row for row in rows if isinstance(row, dict)]
+    ranked = _insight_widget_by_title(payload, "product", "revenue", "ranking") or _insight_widget_by_title(
+        payload,
+        "revenue",
+        "ranking",
+    )
+    items = ranked.get("items") if isinstance(ranked, dict) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _insight_comparison_name(item: dict[str, Any]) -> str:
+    for key in ("product", "product_name", "label", "title", "name"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return "product"
+
+
+def _insight_comparison_value(item: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            try:
+                return float(str(value).replace(",", ""))
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+def _latest_insight_follow_up_answer(user_text: str, history: Any) -> str | None:
+    text = _normalize_user_text(user_text)
+    if not text:
+        return None
+    if _is_new_scoped_insight_request(text):
+        return None
+    payload = _select_history_insight_payload(user_text, history)
+    if not payload:
+        return None
+
+    # New scoped requests should run tools instead of answering from stale history.
+    if any(token in text for token in ("last month", "this month", "today", "yesterday", "past 7 days", "barcode", "compare ", "new analysis")):
+        return None
+
+    timeframe = payload.get("timeframe") if isinstance(payload.get("timeframe"), dict) else {}
+    timeframe_label = str(timeframe.get("label") or "").strip()
+    timeframe_suffix = f" for {timeframe_label}" if timeframe_label else ""
+
+    if re.search(r"\b(procurement|purchasing|purchase order|po|receiving|supplier)\b", text):
+        procurement_items = _insight_procurement_items(payload)
+        if procurement_items:
+            open_items = [
+                item
+                for item in procurement_items
+                if _insight_item_status(item)
+                and not re.search(r"(received|complete|completed|closed|done)", _insight_item_status(item).lower())
+            ]
+            attention_items = open_items or procurement_items[:3]
+            status_counts: dict[str, int] = {}
+            for item in procurement_items:
+                status = _insight_item_status(item) or "unknown"
+                status_counts[status] = status_counts.get(status, 0) + 1
+            status_summary = ", ".join(f"{status}: {_format_plain_number(count)}" for status, count in status_counts.items())
+            priority = ", ".join(
+                f"{_insight_item_label(item)}{f' ({_insight_item_status(item)})' if _insight_item_status(item) else ''}"
+                for item in attention_items[:5]
+            )
+
+            if any(phrase in text for phrase in ("bottleneck", "block", "delay", "issue", "risk")):
+                return (
+                    f"From the receiving lifecycle{timeframe_suffix}, the main bottleneck is unfinished receiving work: "
+                    f"{_format_plain_number(len(open_items))} of {_format_plain_number(len(procurement_items))} tracked POs are not fully received. "
+                    f"Status mix: {status_summary}."
+                )
+            if any(phrase in text for phrase in ("status", "attention", "needs attention")):
+                return f"From the receiving lifecycle{timeframe_suffix}, these statuses need attention: {status_summary}. Priority POs: {priority}."
+            if any(phrase in text for phrase in ("what should", "next", "action", "do next", "recommend", "team")):
+                return (
+                    f"From the receiving lifecycle{timeframe_suffix}, the purchasing team should first follow up on {priority}. "
+                    "Then confirm supplier ETAs, close partial receipts, and split large supplier deliveries where receiving spikes are recurring."
+                )
+
+    comparison_rows = _insight_comparison_rows(payload)
+    if len(comparison_rows) >= 2:
+        if any(phrase in text for phrase in ("revenue", "sales total", "generated more", "made more", "led")):
+            ranked = sorted(
+                comparison_rows,
+                key=lambda item: _insight_comparison_value(item, "sales_total", "total_sales", "revenue", "sales", "value"),
+                reverse=True,
+            )
+            leader, runner = ranked[0], ranked[1]
+            leader_value = _insight_comparison_value(leader, "sales_total", "total_sales", "revenue", "sales", "value")
+            runner_value = _insight_comparison_value(runner, "sales_total", "total_sales", "revenue", "sales", "value")
+            return (
+                f"From the comparison{timeframe_suffix}, {_insight_comparison_name(leader)} led revenue with "
+                f"{_format_plain_money(leader_value, payload)}. It was ahead of {_insight_comparison_name(runner)} by "
+                f"{_format_plain_money(leader_value - runner_value, payload)}."
+            )
+        if any(phrase in text for phrase in ("unit", "quantity", "sold more", "volume")):
+            ranked = sorted(
+                comparison_rows,
+                key=lambda item: _insight_comparison_value(item, "quantity_sold", "units_sold", "quantity", "units"),
+                reverse=True,
+            )
+            leader, runner = ranked[0], ranked[1]
+            leader_value = _insight_comparison_value(leader, "quantity_sold", "units_sold", "quantity", "units")
+            runner_value = _insight_comparison_value(runner, "quantity_sold", "units_sold", "quantity", "units")
+            return (
+                f"From the comparison{timeframe_suffix}, {_insight_comparison_name(leader)} sold more units: "
+                f"{_format_plain_number(leader_value)} units vs {_format_plain_number(runner_value)} for {_insight_comparison_name(runner)}."
+            )
+
+    if re.search(r"\b(staff|audit|activity|action|event|risk)\b", text):
+        action_items = _insight_ranked_items(payload, "staff", "actions") or _insight_ranked_items(payload, "frequent", "actions")
+        timeline_events = _insight_timeline_events(payload, "audit", "events")
+        if any(phrase in text for phrase in ("most active staff", "active staff", "staff member", "which staff", "who was")):
+            return (
+                f"The saved staff activity response{timeframe_suffix} does not include a staff-member ranking. "
+                "It includes action frequency and recent audit events. Ask for staff activity by user if you want the top staff member."
+            )
+        if action_items and any(phrase in text for phrase in ("activity type", "action type", "happened the most", "most frequent", "most common")):
+            top = action_items[0]
+            return (
+                f"From the staff audit activity{timeframe_suffix}, the most frequent activity type was "
+                f"{_insight_item_label(top)} with {_format_plain_number(top.get('value') or top.get('count'))} events."
+            )
+        if any(phrase in text for phrase in ("risk", "risks", "attention", "warning", "high")):
+            risky = [
+                event
+                for event in timeline_events
+                if re.search(r"\b(warning|high|critical|error)\b", str(event.get("severity") or "").lower())
+            ]
+            if risky:
+                preview = "; ".join(str(event.get("title") or "Audit event") for event in risky[:3])
+                return f"From the staff audit activity{timeframe_suffix}, {len(risky)} recent audit events need attention: {preview}."
+            if timeline_events:
+                return f"From the staff audit activity{timeframe_suffix}, no high-severity staff activity risk is visible in the recent audit events shown."
+
+    if any(phrase in text for phrase in ("best day", "highest day", "strongest day", "peak day")):
+        for insight in payload.get("insights") or []:
+            if isinstance(insight, dict) and "best day" in str(insight.get("title") or "").lower():
+                detail = str(insight.get("detail") or "").strip()
+                if detail:
+                    return f"From the last analysis{timeframe_suffix}: {detail}"
+        trend = _insight_widget_by_title(payload, "revenue", "trend")
+        rows = trend.get("data") if isinstance(trend, dict) else []
+        if isinstance(rows, list) and rows:
+            best = max((row for row in rows if isinstance(row, dict)), key=lambda row: float(row.get("sales") or row.get("value") or 0), default=None)
+            if best:
+                return f"From the last analysis{timeframe_suffix}, the strongest day was {best.get('label')} at {_format_plain_money(best.get('sales') or best.get('value'), payload)}."
+
+    if any(phrase in text for phrase in ("which location", "top location", "best location", "leading location", "location led", "far behind", "lagging", "lowest revenue", "least revenue", "underperforming")):
+        table = _insight_widget_by_title(payload, "location")
+        rows = table.get("rows") if isinstance(table, dict) else []
+        if not rows and isinstance(table, dict):
+            rows = table.get("data") if isinstance(table.get("data"), list) else []
+        if isinstance(rows, list) and rows:
+            valid_rows = [row for row in rows if isinstance(row, dict)]
+            best = max(valid_rows, key=lambda row: float(row.get("sales") or row.get("value") or 0), default=None)
+            worst = min(valid_rows, key=lambda row: float(row.get("sales") or row.get("value") or 0), default=None)
+            if best and worst:
+                best_label = best.get("location") or best.get("label")
+                best_sales = best.get("sales") or best.get("value") or best.get("total_sales")
+                best_orders = best.get("orders") or best.get("count") or best.get("order_count")
+                worst_label = worst.get("location") or worst.get("label")
+                worst_sales = worst.get("sales") or worst.get("value") or worst.get("total_sales")
+                total_sales = sum(float(row.get("sales") or row.get("value") or row.get("total_sales") or 0) for row in rows if isinstance(row, dict))
+                order_leader = max(
+                    valid_rows,
+                    key=lambda row: float(row.get("orders") or row.get("count") or row.get("order_count") or 0),
+                    default=None,
+                )
+                share = ""
+                try:
+                    if total_sales > 0:
+                        share = f", representing {(float(best_sales or 0) / total_sales) * 100:.1f}% of location revenue"
+                except Exception:
+                    share = ""
+                also_led_orders = bool(order_leader and (order_leader.get("location") or order_leader.get("label")) == best_label)
+                reason = ""
+                if any(phrase in text for phrase in ("why", "reason", "because")):
+                    reason = f" It led because it generated the highest revenue{share}{' and also had the highest order count' if also_led_orders else ''}."
+                if any(phrase in text for phrase in ("far behind", "lagging", "lowest revenue", "least revenue", "underperforming")):
+                    gap = float(best_sales or 0) - float(worst_sales or 0)
+                    return (
+                        f"From the last analysis{timeframe_suffix}, {worst_label} was farthest behind with "
+                        f"{_format_plain_money(worst_sales, payload)}, trailing {best_label} by {_format_plain_money(gap, payload)}."
+                    )
+                return f"From the last analysis{timeframe_suffix}, {best_label} led with {_format_plain_money(best_sales, payload)} across {_format_plain_number(best_orders)} orders.{reason}"
+
+    if any(phrase in text for phrase in ("top product", "top products", "which product", "what product", "products drove", "best seller")):
+        ranked = _insight_widget_by_title(payload, "top", "product") or _insight_widget_by_title(payload, "top", "seller")
+        items = ranked.get("items") if isinstance(ranked, dict) else []
+        if isinstance(items, list) and items:
+            lines = []
+            for index, item in enumerate([row for row in items if isinstance(row, dict)][:5], start=1):
+                label = str(item.get("label") or item.get("title") or "Product").strip()
+                value = _format_plain_money(item.get("value") or item.get("count"), payload)
+                detail = str(item.get("detail") or "").strip()
+                lines.append(f"{index}. {label}: {value}{f' ({detail})' if detail else ''}")
+            if lines:
+                return "From the last analysis, the top products were:\n" + "\n".join(lines)
+
+    if any(phrase in text for phrase in ("what should i do", "what do i do", "first action", "next action", "recommend", "priority")):
+        ranked = _insight_widget_by_title(payload, "recommended", "actions") or _insight_widget_by_title(payload, "next", "actions")
+        items = ranked.get("items") if isinstance(ranked, dict) else []
+        if isinstance(items, list) and items:
+            lines = []
+            for index, item in enumerate([row for row in items if isinstance(row, dict)][:3], start=1):
+                label = str(item.get("label") or item.get("title") or "Action").strip()
+                detail = str(item.get("detail") or item.get("description") or "").strip()
+                lines.append(f"{index}. {label}{f': {detail}' if detail else ''}")
+            return "From the last analysis, prioritize:\n" + "\n".join(lines)
+
+    if any(phrase in text for phrase in ("risk", "risks", "problem", "problems", "attention", "concern", "weak")):
+        panel = _insight_widget_by_title(payload, "attention") or _insight_widget_by_title(payload, "risk")
+        items = panel.get("items") if isinstance(panel, dict) else []
+        if isinstance(items, list) and items:
+            lines = []
+            for index, item in enumerate([row for row in items if isinstance(row, dict)][:5], start=1):
+                label = str(item.get("label") or item.get("title") or "Risk").strip()
+                detail = str(item.get("description") or item.get("detail") or "").strip()
+                lines.append(f"{index}. {label}{f': {detail}' if detail else ''}")
+            return "From the last analysis, these need attention:\n" + "\n".join(lines)
+
+    if any(phrase in text for phrase in ("total revenue", "how much", "total sales", "how many orders", "order count", "revenue")):
+        revenue = _insight_metric_value(payload, "Revenue")
+        orders = _insight_metric_value(payload, "Orders")
+        if revenue is not None or orders is not None:
+            parts = []
+            if revenue is not None:
+                parts.append(f"revenue was {_format_plain_money(revenue, payload)}")
+            if orders is not None:
+                parts.append(f"orders were {_format_plain_number(orders)}")
+            return f"From the last analysis{timeframe_suffix}, " + " and ".join(parts) + "."
+
+    if any(token in text for token in ("explain", "summary", "summarize", "what does this mean", "insight")):
+        explanation = str(payload.get("explanation") or "").strip()
+        insights = [
+            str(item.get("detail") or "").strip()
+            for item in payload.get("insights") or []
+            if isinstance(item, dict) and str(item.get("detail") or "").strip()
+        ]
+        if explanation or insights:
+            return "\n".join([part for part in [explanation, *insights[:3]] if part])
+
+    return (
+        f"I have the previous analysis{timeframe_suffix}, but that follow-up is not mapped yet. "
+        "Ask about the leader, laggard, gap, trend, risk, or next action, and I will answer from the saved result."
+    )
+
+
 QUERY_TOKEN_ALLOWLIST: set[str] = {"pos", "sku", "api", "ui"}
 
 QUERY_TOKEN_STOPWORDS: set[str] = {
@@ -315,6 +1242,8 @@ def _canonical_host_domain_agent(name: str) -> str:
     normalized = str(name or "").strip().lower().replace("_", "-")
     if not normalized:
         return ""
+    if normalized == "host" or normalized.endswith("-host") or "-host-" in normalized:
+        return "host"
     if normalized in HOST_AGENT_LABELS:
         return normalized
     if "onboarding" in normalized or normalized == "onboard":
@@ -349,7 +1278,7 @@ def _is_simple_greeting_query(value: str) -> bool:
 
 def _agent_intro_text(agent_name: str | None) -> str:
     normalized = str(agent_name or "").strip().lower()
-    if normalized == "host":
+    if _canonical_host_domain_agent(normalized) == "host":
         return "I’m your workspace host agent. What can I help you with?"
     return f"I’m your {_friendly_agent_label(normalized or 'assistant')} agent. What can I help you with?"
 
@@ -849,10 +1778,13 @@ def _host_orchestration_plan(query: str, agent_summaries: list[dict[str, Any]] |
     text = _normalize_user_text(query)
     if not text:
         return []
+    inferred_agent = _strong_domain_agent_override(query)
     available_names = _available_agent_names(agent_summaries)
+    if inferred_agent and inferred_agent != "onboarding" and (not available_names or inferred_agent in available_names):
+        return [inferred_agent]
     candidates: list[tuple[str, int]] = []
     for agent_name, keywords in HOST_DOMAIN_KEYWORDS.items():
-        if agent_name == "host":
+        if _canonical_host_domain_agent(agent_name) == "host":
             continue
         if available_names and agent_name not in available_names:
             continue
@@ -3064,14 +3996,22 @@ def _inventory_fulfillment_execute_action(
     action: str,
     form_data: dict[str, Any],
     tool_specs: list[ToolSpec],
+    interaction_payload: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any], list[str]]:
     if action == "create_stock_reservation":
         spec = _tool_spec_by_name(tool_specs, "inventory.create_stock_reservation")
         payload_spec = _nested_object_tool_spec(spec, "payload")
         arguments: dict[str, Any] = {}
         payload_arguments: dict[str, Any] = {}
+        stock_location_id = str(form_data.get("stock_location_id") or "").strip() or None
+        structural_location_id = _selected_structural_location_id_from_form(
+            interaction_payload,
+            field_name="stock_location_id",
+            selected_value=stock_location_id,
+        )
         _set_schema_arg(payload_arguments, payload_spec, ["inventory_item_id", "inventoryItemId"], str(form_data.get("inventory_item_id") or "").strip() or None)
-        _set_schema_arg(payload_arguments, payload_spec, ["stock_location_id", "stockLocationId"], str(form_data.get("stock_location_id") or "").strip() or None)
+        _set_schema_arg(payload_arguments, payload_spec, ["stock_location_id", "stockLocationId"], stock_location_id)
+        _set_schema_arg(payload_arguments, payload_spec, ["structural_location_id", "structuralLocationId"], structural_location_id)
         _set_schema_arg(payload_arguments, payload_spec, ["reserved_quantity", "reservedQuantity"], str(form_data.get("quantity") or "").strip() or None)
         _set_schema_arg(payload_arguments, payload_spec, ["external_order_type", "externalOrderType"], str(form_data.get("external_order_type") or "").strip() or None)
         _set_schema_arg(payload_arguments, payload_spec, ["external_order_id", "externalOrderId"], str(form_data.get("external_order_id") or "").strip() or None)
@@ -3087,6 +4027,11 @@ def _inventory_fulfillment_execute_action(
         payload_spec = _nested_object_tool_spec(spec, "payload")
         arguments: dict[str, Any] = {}
         from_location_id = str(form_data.get("from_location_id") or "").strip() or None
+        from_structural_location_id = _selected_structural_location_id_from_form(
+            interaction_payload,
+            field_name="from_location_id",
+            selected_value=from_location_id,
+        )
         _set_schema_arg(arguments, spec, ["location_id", "locationId"], from_location_id)
         payload_arguments: dict[str, Any] = {}
         transfer_line = {
@@ -3096,7 +4041,10 @@ def _inventory_fulfillment_execute_action(
             "quantity": str(form_data.get("quantity") or "").strip() or None,
             "notes": str(form_data.get("notes") or "").strip() or None,
         }
+        if from_structural_location_id:
+            transfer_line["structural_location_id"] = from_structural_location_id
         _set_schema_arg(payload_arguments, payload_spec, ["transfers"], [transfer_line])
+        _set_schema_arg(payload_arguments, payload_spec, ["structural_location_id", "structuralLocationId"], from_structural_location_id)
         _set_schema_arg(payload_arguments, payload_spec, ["reason"], str(form_data.get("reason") or "").strip() or None)
         _set_schema_arg(payload_arguments, payload_spec, ["notes"], str(form_data.get("notes") or "").strip() or None)
         if payload_arguments:
@@ -3110,14 +4058,23 @@ def _inventory_fulfillment_execute_action(
         arguments: dict[str, Any] = {}
         _set_schema_arg(arguments, spec, ["inventory_item_id", "inventoryItemId"], str(form_data.get("inventory_item_id") or "").strip() or None)
         payload_arguments: dict[str, Any] = {}
+        stock_location_id = str(form_data.get("stock_location_id") or "").strip() or None
+        structural_location_id = _selected_structural_location_id_from_form(
+            interaction_payload,
+            field_name="stock_location_id",
+            selected_value=stock_location_id,
+        )
         adjustment_line = {
             "inventory_item_id": str(form_data.get("inventory_item_id") or "").strip() or None,
-            "stock_location_id": str(form_data.get("stock_location_id") or "").strip() or None,
+            "stock_location_id": stock_location_id,
             "quantity": str(form_data.get("quantity") or "").strip() or None,
             "adjustment_type": str(form_data.get("adjustment_type") or "").strip() or None,
             "notes": str(form_data.get("notes") or "").strip() or None,
         }
+        if structural_location_id:
+            adjustment_line["structural_location_id"] = structural_location_id
         _set_schema_arg(payload_arguments, payload_spec, ["adjustments"], [adjustment_line])
+        _set_schema_arg(payload_arguments, payload_spec, ["structural_location_id", "structuralLocationId"], structural_location_id)
         _set_schema_arg(payload_arguments, payload_spec, ["reason"], str(form_data.get("reason") or "").strip() or None)
         _set_schema_arg(payload_arguments, payload_spec, ["notes"], str(form_data.get("notes") or "").strip() or None)
         if payload_arguments:
@@ -3699,6 +4656,5271 @@ def _pos_admin_action_from_text(text: str) -> str | None:
         )
     ):
         return "create_pos_discount"
+    return None
+
+
+def _pos_admin_named_insight_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    comparison_terms = ("compare", "comparison", "versus", "vs", "side by side", "side-by-side", "performance")
+    comparison_queries = _extract_product_comparison_queries_from_text(text)
+    if (
+        any(token in normalized for token in ("variant", "variants"))
+        and any(token in normalized for token in comparison_terms)
+    ):
+        return "variant_comparison"
+    if (
+        any(token in normalized for token in comparison_terms)
+        and len(comparison_queries) >= 2
+        and (
+            any(token in normalized for token in ("product", "products", "item", "items", "barcode", "sku"))
+            or any(re.fullmatch(r"\d{8,18}", query.strip()) for query in comparison_queries)
+            or not any(
+                token in normalized
+                for token in (
+                    "location",
+                    "locations",
+                    "store",
+                    "stores",
+                    "staff",
+                    "cashier",
+                    "cashiers",
+                    "supplier",
+                    "suppliers",
+                    "purchase order",
+                    "audit",
+                    "permission",
+                    "security",
+                )
+            )
+        )
+    ):
+        return "product_comparison"
+    if (
+        any(token in normalized for token in ("trend", "performance", "analyse", "analyze", "analysis", "compare", "comparison", "history"))
+        and any(token in normalized for token in ("product", "variant", "item", "barcode", "sku"))
+        and any(token in normalized for token in ("sales", "sold", "revenue", "units", "location", "locations"))
+    ):
+        return "product_sales_trend"
+    if (
+        any(token in normalized for token in ("highest sales", "best sales day", "peak sales day", "strongest sales day", "most sales in a day", "highest revenue day"))
+        and any(token in normalized for token in ("day", "daily", "ever", "all time", "historical", "history"))
+    ):
+        return "best_sales_day"
+    if (
+        any(token in normalized for token in ("sales", "revenue", "orders", "order count", "avg basket", "average basket"))
+        and any(
+            token in normalized
+            for token in (
+                "how many",
+                "total",
+                "overview",
+                "analysis",
+                "analyse",
+                "analyze",
+                "analytics",
+                "summary",
+                "gross",
+                "made",
+                "recorded",
+                "generated",
+                "did we make",
+                "did we do",
+                "data",
+            )
+        )
+        and not any(
+            token in normalized
+            for token in (
+                "location",
+                "locations",
+                "branch",
+                "branches",
+                "top seller",
+                "top sellers",
+                "best seller",
+                "best sellers",
+                "payment",
+                "terminal",
+                "cashier",
+            )
+        )
+    ):
+        return "sales_overview"
+    if _text_matches_all_terms(
+        normalized,
+        r"\b(sales?|revenue|orders?|basket)\b",
+        r"\b(location|locations|branch|branches)\b",
+    ):
+        return "sales_by_location_today"
+    if (
+        _text_matches_all_terms(normalized, r"\b(top|best)\s+sellers?\b")
+        or (
+            any(
+                token in normalized
+                for token in (
+                    "selling the most",
+                    "sold the most",
+                    "highest revenue",
+                    "generated the highest revenue",
+                    "strongest sellers",
+                    "top-selling variants",
+                    "product leaders",
+                    "carrying sales",
+                    "quantity sold",
+                    "weekly top sellers",
+                    "top sellers over seven days",
+                    "skus are my top sellers",
+                )
+            )
+        )
+    ):
+        return "top_sellers_seven_days"
+    if (
+        any(token in normalized for token in ("sku", "skus", "product", "products", "item", "items", "seller", "sellers", "revenue"))
+        and any(token in normalized for token in ("top", "best", "highest", "strongest", "leaders", "sold the most", "selling the most"))
+    ):
+        return "top_sellers_seven_days"
+    if any(
+        token in normalized
+        for token in (
+            "payment mix",
+            "payment method",
+            "payment methods",
+            "payment channel",
+            "payment channels",
+            "payment usage split",
+            "payment usage",
+            "cash versus transfer",
+            "failed versus successful payment activity",
+            "failed versus successful payment",
+            "tender mix",
+            "tender",
+        )
+    ):
+        return "payment_mix"
+    if any(
+        token in normalized
+        for token in (
+            "pos activity from audit events",
+            "audited activity",
+            "timeline of pos actions",
+            "pos settings recently",
+            "pos configuration changes",
+            "cashier actions are most frequent",
+            "order-related pos events",
+            "pos activity patterns look unusual",
+            "pos audit activity",
+            "pos operational events",
+            "cashier performance",
+            "sales by cashier",
+            "terminal activity",
+            "busiest",
+            "terminal usage",
+            "performance across terminals and cashiers",
+            "processed the most orders",
+            "revenue contribution",
+            "average basket by cashier",
+            "refund activity",
+        )
+    ):
+        if any(
+            token in normalized
+            for token in (
+                "audit",
+                "audited",
+                "timeline of pos actions",
+                "pos settings recently",
+                "pos configuration changes",
+                "order-related pos events",
+                "pos activity patterns look unusual",
+                "pos operational events",
+            )
+        ):
+            return "pos_audit_activity"
+        return "terminal_cashier_activity"
+    if any(
+        token in normalized
+        for token in (
+            "open versus closed pos sessions",
+            "sessions were opened and closed",
+            "hourly sales trend",
+            "driving the most sales today",
+            "order flow",
+            "order count trend",
+            "draft, held, and completed",
+            "session throughput",
+            "longest active pos session",
+            "trend lines for orders and revenue",
+        )
+    ):
+        return "sessions_orders"
+    if any(
+        token in normalized
+        for token in (
+            "pos risk signals",
+            "refunds unusually high",
+            "suspicious activity",
+            "voided or cancelled",
+            "abnormal discount activity",
+            "weak conversion",
+            "operational attention",
+            "pos exceptions",
+            "payment or session anomalies",
+            "investigate first",
+        )
+    ):
+        return "pos_exceptions"
+    return None
+
+
+def _inventory_procurement_named_insight_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if _text_matches_all_terms(normalized, r"\b(purchase order|purchase orders|po)\b", r"\b(receiving|received|receipts?)\b"):
+        return "receiving_lifecycle"
+    if any(
+        token in normalized
+        for token in (
+            "purchase-order lifecycle",
+            "purchase order lifecycle",
+            "purchase-order pipeline",
+            "purchase order pipeline",
+            "purchase orders are pending, approved, issued, or received",
+            "open purchase orders by status",
+            "stage is each active po",
+            "po workflow progress",
+            "closest to completion",
+            "purchase-order status split",
+            "timeline view of current po activity",
+            "stalled in the pipeline",
+        )
+    ):
+        return "po_lifecycle"
+    if any(
+        token in normalized
+        for token in (
+            "po receiving lifecycle",
+            "purchase orders received",
+            "purchase order receiving",
+            "purchase order receipts",
+            "what was received",
+            "receiving progress for open purchase orders",
+            "partially received",
+            "receiving timeline",
+            "receipts landed today",
+            "receiving completion progress",
+            "waiting to be received",
+            "goods-receipt activity",
+            "blocked at receiving",
+            "receiving progress board",
+        )
+    ):
+        return "receiving_lifecycle"
+    if (
+        _text_matches_all_terms(normalized, r"\b(purchase order|purchase orders|po)\b", r"\b(status|statuses|pipeline|lifecycle|open|pending|approved|issued|received)\b")
+        or _text_matches_all_terms(normalized, r"\bhow many\b", r"\b(purchase order|purchase orders|po)\b")
+    ):
+        return "po_lifecycle"
+    if (
+        _text_matches_all_terms(normalized, r"\b(purchase order|purchase orders|po)\b", r"\b(analysis|analytics|analyze|analyse)\b")
+        or (
+            re.search(r"\b(purchase order|purchase orders|po)\b", normalized, flags=re.IGNORECASE)
+            and any(
+                token in normalized
+                for token in (
+                    "last month",
+                    "last 3 months",
+                    "last three months",
+                    "past month",
+                    "past 3 months",
+                    "past three months",
+                    "this month",
+                    "this quarter",
+                    "last quarter",
+                    "last year",
+                    "past year",
+                )
+            )
+        )
+    ):
+        return "po_lifecycle"
+    if any(
+        token in normalized
+        for token in (
+            "supplier performance",
+            "delivering on time",
+            "fill rate and delay rate",
+            "receiving reliability",
+            "suppliers create the most receiving exceptions",
+            "completion quality by supplier",
+            "supplier responsiveness",
+            "trust most for urgent restocks",
+            "supplier scorecards",
+            "performance summary for procurement",
+        )
+    ):
+        return "supplier_performance"
+    if any(
+        token in normalized
+        for token in (
+            "delayed purchase orders",
+            "need escalation right now",
+            "receiving exceptions by severity",
+            "overdue for receiving",
+            "procurement risks across active suppliers",
+            "missing or blocked receipt activity",
+            "procurement exceptions from the audit trail",
+            "procurement problems should i investigate first",
+            "highest operational risk",
+            "purchasing delays affecting stock availability",
+        )
+    ):
+        return "delay_exceptions"
+    if any(
+        token in normalized
+        for token in (
+            "cost variance across recent purchase orders",
+            "biggest price variance",
+            "expected versus received procurement cost",
+            "landed cost is drifting",
+            "procurement lines deserve price review first",
+        )
+    ):
+        return "cost_variance"
+    return None
+
+
+def _product_discovery_named_insight_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if any(
+        token in normalized
+        for token in (
+            "product activity from audit events",
+            "products were edited most recently",
+            "audit timeline for product changes",
+            "recent catalog activity",
+            "barcode or sku change activity",
+            "product families are seeing the most edits",
+            "recently modified products with audit evidence",
+            "product records changed across multiple staff",
+            "product audit activity by category",
+            "product changes should i review first",
+        )
+    ):
+        return "product_audit_activity"
+    if any(
+        token in normalized
+        for token in (
+            "global catalog import opportunities",
+            "global products should i import next",
+            "import opportunities",
+            "global catalog products match my current assortment gaps",
+            "catalog opportunities not yet imported",
+            "brands have the biggest import potential",
+            "likely import wins for the current workspace",
+            "global products can expand my catalog fastest",
+            "rank import opportunities",
+            "global catalog opportunity board",
+        )
+    ):
+        return "import_opportunities"
+    if any(
+        token in normalized
+        for token in (
+            "look up product variants by barcode",
+            "matching variant for a scanned barcode",
+            "product variant matches this sku or barcode",
+            "best catalog match for a product code",
+            "look up a product variant",
+            "variant record behind a barcode scan",
+            "variant is tied to this catalog code",
+            "variant lookup result",
+            "closest global catalog match for a code",
+            "product family and variant that match a lookup",
+        )
+    ):
+        return "variant_lookup"
+    if any(
+        token in normalized
+        for token in (
+            "catalog gaps in my current assortment",
+            "categories look underrepresented",
+            "product families are missing versus demand signals",
+            "product assortment risks by category",
+            "brands are thin in my catalog",
+            "gaps between imported catalog and active sales mix",
+            "products should exist here but do not yet",
+            "assortment weaknesses",
+            "catalog gaps likely hurting sales coverage",
+            "catalog gaps should i close first",
+        )
+    ):
+        return "catalog_gaps"
+    if any(
+        token in normalized
+        for token in (
+            "duplicate barcode risks",
+            "skus or barcodes may conflict",
+            "product code collisions",
+            "duplicate identifiers",
+            "barcode conflicts",
+            "duplicate code pressure",
+            "code conflicts could block imports",
+            "duplicate variant records",
+            "barcode or sku issues should i resolve first",
+            "duplicate code risk",
+        )
+    ):
+        return "duplicate_codes"
+    if any(
+        token in normalized
+        for token in (
+            "missing strong media coverage",
+            "better curated product content",
+            "weak image coverage",
+            "merchandising cleanup first",
+            "content quality opportunities",
+        )
+    ):
+        return "media_category"
+    return None
+
+
+def _host_passthrough_named_insight_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+
+    pos_insight = _pos_admin_named_insight_from_text(normalized)
+    if pos_insight:
+        return f"pos::{pos_insight}"
+
+    inventory_visibility_insight = _inventory_visibility_named_insight_from_text(normalized)
+    if inventory_visibility_insight:
+        return f"inventory_visibility::{inventory_visibility_insight}"
+
+    inventory_procurement_insight = _inventory_procurement_named_insight_from_text(normalized)
+    if inventory_procurement_insight:
+        return f"inventory_procurement::{inventory_procurement_insight}"
+
+    users_insight = _users_named_insight_from_text(normalized)
+    if users_insight:
+        return f"users::{users_insight}"
+
+    product_discovery_insight = _product_discovery_named_insight_from_text(normalized)
+    if product_discovery_insight:
+        return f"product_discovery::{product_discovery_insight}"
+
+    return None
+
+
+def _host_named_insight_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if any(
+        token in normalized
+        for token in (
+            "business analyst",
+            "data analyst",
+            "act as an analyst",
+            "act like an analyst",
+            "analyze the entire data",
+            "analyse the entire data",
+            "analyze my whole business",
+            "analyse my whole business",
+            "analyze the whole workspace",
+            "analyse the whole workspace",
+            "analyze my entire system",
+            "analyse my entire system",
+            "analyze the entire system",
+            "analyse the entire system",
+            "analyze my whole system",
+            "analyse my whole system",
+            "analyze the whole system",
+            "analyse the whole system",
+            "what am i not seeing",
+            "what are we missing",
+            "hidden insight",
+            "hidden insights",
+            "strategic business review",
+            "management review",
+            "owner review",
+        )
+    ) or (
+        _text_matches_all_terms(normalized, r"\b(business|data)\b", r"\banalyst\b")
+        or _text_matches_all_terms(normalized, r"\b(entire|whole|overall)\b", r"\b(data|business|workspace|system|operation|operations)\b", r"\b(analy[sz]e|review|insight|insights)\b")
+        or _text_matches_all_terms(normalized, r"\bwhat\b", r"\b(missing|not seeing|overlooked)\b")
+    ):
+        return "business_analyst_review"
+    if any(
+        token in normalized
+        for token in (
+            "compare locations",
+            "compare branches",
+            "location performance",
+            "branch is winning on sales",
+            "branch has strong sales but poor replenishment posture",
+            "location needs the most intervention",
+            "branch scorecard",
+            "overall operational readiness",
+            "side-by-side location performance",
+            "revenue, orders, and stock risk",
+            "location performance gaps",
+            "top sellers and stockouts",
+            "rank locations",
+        )
+    ) or (
+        _text_matches_all_terms(normalized, r"\b(compare|rank)\b", r"\b(location|locations|branch|branches)\b")
+        or _text_matches_all_terms(normalized, r"\b(location|branch)\b", r"\b(scorecard|performance)\b")
+    ):
+        return "location_comparison"
+    if any(
+        token in normalized
+        for token in (
+            "top three actions",
+            "urgent operator recommendations",
+            "improve sales and reduce stock risk fastest",
+            "prioritized action plan",
+            "what should i do first",
+        )
+    ) or (
+        _text_matches_all_terms(normalized, r"\b(action|actions|recommendation|recommendations)\b", r"\b(next|urgent|prioritized|first)\b")
+        or _text_matches_all_terms(normalized, r"\bwhat\b", r"\bshould i do first\b")
+    ):
+        return "recommendations"
+    if any(
+        token in normalized
+        for token in (
+            "operational summary for today",
+            "one-screen operational summary",
+            "business signals across sales, stock, and purchasing",
+            "whole workspace",
+            "revenue, stock risk, and po status together",
+            "executive operational snapshot",
+            "strong and weak across inventory and pos",
+            "cross-service health overview",
+            "business posture across sales, stock, staff, and procurement",
+            "operational changes since yesterday",
+            "workspace summary with the key metrics and risks",
+            "pay attention to first across the whole workspace",
+        )
+    ) or (
+        _text_matches_all_terms(normalized, r"\boperational\b", r"\bsummary\b")
+        or _text_matches_all_terms(normalized, r"\bbusiness\b", r"\bsignals?\b")
+        or _text_matches_all_terms(normalized, r"\bwhole\b", r"\bworkspace\b")
+        or _text_matches_all_terms(normalized, r"\brevenue\b", r"\bstock\b", r"\bpo\b")
+        or _text_matches_all_terms(normalized, r"\bexecutive\b", r"\bsnapshot\b")
+        or _text_matches_all_terms(normalized, r"\bstrong\b", r"\bweak\b", r"\b(inventory|stock)\b", r"\b(pos|sales)\b")
+        or _text_matches_all_terms(normalized, r"\bcross[\s-]*service\b", r"\bhealth\b")
+        or _text_matches_all_terms(normalized, r"\bbusiness\b", r"\bposture\b")
+        or _text_matches_all_terms(normalized, r"\boperational\b", r"\bchanges?\b", r"\byesterday\b")
+        or _text_matches_all_terms(normalized, r"\bworkspace\b", r"\bsummary\b", r"\b(metrics|risks?)\b")
+    ):
+        return "cross_domain_ops"
+    passthrough_insight = _host_passthrough_named_insight_from_text(normalized)
+    if passthrough_insight:
+        return passthrough_insight
+    return None
+
+
+def _inventory_visibility_named_insight_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if any(
+        token in normalized
+        for token in (
+            "out-of-stock",
+            "out of stock",
+            "stockout",
+            "stockouts",
+            "zero-balance",
+            "zero balance",
+            "missing from the shelf",
+            "missing from shelf",
+        )
+    ):
+        return "stock_risk_out_of_stock"
+    if _text_matches_all_terms(normalized, r"\blow\b", r"\bstock\b"):
+        return "stock_risk_low_stock"
+    if any(token in normalized for token in ("run out soon", "below reorder level", "closest to stockout")):
+        return "stock_risk_low_stock"
+    if (
+        any(token in normalized for token in ("supplier-linked", "supplier linked", "supplier defaults"))
+        and "replenishment first" in normalized
+    ):
+        return "reorder_candidates"
+    if any(
+        token in normalized
+        for token in (
+            "stock value",
+            "inventory value",
+            "stock value change",
+            "stock value changes",
+            "inventory value change",
+            "inventory value changes",
+            "value variance",
+            "stock variance",
+            "inventory variance",
+            "value trend",
+            "stock value trend",
+            "inventory value trend",
+        )
+    ):
+        return "stock_value_changes"
+    if any(
+        token in normalized
+        for token in (
+            "realtime dashboard snapshot",
+            "realtime snapshot",
+            "real-time dashboard snapshot",
+            "live dashboard snapshot",
+            "current dashboard snapshot",
+            "dashboard snapshot right now",
+            "inventory health across locations",
+            "location has the biggest stock risk",
+            "biggest stock risk right now",
+            "stock posture by branch",
+            "stock by location",
+            "replenishment first",
+            "category concentration by location",
+            "overstocked versus understocked",
+            "inventory readiness",
+            "healthiest from an inventory standpoint",
+            "inventory value and stock pressure",
+        )
+    ):
+        if any(
+            token in normalized
+            for token in (
+                "realtime dashboard snapshot",
+                "realtime snapshot",
+                "real-time dashboard snapshot",
+                "live dashboard snapshot",
+                "current dashboard snapshot",
+                "dashboard snapshot right now",
+            )
+        ):
+            return "realtime_snapshot"
+        return "location_health"
+    if (
+        _text_matches_all_terms(normalized, r"\breorder\b", r"\b(candidate|candidates|need|needs|priority|priorities|now)\b")
+        or any(
+            token in normalized
+            for token in (
+                "purchasing prioritize",
+                "safety stock",
+                "supplier defaults",
+                "reorder pressure",
+                "reorder short list",
+            )
+        )
+    ):
+        return "reorder_candidates"
+    if _text_matches_all_terms(normalized, r"\b(stock|inventory)\b", r"\b(risk|risks|alerts)\b"):
+        return "stock_risk"
+    if (
+        _text_matches_all_terms(normalized, r"\b(stock|inventory)\b", r"\bmovement\b")
+        or any(
+            token in normalized
+            for token in (
+                "recent stock movements",
+                "inventory movements happened today",
+                "stock in versus stock out",
+                "movement timeline",
+                "receiving, transfers, and issues",
+                "movement trends",
+                "movement history",
+                "movement dashboard",
+                "stock depletion",
+            )
+        )
+    ):
+        return "stock_movements"
+    if any(
+        token in normalized
+        for token in (
+            "adjustment risk",
+            "stock adjustments",
+            "adjustment-heavy",
+            "adjustment activity by staff and item",
+            "manual corrections",
+            "negative adjustment trend",
+            "correction patterns",
+            "process issues",
+            "adjustment anomalies",
+        )
+    ):
+        return "adjustment_risk"
+    return None
+
+
+def _inventory_risk_rows(payload: dict[str, Any], *, focus: str | None = None) -> list[dict[str, Any]]:
+    risk_items = payload.get("risk_items") if isinstance(payload.get("risk_items"), dict) else {}
+    if focus and isinstance(risk_items.get(focus), list):
+        rows = risk_items.get(focus)
+    else:
+        rows = []
+        for key in ("out_of_stock", "needs_reorder", "low_stock", "expiring_soon"):
+            value = risk_items.get(key)
+            if isinstance(value, list):
+                rows.extend(value)
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _build_inventory_stock_risk_insight(payload: dict[str, Any], *, focus: str | None = None) -> dict[str, Any]:
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    rows = _inventory_risk_rows(payload, focus=focus)
+    ranked_items = []
+    risk_panel_items = []
+    for row in rows[:12]:
+        label = _first_string(row, ["name", "inventory_item_name", "product_variant", "sku", "barcode"]) or "Inventory item"
+        quantity = float(row.get("quantity_available") or row.get("quantity") or 0)
+        location_name = _first_string(row, ["location_name"]) or "Unassigned location"
+        ranked_items.append(
+            {
+                "label": label,
+                "value": quantity,
+                "secondary_value": location_name,
+                "meta": {
+                    "sku": str(row.get("sku") or ""),
+                    "barcode": str(row.get("barcode") or ""),
+                    "location_name": location_name,
+                    "reorder_point": float(row.get("reorder_point") or 0),
+                    "minimum_stock_level": float(row.get("minimum_stock_level") or 0),
+                },
+            }
+        )
+        risk_panel_items.append(
+            {
+                "label": label,
+                "severity": "high" if focus == "out_of_stock" else "medium",
+                "detail": f"{location_name} · available {quantity}",
+                "next_action": "Review replenishment or transfer options.",
+            }
+        )
+    if focus == "out_of_stock":
+        summary_text = "Out-of-stock products are ready."
+    elif focus == "low_stock":
+        summary_text = "Low-stock products are ready."
+    elif focus == "needs_reorder":
+        summary_text = "Reorder candidates are ready."
+    else:
+        summary_text = "Inventory stock risk is ready."
+    if not rows:
+        if focus == "out_of_stock":
+            summary_text = "No out-of-stock products are active right now."
+        elif focus == "low_stock":
+            summary_text = "No low-stock products are active right now."
+        elif focus == "needs_reorder":
+            summary_text = "No reorder candidates are active right now."
+        else:
+            summary_text = "No inventory stock risks are active right now."
+    return {
+        "kind": "insight_response",
+        "summary": summary_text,
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Inventory risk posture",
+                "data": [
+                    {"label": "Out of Stock", "value": int(summary.get("out_of_stock_count") or 0)},
+                    {"label": "Needs Reorder", "value": int(summary.get("reorder_count") or 0)},
+                    {"label": "Low Stock", "value": int(summary.get("low_stock_count") or 0)},
+                    {"label": "Expiring Soon", "value": int(summary.get("expiring_count") or 0)},
+                ],
+            },
+            {
+                "type": "risk_panel",
+                "title": "Highest priority stock risks",
+                "items": risk_panel_items,
+            },
+            {
+                "type": "ranked_list",
+                "title": "Items needing attention",
+                "items": ranked_items,
+                "ordered_by": "quantity_available",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "inventory", "endpoint_or_topic": "get_stock_risk", "freshness": "live"}],
+        "permissions_checked": ["read_inventory"],
+        "confidence": "high",
+        "warnings": [] if rows else ["No inventory items matched the requested risk posture."],
+    }
+
+
+def _build_inventory_movements_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    results = payload.get("results") if isinstance(payload, dict) else []
+    results = results if isinstance(results, list) else []
+    timeline_items = []
+    type_counts: dict[str, int] = {}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        movement_type = str(item.get("movement_type") or "movement")
+        type_counts[movement_type] = type_counts.get(movement_type, 0) + 1
+        timeline_items.append(
+            {
+                "timestamp": str(item.get("occurred_at") or ""),
+                "title": f"{movement_type.replace('_', ' ').title()} {float(item.get('quantity') or 0):g}",
+                "description": str(item.get("inventory_item_name") or ""),
+                "severity": "info",
+            }
+        )
+    chart_rows = [{"label": key.replace("_", " ").title(), "count": value} for key, value in type_counts.items()]
+    return {
+        "kind": "insight_response",
+        "summary": "Recent stock movements are ready." if timeline_items else "No recent stock movements were found.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Movement snapshot",
+                "data": [
+                    {"label": "Events", "value": len(timeline_items)},
+                    {"label": "Movement Types", "value": len(chart_rows)},
+                ],
+            },
+            {
+                "type": "timeline",
+                "title": "Recent stock movements",
+                "events": timeline_items,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "inventory", "endpoint_or_topic": "get_stock_movements", "freshness": "live"}],
+        "permissions_checked": ["read_inventory"],
+        "confidence": "high",
+        "warnings": [] if timeline_items else ["No recent stock movements matched the requested window."],
+    }
+
+
+def _build_inventory_location_health_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    results = payload.get("results") if isinstance(payload, dict) else []
+    results = results if isinstance(results, list) else []
+    rows = []
+    risk_items = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        row = {
+            "location": str(item.get("name") or "Location"),
+            "items": int(item.get("total_items") or 0),
+            "quantity": float(item.get("total_quantity") or 0),
+            "value": float(item.get("total_value") or 0),
+            "expiring_soon": int(item.get("expiring_soon_count") or 0),
+        }
+        rows.append(row)
+        if row["expiring_soon"] > 0:
+            risk_items.append(
+                {
+                    "label": row["location"],
+                    "severity": "medium",
+                    "description": f"{row['expiring_soon']} items expiring soon.",
+                }
+            )
+    return {
+        "kind": "insight_response",
+        "summary": "Location inventory health is ready." if rows else "No location inventory summary is available.",
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": "Inventory health by location",
+                "columns": ["location", "items", "quantity", "value", "expiring_soon"],
+                "rows": rows,
+            },
+            {
+                "type": "risk_panel",
+                "title": "Location pressure",
+                "items": risk_items or [{"label": "All locations", "severity": "low", "description": "No immediate expiring-stock pressure detected."}],
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "inventory", "endpoint_or_topic": "search_stock_locations", "freshness": "live"}],
+        "permissions_checked": ["read_inventory"],
+        "confidence": "medium",
+        "warnings": [] if rows else ["No stock-location summaries were returned."],
+    }
+
+
+def _build_realtime_dashboard_snapshot_insight(
+    snapshot_payload: dict[str, Any],
+    alerts_payload: dict[str, Any],
+) -> dict[str, Any]:
+    metrics = snapshot_payload.get("metrics") if isinstance(snapshot_payload.get("metrics"), dict) else {}
+    charts = snapshot_payload.get("charts") if isinstance(snapshot_payload.get("charts"), dict) else {}
+    leaderboards = snapshot_payload.get("leaderboards") if isinstance(snapshot_payload.get("leaderboards"), dict) else {}
+    alerts = snapshot_payload.get("alerts") if isinstance(snapshot_payload.get("alerts"), dict) else {}
+    feed = snapshot_payload.get("feed") if isinstance(snapshot_payload.get("feed"), list) else []
+
+    metric_rows = [
+        {"label": "Sales 24h", "value": float(metrics.get("sales_24h_amount") or 0)},
+        {"label": "Orders 24h", "value": int(metrics.get("sales_24h_orders") or 0)},
+        {"label": "Receiving Units 24h", "value": int(metrics.get("receiving_24h_units") or 0)},
+        {"label": "Attention Items", "value": int(alerts.get("total_attention_items") or 0)},
+        {"label": "Security Events 24h", "value": int(metrics.get("security_events_24h") or 0)},
+        {"label": "Unread Alerts", "value": int(alerts_payload.get("unread_count") or 0)},
+    ]
+    sales_chart = charts.get("sales_amount_by_hour") if isinstance(charts.get("sales_amount_by_hour"), list) else []
+    leaderboard_rows = leaderboards.get("top_products_24h") if isinstance(leaderboards.get("top_products_24h"), list) else []
+    ranked_items = [
+        {
+            "label": str(item.get("title") or "Product"),
+            "value": float(item.get("metric_value") or 0),
+            "secondary_value": str(item.get("subtitle") or ""),
+        }
+        for item in leaderboard_rows[:8]
+        if isinstance(item, dict)
+    ]
+    risk_items = [
+        {
+            "label": "High severity activity",
+            "severity": "high" if int(alerts.get("high_severity_24h") or 0) > 0 else "low",
+            "description": f"{int(alerts.get('high_severity_24h') or 0)} high-severity events in the last 24 hours.",
+        },
+        {
+            "label": "Support access activity",
+            "severity": "medium" if int(alerts.get("support_access_24h") or 0) > 0 else "low",
+            "description": f"{int(alerts.get('support_access_24h') or 0)} support-access events in the last 24 hours.",
+        },
+        {
+            "label": "Notification pressure",
+            "severity": "medium" if int(alerts_payload.get("unread_count") or 0) > 0 else "low",
+            "description": f"{int(alerts_payload.get('unread_count') or 0)} unread notifications for the active workspace.",
+        },
+    ]
+    timeline_events = [
+        {
+            "title": str(item.get("title") or item.get("summary") or item.get("event_name") or "Audit event"),
+            "subtitle": str(item.get("subtitle") or item.get("source_service") or ""),
+            "timestamp": str(item.get("occurred_at") or ""),
+            "severity": str(item.get("severity") or "info"),
+            "meta": [
+                {"label": "Actor", "value": str(item.get("actor_name") or "")},
+                {"label": "Target", "value": str(item.get("target_label") or "")},
+            ],
+        }
+        for item in feed[:8]
+        if isinstance(item, dict)
+    ]
+    warnings = []
+    if not sales_chart:
+        warnings.append("No hourly sales series was returned in the realtime snapshot.")
+    if not timeline_events:
+        warnings.append("No recent audit feed items were returned in the realtime snapshot.")
+    return {
+        "kind": "insight_response",
+        "summary": "Realtime operational snapshot is ready.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Realtime dashboard snapshot",
+                "data": metric_rows,
+            },
+            {
+                "type": "line_chart",
+                "title": "Sales amount by hour",
+                "data": sales_chart,
+                "x_key": "bucket",
+                "y_key": "value",
+            },
+            {
+                "type": "ranked_list",
+                "title": "Top products in the last 24 hours",
+                "items": ranked_items,
+                "ordered_by": "metric_value",
+            },
+            {
+                "type": "risk_panel",
+                "title": "Attention signals",
+                "items": risk_items,
+            },
+            {
+                "type": "timeline",
+                "title": "Recent operational feed",
+                "events": timeline_events,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "audit", "endpoint_or_topic": "get_realtime_dashboard_snapshot", "freshness": "live"},
+            {"service": "notifications", "endpoint_or_topic": "get_alert_summary", "freshness": "live"},
+        ],
+        "permissions_checked": ["view_audit_logs"],
+        "confidence": "high",
+        "warnings": warnings,
+    }
+
+
+def _build_stock_value_change_insight(
+    analytics_payload: dict[str, Any],
+    movements_payload: dict[str, Any],
+    *,
+    window_label: str,
+) -> dict[str, Any]:
+    analytics = analytics_payload.get("analytics") if isinstance(analytics_payload, dict) else {}
+    analytics = analytics if isinstance(analytics, dict) else {}
+    location_distribution = analytics.get("location_distribution") if isinstance(analytics.get("location_distribution"), list) else []
+    aging_analysis = analytics.get("aging_analysis") if isinstance(analytics.get("aging_analysis"), dict) else {}
+    movements = movements_payload.get("results") if isinstance(movements_payload, dict) else []
+    movements = movements if isinstance(movements, list) else []
+
+    def _movement_value(row: dict[str, Any]) -> float:
+        movement_type = str(row.get("movement_type") or "").strip().lower()
+        quantity = float(row.get("quantity") or 0)
+        unit_cost = float(row.get("unit_cost") or 0)
+        gross_value = quantity * unit_cost
+        if row.get("from_location_id") and row.get("to_location_id"):
+            return 0.0
+        negative_tokens = ("issue", "ship", "dispatch", "sale", "write", "damage", "shrink", "consume", "return_out")
+        positive_tokens = ("receive", "opening", "return_in", "count_surplus", "restock")
+        if any(token in movement_type for token in negative_tokens):
+            return -abs(gross_value)
+        if any(token in movement_type for token in positive_tokens):
+            return abs(gross_value)
+        if row.get("from_location_id") and not row.get("to_location_id"):
+            return -abs(gross_value)
+        if row.get("to_location_id") and not row.get("from_location_id"):
+            return abs(gross_value)
+        return gross_value
+
+    daily_totals: dict[str, float] = {}
+    inflow_value = 0.0
+    outflow_value = 0.0
+    for movement in movements:
+        if not isinstance(movement, dict):
+            continue
+        raw_timestamp = str(movement.get("occurred_at") or "").strip()
+        if len(raw_timestamp) < 10:
+            continue
+        bucket = raw_timestamp[:10]
+        delta_value = _movement_value(movement)
+        daily_totals[bucket] = round(daily_totals.get(bucket, 0.0) + delta_value, 2)
+        if delta_value >= 0:
+            inflow_value += delta_value
+        else:
+            outflow_value += abs(delta_value)
+
+    chart_rows = [{"bucket": bucket, "value": value} for bucket, value in sorted(daily_totals.items())]
+    table_rows = [
+        {
+            "location": str(item.get("location_name") or "Location"),
+            "items": int(item.get("item_count") or 0),
+            "quantity": float(item.get("total_quantity") or 0),
+            "value": float(item.get("total_value") or 0),
+        }
+        for item in location_distribution[:10]
+        if isinstance(item, dict)
+    ]
+    risk_items = [
+        {
+            "label": "Aged stock",
+            "severity": "medium" if int(aging_analysis.get("over_1_year") or 0) > 0 else "low",
+            "description": f"{int(aging_analysis.get('over_1_year') or 0)} stock positions are older than one year.",
+        },
+        {
+            "label": "Mid-age stock",
+            "severity": "medium" if int(aging_analysis.get("91-365_days") or 0) > 0 else "low",
+            "description": f"{int(aging_analysis.get('91-365_days') or 0)} stock positions have aged beyond 90 days.",
+        },
+        {
+            "label": "Observed value swings",
+            "severity": "medium" if abs(inflow_value - outflow_value) > 0 else "low",
+            "description": f"Inflows were {round(inflow_value, 2)} and outflows were {round(outflow_value, 2)} for {window_label}.",
+        },
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": f"Stock value analysis is ready for {window_label}.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Stock value for {window_label}",
+                "data": [
+                    {"label": "Current Stock Value", "value": float(analytics.get("total_stock_value") or 0)},
+                    {"label": "Value Inflows", "value": round(inflow_value, 2)},
+                    {"label": "Value Outflows", "value": round(outflow_value, 2)},
+                    {"label": "Locations", "value": int(analytics.get("total_locations") or 0)},
+                ],
+            },
+            {
+                "type": "line_chart",
+                "title": f"Stock value changes for {window_label}",
+                "data": chart_rows,
+                "x_key": "bucket",
+                "y_key": "value",
+            },
+            {
+                "type": "comparison_table",
+                "title": "Stock value by location",
+                "columns": ["location", "items", "quantity", "value"],
+                "rows": table_rows,
+            },
+            {
+                "type": "risk_panel",
+                "title": "Value variance watchpoints",
+                "items": risk_items,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "inventory", "endpoint_or_topic": "get_stock_analytics", "freshness": "live"},
+            {"service": "inventory", "endpoint_or_topic": "get_stock_movements", "freshness": "live"},
+        ],
+        "permissions_checked": ["read_inventory"],
+        "confidence": "medium",
+        "warnings": [] if chart_rows else [f"No stock movements were returned for {window_label}."],
+    }
+
+
+def _build_inventory_adjustment_risk_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    results = payload.get("results") if isinstance(payload, dict) else []
+    results = results if isinstance(results, list) else []
+    risk_items = []
+    timeline_items = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        qty = float(item.get("quantity") or 0)
+        title = str(item.get("inventory_item_name") or "Inventory item")
+        timeline_items.append(
+            {
+                "timestamp": str(item.get("occurred_at") or ""),
+                "title": f"Adjustment {qty:g}",
+                "description": title,
+                "severity": "medium" if qty < 0 else "info",
+            }
+        )
+        if qty < 0:
+            risk_items.append(
+                {
+                    "label": title,
+                    "severity": "high" if abs(qty) >= 5 else "medium",
+                    "description": f"Negative adjustment of {abs(qty):g}.",
+                }
+            )
+    return {
+        "kind": "insight_response",
+        "summary": "Inventory adjustment risk is ready." if timeline_items else "No recent adjustment activity was found.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Adjustment snapshot",
+                "data": [
+                    {"label": "Adjustment Events", "value": len(timeline_items)},
+                    {"label": "Negative Adjustments", "value": len(risk_items)},
+                ],
+            },
+            {
+                "type": "risk_panel",
+                "title": "Adjustment anomalies",
+                "items": risk_items or [{"label": "Current adjustment posture", "severity": "low", "description": "No negative adjustment spikes detected."}],
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "inventory", "endpoint_or_topic": "get_stock_movements", "freshness": "live"}],
+        "permissions_checked": ["read_inventory"],
+        "confidence": "medium",
+        "warnings": [] if timeline_items else ["No recent adjustment movements matched the requested window."],
+    }
+
+
+def _build_pos_sales_by_location_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="today")
+    groups = payload.get("groups") if isinstance(payload, dict) else []
+    groups = groups if isinstance(groups, list) else []
+    total_sales = float(payload.get("total_sales") or 0) if isinstance(payload, dict) else 0.0
+    total_orders = sum(int(item.get("order_count") or 0) for item in groups if isinstance(item, dict))
+    chart_rows = [
+        {
+            "label": str(item.get("label") or "Unassigned location"),
+            "value": float(item.get("total_sales") or 0),
+            "order_count": int(item.get("order_count") or 0),
+            "average_basket": round(
+                float(item.get("total_sales") or 0) / max(int(item.get("order_count") or 0), 1),
+                2,
+            ),
+        }
+        for item in groups
+        if isinstance(item, dict)
+    ]
+    top_location = chart_rows[0]["label"] if chart_rows else "No sales"
+    average_basket = round(total_sales / max(total_orders, 1), 2) if total_orders else 0.0
+    summary = (
+        f"{top_location} leads sales for {window_label}."
+        if chart_rows
+        else f"No completed POS sales were recorded for {window_label}."
+    )
+    explanation = (
+        f"{top_location} generated the most revenue in {window_label}, while average basket size settled at {average_basket}."
+        if chart_rows
+        else "There is no completed sales activity to compare across locations for the selected window."
+    )
+    return {
+        "kind": "insight_response",
+        "summary": summary,
+        "explanation": explanation,
+        "insights": (
+            [
+                {
+                    "title": "Leading location",
+                    "detail": f"{top_location} produced the highest sales volume for {window_label}.",
+                },
+                {
+                    "title": "Coverage",
+                    "detail": f"{len(chart_rows)} locations contributed {total_orders} completed orders.",
+                },
+            ]
+            if chart_rows
+            else []
+        ),
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"{window_label.title()} across locations",
+                "data": [
+                    {"label": "Sales", "value": round(total_sales, 2)},
+                    {"label": "Orders", "value": total_orders},
+                    {"label": "Avg Basket", "value": average_basket},
+                    {"label": "Locations", "value": len(chart_rows)},
+                ],
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Sales by location for {window_label}",
+                "data": chart_rows,
+                "x_key": "label",
+                "y_key": "value",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "pos", "endpoint_or_topic": "get_sales_summary", "freshness": "live"}],
+        "permissions_checked": ["view_pos_reports"],
+        "confidence": "high",
+        "warnings": [] if chart_rows else ["No completed sales matched the requested window."],
+    }
+
+
+def _xml_text(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _product_image_url(item: dict[str, Any]) -> str:
+    for key in ("image_url", "product_variant_image_url", "display_image", "image"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+
+    label = str(item.get("variant_name") or item.get("product_name") or item.get("label") or "Product").strip()
+    barcode = str(item.get("barcode") or item.get("barcode_snapshot") or "").strip()
+    sku = str(item.get("sku") or item.get("sku_snapshot") or "").strip()
+    seed = (barcode or sku or label or "product").lower()
+    palette = [
+        ("#0f766e", "#ecfeff", "#99f6e4"),
+        ("#1d4ed8", "#eff6ff", "#bfdbfe"),
+        ("#b45309", "#fffbeb", "#fde68a"),
+        ("#be123c", "#fff1f2", "#fecdd3"),
+        ("#6d28d9", "#f5f3ff", "#ddd6fe"),
+        ("#047857", "#ecfdf5", "#a7f3d0"),
+    ]
+    bg, fg, accent = palette[sum(ord(char) for char in seed) % len(palette)]
+    initials = "".join(part[0] for part in re.split(r"[^A-Za-z0-9]+", label) if part)[:3].upper() or "IMS"
+    display_label = _xml_text(label[:34])
+    display_code = _xml_text(barcode or sku or "No barcode")
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
+<rect width="160" height="160" rx="28" fill="{fg}"/>
+<circle cx="126" cy="30" r="34" fill="{accent}"/>
+<rect x="22" y="22" width="116" height="78" rx="22" fill="{bg}"/>
+<text x="80" y="74" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="34" font-weight="800" fill="white">{_xml_text(initials)}</text>
+<text x="80" y="122" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#0f172a">{display_label}</text>
+<text x="80" y="140" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="9" fill="#475569">{display_code}</text>
+</svg>"""
+    return "data:image/svg+xml;utf8," + quote(svg)
+
+
+def _extract_product_query_from_text(text: str) -> str:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return ""
+    quoted = re.search(r"['\"]([^'\"]{2,120})['\"]", normalized)
+    if quoted:
+        return quoted.group(1).strip()
+    for pattern in (
+        r"\bbarcode\s*(?:is|:|#)?\s*([A-Za-z0-9][A-Za-z0-9_-]{3,80})\b",
+        r"\bsku\s*(?:is|:|#)?\s*([A-Za-z0-9][A-Za-z0-9_-]{2,80})\b",
+        r"\bvariant\s*(?:id|code)?\s*(?:is|:|#)?\s*([A-Za-z0-9][A-Za-z0-9_-]{3,80})\b",
+    ):
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    numeric_code = re.search(r"\b\d{8,18}\b", normalized)
+    if numeric_code:
+        return numeric_code.group(0)
+    for pattern in (
+        r"\b(?:for|of|on|about)\s+(.+?)(?:\s+(?:for|over|across|in|during|from|between)\b|[?.!]|$)",
+        r"\b(?:trend|analysis|performance|compare)\s+(.+?)(?:\s+(?:for|over|across|in|during|from|between)\b|[?.!]|$)",
+    ):
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            candidate = re.sub(r"\b(the|this|that|product|variant|item|sales|trend|analysis|performance)\b", " ", match.group(1), flags=re.IGNORECASE)
+            candidate = re.sub(r"\s+", " ", candidate).strip(" .,:;")
+            if len(candidate) >= 2:
+                return candidate
+    return ""
+
+
+def _extract_product_comparison_queries_from_text(text: str) -> list[str]:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return []
+    quoted = [item.strip() for item in re.findall(r"['\"]([^'\"]{2,120})['\"]", normalized) if item.strip()]
+    if len(quoted) >= 2:
+        return quoted[:5]
+
+    candidate = re.sub(
+        r"(?i)\b(compare|comparison|versus|vs|side by side|side-by-side|performance|sales|revenue|units|orders|order count|products?|items?)\b",
+        " ",
+        normalized,
+    )
+    candidate = re.split(r"(?i)\b(?:for|over|during|from|between|in the past|last|past)\b", candidate, maxsplit=1)[0]
+    parts = re.split(r"(?i)\s+(?:vs\.?|versus|and|against|with)\s+|[,/]+", candidate)
+    cleaned: list[str] = []
+    for part in parts:
+        value = re.sub(r"\s+", " ", part).strip(" .,:;?\"'")
+        value = re.sub(r"(?i)\b(the|this|that|a|an|of|by|barcode|sku|code)\b", " ", value)
+        value = re.sub(r"\s+", " ", value).strip(" .,:;?\"'")
+        if len(value) >= 2 and value.lower() not in {"product", "products", "item", "items"}:
+            cleaned.append(value)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in cleaned:
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value)
+    return deduped[:5]
+
+
+def _build_pos_sales_overview_insight(
+    payload: dict[str, Any],
+    *,
+    top_sellers_payload: dict[str, Any] | None = None,
+    daily_sales_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="the selected period")
+    groups = payload.get("groups") if isinstance(payload, dict) else []
+    groups = groups if isinstance(groups, list) else []
+    total_sales = float(payload.get("total_sales") or 0) if isinstance(payload, dict) else 0.0
+    total_orders = sum(int(item.get("order_count") or 0) for item in groups if isinstance(item, dict))
+    average_basket = round(total_sales / max(total_orders, 1), 2) if total_orders else 0.0
+    rows = [
+        {
+            "location": str(item.get("label") or "Unassigned location"),
+            "orders": int(item.get("order_count") or 0),
+            "sales": round(float(item.get("total_sales") or 0), 2),
+        }
+        for item in groups
+        if isinstance(item, dict)
+    ]
+    sales_chart_rows = [
+        {
+            "label": row["location"],
+            "value": row["sales"],
+        }
+        for row in rows
+    ]
+    order_share_rows = [
+        {
+            "label": row["location"],
+            "value": row["orders"],
+        }
+        for row in rows
+        if row["orders"] > 0
+    ]
+    daily_groups = daily_sales_payload.get("groups") if isinstance(daily_sales_payload, dict) else []
+    daily_groups = daily_groups if isinstance(daily_groups, list) else []
+    daily_sales_rows = [
+        {
+            "label": str(item.get("label") or ""),
+            "value": round(float(item.get("total_sales") or 0), 2),
+            "order_count": int(item.get("order_count") or 0),
+        }
+        for item in daily_groups
+        if isinstance(item, dict)
+    ]
+    peak_day = max(daily_sales_rows, key=lambda row: (float(row.get("value") or 0), int(row.get("order_count") or 0)), default=None)
+    top_seller_results = top_sellers_payload.get("results") if isinstance(top_sellers_payload, dict) else []
+    top_seller_results = top_seller_results if isinstance(top_seller_results, list) else []
+    product_revenue_rows = []
+    product_unit_rows = []
+    product_ranked_items = []
+    for item in top_seller_results[:8]:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("variant_name") or item.get("product_name") or "Unnamed item")
+        units_sold = round(float(item.get("quantity_sold") or 0), 2)
+        revenue_amount = round(float(item.get("sales_total") or 0), 2)
+        order_count = int(item.get("order_count") or 0)
+        product_revenue_rows.append({"label": label, "value": revenue_amount})
+        product_unit_rows.append({"label": label, "value": units_sold})
+        product_ranked_items.append(
+            {
+                "label": label,
+                "value": revenue_amount,
+                "format": "currency",
+                "secondary_value": units_sold,
+                "secondary_format": "number",
+                "image_url": _product_image_url(item),
+                "barcode": str(item.get("barcode") or item.get("barcode_snapshot") or ""),
+                "detail": f"{order_count} orders" if order_count else "",
+            }
+        )
+    top_location = rows[0]["location"] if rows else "No sales"
+    top_product = product_ranked_items[0]["label"] if product_ranked_items else "No product leader"
+    leading_location_share = round((rows[0]["sales"] / total_sales) * 100, 1) if rows and total_sales else 0.0
+    currency_code = str(payload.get("currency_code") or payload.get("currency") or "NGN").upper()
+    currency_symbol = {
+        "NGN": "₦",
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£",
+        "JPY": "¥",
+        "CAD": "C$",
+        "AUD": "A$",
+        "GHS": "₵",
+        "KES": "KSh",
+        "ZAR": "R",
+    }.get(currency_code, f"{currency_code} ")
+    total_sales_label = f"{currency_symbol}{total_sales:,.2f}"
+    summary = (
+        f"{total_orders} sales were recorded for {window_label}, totaling {total_sales_label}."
+        if total_orders
+        else f"No completed sales were recorded for {window_label}."
+    )
+    explanation = (
+        f"{top_location} contributed the most revenue for {window_label} at {leading_location_share}% of sales, and {top_product} led the product mix."
+        if total_orders
+        else "There is no completed sales activity to analyze for the selected window."
+    )
+    widgets: list[dict[str, Any]] = [
+        {
+            "type": "metric_grid",
+            "title": f"Sales overview for {window_label}",
+            "data": [
+                {"label": "Sales Count", "value": total_orders},
+                {"label": "Revenue", "value": round(total_sales, 2)},
+                {"label": "Avg Basket", "value": average_basket},
+                {"label": "Top Location", "value": top_location},
+            ],
+        },
+    ]
+    if daily_sales_rows:
+        widgets.append(
+            {
+                "type": "line_chart",
+                "title": f"Daily sales trend for {window_label}",
+                "subtitle": "Use this to spot the strongest and weakest days across the period.",
+                "x_key": "label",
+                "y_key": "value",
+                "value_format": "currency",
+                "data": daily_sales_rows,
+            }
+        )
+    widgets.extend(
+        [
+            {
+                "type": "comparison_table",
+                "title": f"Location contribution for {window_label}",
+                "columns": ["location", "orders", "sales"],
+                "rows": rows,
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Sales by location for {window_label}",
+                "subtitle": "Use this to compare location revenue at a glance.",
+                "x_key": "label",
+                "y_key": "value",
+                "value_format": "currency",
+                "data": sales_chart_rows,
+            },
+            {
+                "type": "donut_chart",
+                "title": f"Order share by location for {window_label}",
+                "subtitle": "This shows how the order mix was split across locations.",
+                "label_key": "label",
+                "value_key": "value",
+                "value_format": "number",
+                "data": order_share_rows,
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Top products by sales amount for {window_label}",
+                "subtitle": "This compares product revenue contribution inside the selected sales window.",
+                "x_key": "label",
+                "y_key": "value",
+                "value_format": "currency",
+                "data": product_revenue_rows,
+            },
+            {
+                "type": "histogram",
+                "title": f"Units sold by product for {window_label}",
+                "subtitle": "Use this to spot high-volume products even when revenue concentration differs.",
+                "x_key": "label",
+                "y_key": "value",
+                "value_format": "number",
+                "data": product_unit_rows,
+            },
+            {
+                "type": "donut_chart",
+                "title": f"Product revenue share for {window_label}",
+                "subtitle": "This shows which products are carrying the period's revenue mix.",
+                "label_key": "label",
+                "value_key": "value",
+                "value_format": "currency",
+                "data": product_revenue_rows,
+            },
+            {
+                "type": "ranked_list",
+                "title": f"Top products for {window_label}",
+                "items": product_ranked_items,
+                "ordered_by": "sales_total",
+            },
+        ]
+    )
+    return {
+        "kind": "insight_response",
+        "summary": summary,
+        "explanation": explanation,
+        "timeframe": {
+            "label": window_label,
+            "start_date": str(payload.get("_window_start_date") or ""),
+            "end_date": str(payload.get("_window_end_date") or ""),
+            "period": str(payload.get("_window_period") or ""),
+        },
+        "insights": [
+            {
+                "title": "Location concentration",
+                "detail": (
+                    f"{top_location} accounted for {leading_location_share}% of revenue in {window_label}."
+                    if total_orders and rows
+                    else "No location concentration signal is available."
+                ),
+            },
+            {
+                "title": "Best trading day",
+                "detail": (
+                    f"{peak_day['label']} delivered the peak daily revenue at {peak_day['value']} across {peak_day['order_count']} orders."
+                    if peak_day
+                    else "A day-by-day revenue trend was not available for this window."
+                ),
+            },
+            {
+                "title": "Product leader",
+                "detail": (
+                    f"{top_product} generated the highest product revenue in the selected period."
+                    if product_ranked_items
+                    else "No product-level sales split was available."
+                ),
+            },
+        ],
+        "widgets": widgets,
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "pos", "endpoint_or_topic": "get_sales_summary", "freshness": "live"},
+            {"service": "pos", "endpoint_or_topic": "get_sales_summary(day)", "freshness": "live"},
+            {"service": "pos", "endpoint_or_topic": "get_top_sellers", "freshness": "live"},
+        ],
+        "permissions_checked": ["view_pos_reports"],
+        "confidence": "high",
+        "warnings": (
+            [] if rows else ["No completed sales matched the requested window."]
+        ) + ([] if product_revenue_rows else ["No product-level sales breakdown was available for the requested window."]),
+    }
+
+
+def _build_pos_top_sellers_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="last 7 days")
+    results = payload.get("results") if isinstance(payload, dict) else []
+    results = results if isinstance(results, list) else []
+    ranked_items = []
+    total_quantity = 0.0
+    total_sales = 0.0
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        quantity_sold = float(item.get("quantity_sold") or 0)
+        sales_total = float(item.get("sales_total") or 0)
+        label = str(item.get("variant_name") or item.get("product_name") or "Unnamed item")
+        ranked_items.append(
+            {
+                "label": label,
+                "value": quantity_sold,
+                "format": "number",
+                "secondary_value": sales_total,
+                "secondary_format": "currency",
+                "image_url": _product_image_url(item),
+                "barcode": str(item.get("barcode_snapshot") or item.get("barcode") or ""),
+                "detail": f"{int(item.get('order_count') or 0)} orders" if int(item.get("order_count") or 0) else "",
+                "meta": {
+                    "product_name": str(item.get("product_name") or ""),
+                    "sku": str(item.get("sku_snapshot") or ""),
+                    "barcode": str(item.get("barcode_snapshot") or ""),
+                    "order_count": int(item.get("order_count") or 0),
+                },
+            }
+        )
+        total_quantity += quantity_sold
+        total_sales += sales_total
+    lead_label = ranked_items[0]["label"] if ranked_items else "No sellers"
+    summary = (
+        f"{lead_label} is the top seller for {window_label}."
+        if ranked_items
+        else f"No completed POS sales were recorded for {window_label}."
+    )
+    explanation = (
+        f"{lead_label} leads unit movement for {window_label}, and the ranked list shows whether revenue concentration matches volume concentration."
+        if ranked_items
+        else "There are no completed sales to rank for the selected period."
+    )
+    return {
+        "kind": "insight_response",
+        "summary": summary,
+        "explanation": explanation,
+        "insights": (
+            [
+                {
+                    "title": "Lead product",
+                    "detail": f"{lead_label} is currently the strongest-selling product in {window_label}.",
+                },
+                {
+                    "title": "Volume tracked",
+                    "detail": f"{round(total_quantity, 2)} units contributed {round(total_sales, 2)} in sales across the ranked set.",
+                },
+            ]
+            if ranked_items
+            else []
+        ),
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Sales for {window_label}",
+                "data": [
+                    {"label": "Units Sold", "value": round(total_quantity, 2)},
+                    {"label": "Sales", "value": round(total_sales, 2)},
+                    {"label": "Items Ranked", "value": len(ranked_items)},
+                ],
+            },
+            {
+                "type": "ranked_list",
+                "title": f"Top sellers for {window_label}",
+                "items": ranked_items,
+                "ordered_by": "quantity_sold",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "pos", "endpoint_or_topic": "get_top_sellers", "freshness": "live"}],
+        "permissions_checked": ["view_pos_reports"],
+        "confidence": "high",
+        "warnings": [] if ranked_items else ["No completed sales matched the requested window."],
+    }
+
+
+def _build_pos_product_sales_trend_insight(payload: dict[str, Any], *, variant_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="the selected period")
+    totals = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
+    trend = payload.get("trend") if isinstance(payload.get("trend"), list) else []
+    locations = payload.get("locations") if isinstance(payload.get("locations"), list) else []
+    products = payload.get("products") if isinstance(payload.get("products"), list) else []
+    recent_orders = payload.get("recent_orders") if isinstance(payload.get("recent_orders"), list) else []
+    first_product = products[0] if products and isinstance(products[0], dict) else {}
+    variant_results = variant_payload.get("results") if isinstance(variant_payload, dict) else []
+    variant_match = variant_results[0] if isinstance(variant_results, list) and variant_results and isinstance(variant_results[0], dict) else {}
+    product_name = str(
+        first_product.get("variant_name")
+        or first_product.get("product_name")
+        or variant_match.get("name")
+        or variant_match.get("product_name")
+        or payload.get("query")
+        or "Product"
+    )
+    product_context = {
+        "variant_name": product_name,
+        "product_name": str(first_product.get("product_name") or variant_match.get("product_name") or product_name),
+        "barcode": str(first_product.get("barcode_snapshot") or variant_match.get("barcode") or ""),
+        "sku": str(first_product.get("sku_snapshot") or variant_match.get("sku") or ""),
+        "image_url": str(variant_match.get("image_url") or ""),
+    }
+    trend_rows = [
+        {
+            "label": str(item.get("label") or ""),
+            "sales_total": round(float(item.get("sales_total") or 0), 2),
+            "quantity_sold": round(float(item.get("quantity_sold") or 0), 2),
+            "order_count": int(item.get("order_count") or 0),
+        }
+        for item in trend
+        if isinstance(item, dict)
+    ]
+    location_rows = [
+        {
+            "location": str(item.get("location") or "Unassigned location"),
+            "sales_total": round(float(item.get("sales_total") or 0), 2),
+            "quantity_sold": round(float(item.get("quantity_sold") or 0), 2),
+            "order_count": int(item.get("order_count") or 0),
+        }
+        for item in locations
+        if isinstance(item, dict)
+    ]
+    recent_rows = [
+        {
+            "completed_at": str(item.get("completed_at") or ""),
+            "location": str(item.get("location") or ""),
+            "terminal": str(item.get("terminal_name") or ""),
+            "quantity": round(float(item.get("quantity") or 0), 2),
+            "unit_price": round(float(item.get("unit_price") or 0), 2),
+            "line_total": round(float(item.get("line_total") or 0), 2),
+        }
+        for item in recent_orders[:10]
+        if isinstance(item, dict)
+    ]
+    sales_total = round(float(totals.get("sales_total") or 0), 2)
+    quantity_sold = round(float(totals.get("quantity_sold") or 0), 2)
+    order_count = int(totals.get("order_count") or 0)
+    average_unit_price = round(float(totals.get("average_unit_price") or 0), 2)
+    peak_bucket = max(trend_rows, key=lambda row: (row["sales_total"], row["quantity_sold"]), default=None)
+    top_location = location_rows[0] if location_rows else None
+    summary = (
+        f"{product_name} generated {sales_total} across {quantity_sold} units in {window_label}."
+        if order_count
+        else f"No completed sales were found for {product_name} in {window_label}."
+    )
+    explanation = (
+        f"{top_location['location']} led location contribution, and {peak_bucket['label']} was the strongest trend bucket."
+        if top_location and peak_bucket
+        else "The product has insufficient completed POS history for deeper trend commentary in this window."
+    )
+    return {
+        "kind": "insight_response",
+        "summary": summary,
+        "explanation": explanation,
+        "timeframe": {
+            "label": window_label,
+            "start_date": str(payload.get("_window_start_date") or ""),
+            "end_date": str(payload.get("_window_end_date") or ""),
+            "period": str(payload.get("_window_period") or ""),
+        },
+        "insights": [
+            {
+                "title": "Peak period",
+                "detail": (
+                    f"{peak_bucket['label']} led with {peak_bucket['sales_total']} in sales and {peak_bucket['quantity_sold']} units."
+                    if peak_bucket
+                    else "No sales bucket was available for this product."
+                ),
+            },
+            {
+                "title": "Location leader",
+                "detail": (
+                    f"{top_location['location']} contributed {top_location['sales_total']} across {top_location['quantity_sold']} units."
+                    if top_location
+                    else "No location split was available for this product."
+                ),
+            },
+        ],
+        "widgets": [
+            {
+                "type": "entity_preview",
+                "title": "Product analyzed",
+                "entity": {
+                    "kind": "Variant",
+                    "title": product_name,
+                    "subtitle": str(product_context.get("product_name") or ""),
+                    "image_url": _product_image_url(product_context),
+                    "meta": [
+                        {"label": "Barcode", "value": str(product_context.get("barcode") or "")},
+                        {"label": "SKU", "value": str(product_context.get("sku") or "")},
+                    ],
+                },
+            },
+            {
+                "type": "metric_grid",
+                "title": f"Product sales snapshot for {window_label}",
+                "data": [
+                    {"label": "Revenue", "value": sales_total, "format": "currency"},
+                    {"label": "Units Sold", "value": quantity_sold, "format": "number"},
+                    {"label": "Orders", "value": order_count, "format": "number"},
+                    {"label": "Avg Unit Price", "value": average_unit_price, "format": "currency"},
+                ],
+            },
+            {
+                "type": "line_chart",
+                "title": f"Sales trend for {product_name} in {window_label}",
+                "subtitle": "Revenue trend across the selected period.",
+                "x_key": "label",
+                "y_key": "sales_total",
+                "value_format": "currency",
+                "data": trend_rows,
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Units sold trend for {product_name} in {window_label}",
+                "x_key": "label",
+                "y_key": "quantity_sold",
+                "value_format": "number",
+                "data": trend_rows,
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Location contribution for {product_name}",
+                "x_key": "location",
+                "y_key": "sales_total",
+                "value_format": "currency",
+                "data": location_rows,
+            },
+            {
+                "type": "comparison_table",
+                "title": f"Recent sales for {product_name}",
+                "columns": ["completed_at", "location", "terminal", "quantity", "unit_price", "line_total"],
+                "rows": recent_rows,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "pos", "endpoint_or_topic": "get_product_sales_trend", "freshness": "live"},
+            {"service": "products", "endpoint_or_topic": "get_variant_lookup", "freshness": "live"},
+        ],
+        "permissions_checked": ["view_pos_reports", "read_products"],
+        "confidence": "high" if order_count else "medium",
+        "warnings": [] if order_count else ["No completed sales matched this product query and date range."],
+    }
+
+
+def _build_pos_product_comparison_insight(payloads: list[dict[str, Any]], *, window: dict[str, Any]) -> dict[str, Any]:
+    window_label = str(window.get("label") or "the selected period")
+    first_payload = payloads[0] if payloads else {}
+    currency_code = str(first_payload.get("currency_code") or first_payload.get("currency") or "NGN").upper()
+    currency_symbol = {
+        "NGN": "₦",
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£",
+        "JPY": "¥",
+        "CAD": "C$",
+        "AUD": "A$",
+        "GHS": "₵",
+        "KES": "KSh",
+        "ZAR": "R",
+    }.get(currency_code, f"{currency_code} ")
+    rows: list[dict[str, Any]] = []
+    all_buckets: set[str] = set()
+    series: list[dict[str, str]] = []
+    revenue_by_bucket: dict[str, dict[str, Any]] = {}
+    units_by_bucket: dict[str, dict[str, Any]] = {}
+    orders_by_bucket: dict[str, dict[str, Any]] = {}
+
+    def _money_label(amount: Any) -> str:
+        return f"{currency_symbol}{float(amount or 0):,.2f}"
+
+    def _count_label(value: Any) -> str:
+        numeric = float(value or 0)
+        return f"{numeric:,.0f}" if numeric.is_integer() else f"{numeric:,.2f}"
+
+    def _series_key(value: str, index: int) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower()
+        return f"product_{normalized or index}"
+
+    for payload_index, payload in enumerate(payloads, start=1):
+        totals = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
+        products = payload.get("products") if isinstance(payload.get("products"), list) else []
+        first_product = products[0] if products and isinstance(products[0], dict) else {}
+        product_name = str(
+            first_product.get("variant_name")
+            or first_product.get("product_name")
+            or payload.get("query")
+            or f"Product {payload_index}"
+        )
+        key = _series_key(product_name, payload_index)
+        series.append({"key": key, "label": product_name})
+        sales_total = round(float(totals.get("sales_total") or 0), 2)
+        quantity_sold = round(float(totals.get("quantity_sold") or 0), 2)
+        order_count = int(totals.get("order_count") or 0)
+        rows.append(
+            {
+                "product": product_name,
+                "barcode": str(first_product.get("barcode_snapshot") or ""),
+                "sales_total": sales_total,
+                "quantity_sold": quantity_sold,
+                "order_count": order_count,
+                "avg_unit_revenue": round(sales_total / quantity_sold, 2) if quantity_sold else 0,
+                "image_url": _product_image_url(
+                    {
+                        "variant_name": product_name,
+                        "product_name": str(first_product.get("product_name") or product_name),
+                        "barcode": str(first_product.get("barcode_snapshot") or ""),
+                        "sku": str(first_product.get("sku_snapshot") or ""),
+                    }
+                ),
+            }
+        )
+        trend_rows = payload.get("trend") if isinstance(payload.get("trend"), list) else []
+        for trend_item in trend_rows:
+            if not isinstance(trend_item, dict):
+                continue
+            bucket = str(trend_item.get("label") or "")
+            if not bucket:
+                continue
+            all_buckets.add(bucket)
+            revenue_by_bucket.setdefault(bucket, {"label": bucket})[key] = round(float(trend_item.get("sales_total") or 0), 2)
+            units_by_bucket.setdefault(bucket, {"label": bucket})[key] = round(float(trend_item.get("quantity_sold") or 0), 2)
+            orders_by_bucket.setdefault(bucket, {"label": bucket})[key] = int(trend_item.get("order_count") or 0)
+
+    for bucket in all_buckets:
+        for series_item in series:
+            revenue_by_bucket.setdefault(bucket, {"label": bucket}).setdefault(series_item["key"], 0)
+            units_by_bucket.setdefault(bucket, {"label": bucket}).setdefault(series_item["key"], 0)
+            orders_by_bucket.setdefault(bucket, {"label": bucket}).setdefault(series_item["key"], 0)
+
+    rows.sort(key=lambda row: (float(row["sales_total"]), float(row["quantity_sold"])), reverse=True)
+    total_sales = round(sum(float(row["sales_total"]) for row in rows), 2)
+    total_units = round(sum(float(row["quantity_sold"]) for row in rows), 2)
+    total_orders = sum(int(row["order_count"]) for row in rows)
+    leader = rows[0] if rows else None
+    ranked_items = [
+        {
+            "label": row["product"],
+            "value": row["sales_total"],
+            "format": "currency",
+            "secondary_value": row["quantity_sold"],
+            "secondary_format": "number",
+            "detail": f"{row['order_count']} orders",
+            "barcode": row["barcode"],
+            "image_url": row["image_url"],
+        }
+        for row in rows[:10]
+    ]
+    table_rows = [
+        {
+            "product": row["product"],
+            "barcode": row["barcode"],
+            "sales_total": row["sales_total"],
+            "quantity_sold": row["quantity_sold"],
+            "order_count": row["order_count"],
+            "avg_unit_revenue": row["avg_unit_revenue"],
+        }
+        for row in rows[:15]
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": (
+            f"{len(rows)} products were compared for {window_label}; {leader['product']} leads revenue."
+            if leader
+            else f"No product sales were found for {window_label}."
+        ),
+        "explanation": (
+            f"The compared products generated {_money_label(total_sales)} across {_count_label(total_units)} units and {_count_label(total_orders)} orders. Use the trend lines to see when each product gained or lost momentum."
+            if rows
+            else "There is not enough completed POS history to compare these products."
+        ),
+        "timeframe": {
+            "label": window_label,
+            "start_date": str(window.get("start_date") or ""),
+            "end_date": str(window.get("end_date") or ""),
+            "period": str(window.get("period") or ""),
+        },
+        "insights": [
+            {
+                "title": "Revenue leader",
+                "detail": (
+                    f"{leader['product']} is ahead with {_money_label(leader['sales_total'])} and {_count_label(leader['quantity_sold'])} units."
+                    if leader
+                    else "No leading product could be identified."
+                ),
+            },
+            {
+                "title": "Trend view",
+                "detail": "Revenue, units sold, and order count are shown separately so high-price products do not hide volume movement.",
+            },
+        ],
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Product comparison snapshot for {window_label}",
+                "data": [
+                    {"label": "Products Compared", "value": len(rows), "format": "number"},
+                    {"label": "Revenue", "value": total_sales, "format": "currency"},
+                    {"label": "Units Sold", "value": total_units, "format": "number"},
+                    {"label": "Orders", "value": total_orders, "format": "number"},
+                ],
+            },
+            {
+                "type": "ranked_list",
+                "title": f"Product revenue ranking for {window_label}",
+                "items": ranked_items,
+                "ordered_by": "sales_total",
+            },
+            {
+                "type": "line_chart",
+                "title": f"Product revenue trend for {window_label}",
+                "subtitle": "Each line tracks one product across the selected period.",
+                "x_key": "label",
+                "series": series,
+                "value_format": "currency",
+                "data": [revenue_by_bucket[key] for key in sorted(revenue_by_bucket)],
+            },
+            {
+                "type": "line_chart",
+                "title": f"Product units trend for {window_label}",
+                "subtitle": "Use this to compare quantity movement independent of price.",
+                "x_key": "label",
+                "series": series,
+                "value_format": "number",
+                "data": [units_by_bucket[key] for key in sorted(units_by_bucket)],
+            },
+            {
+                "type": "line_chart",
+                "title": f"Product order-count trend for {window_label}",
+                "subtitle": "This shows purchase frequency for each product.",
+                "x_key": "label",
+                "series": series,
+                "value_format": "number",
+                "data": [orders_by_bucket[key] for key in sorted(orders_by_bucket)],
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Product revenue comparison for {window_label}",
+                "x_key": "product",
+                "y_key": "sales_total",
+                "value_format": "currency",
+                "data": rows,
+            },
+            {
+                "type": "comparison_table",
+                "title": f"Product comparison table for {window_label}",
+                "columns": ["product", "barcode", "sales_total", "quantity_sold", "order_count", "avg_unit_revenue"],
+                "rows": table_rows,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "pos", "endpoint_or_topic": "get_product_sales_trend", "freshness": "live"}],
+        "permissions_checked": ["view_pos_reports"],
+        "confidence": "high" if rows else "medium",
+        "warnings": [] if rows else ["No completed sales matched these product queries and date range."],
+    }
+
+
+def _build_pos_variant_comparison_insight(payload: dict[str, Any], *, variant_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="the selected period")
+    products = payload.get("products") if isinstance(payload.get("products"), list) else []
+    variant_results = variant_payload.get("results") if isinstance(variant_payload, dict) else []
+    variant_results = variant_results if isinstance(variant_results, list) else []
+    lookup_by_code: dict[str, dict[str, Any]] = {}
+    for item in variant_results:
+        if not isinstance(item, dict):
+            continue
+        for key in (str(item.get("barcode") or ""), str(item.get("sku") or "")):
+            if key:
+                lookup_by_code[key] = item
+    rows = []
+    for item in products:
+        if not isinstance(item, dict):
+            continue
+        barcode = str(item.get("barcode_snapshot") or "")
+        sku = str(item.get("sku_snapshot") or "")
+        label = str(item.get("variant_name") or item.get("product_name") or barcode or sku or "Variant")
+        match = lookup_by_code.get(barcode) or lookup_by_code.get(sku) or {}
+        sales_total = round(float(item.get("sales_total") or 0), 2)
+        quantity_sold = round(float(item.get("quantity_sold") or 0), 2)
+        order_count = int(item.get("order_count") or 0)
+        rows.append(
+            {
+                "variant": label,
+                "product": str(item.get("product_name") or match.get("product_name") or ""),
+                "sku": sku or str(match.get("sku") or ""),
+                "barcode": barcode or str(match.get("barcode") or ""),
+                "sales_total": sales_total,
+                "quantity_sold": quantity_sold,
+                "order_count": order_count,
+                "avg_unit_revenue": round(sales_total / quantity_sold, 2) if quantity_sold else 0,
+                "image_url": _product_image_url(
+                    {
+                        "variant_name": label,
+                        "product_name": str(item.get("product_name") or match.get("product_name") or ""),
+                        "barcode": barcode or str(match.get("barcode") or ""),
+                        "sku": sku or str(match.get("sku") or ""),
+                        "image_url": str(match.get("image_url") or ""),
+                    }
+                ),
+            }
+        )
+    rows.sort(key=lambda row: (float(row["sales_total"]), float(row["quantity_sold"])), reverse=True)
+    total_sales = round(sum(float(row["sales_total"]) for row in rows), 2)
+    total_units = round(sum(float(row["quantity_sold"]) for row in rows), 2)
+    total_orders = sum(int(row["order_count"]) for row in rows)
+    leader = rows[0] if rows else None
+    currency_code = str(payload.get("currency_code") or payload.get("currency") or "NGN").upper()
+    currency_symbol = {
+        "NGN": "₦",
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£",
+        "JPY": "¥",
+        "CAD": "C$",
+        "AUD": "A$",
+        "GHS": "₵",
+        "KES": "KSh",
+        "ZAR": "R",
+    }.get(currency_code, f"{currency_code} ")
+    money_label = lambda amount: f"{currency_symbol}{float(amount or 0):,.2f}"
+    count_label = lambda value: f"{float(value or 0):,.0f}" if float(value or 0).is_integer() else f"{float(value or 0):,.2f}"
+    label_by_identity: dict[str, str] = {}
+    for row in rows:
+        identity_parts = [
+            str(row.get("barcode") or ""),
+            str(row.get("sku") or ""),
+            str(row.get("variant") or ""),
+            str(row.get("product") or ""),
+        ]
+        identity_key = next((part for part in identity_parts if part), "")
+        if identity_key:
+            label_by_identity[identity_key] = str(row.get("variant") or row.get("product") or identity_key)
+
+    def _series_identity(item: dict[str, Any]) -> str:
+        return (
+            str(item.get("barcode_snapshot") or "")
+            or str(item.get("sku_snapshot") or "")
+            or str(item.get("variant_name") or "")
+            or str(item.get("product_name") or "")
+            or "Series"
+        )
+
+    def _series_label(item: dict[str, Any]) -> str:
+        identity = _series_identity(item)
+        return (
+            label_by_identity.get(identity)
+            or str(item.get("variant_name") or item.get("product_name") or item.get("barcode_snapshot") or item.get("sku_snapshot") or identity)
+        )
+
+    def _series_key(identity: str, index: int) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9]+", "_", identity).strip("_").lower()
+        return f"series_{normalized or index}"
+
+    def _build_series_chart(metric_key: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        trend_rows = payload.get("series_trend") if isinstance(payload.get("series_trend"), list) else []
+        series_lookup: dict[str, dict[str, str]] = {}
+        bucket_lookup: dict[str, dict[str, Any]] = {}
+        for item in trend_rows:
+            if not isinstance(item, dict):
+                continue
+            bucket = str(item.get("label") or "")
+            identity = _series_identity(item)
+            if not bucket or not identity:
+                continue
+            if identity not in series_lookup:
+                series_lookup[identity] = {
+                    "key": _series_key(identity, len(series_lookup) + 1),
+                    "label": _series_label(item),
+                }
+            bucket_row = bucket_lookup.setdefault(bucket, {"label": bucket})
+            bucket_row[series_lookup[identity]["key"]] = round(float(item.get(metric_key) or 0), 2)
+        series = list(series_lookup.values())
+        data = [bucket_lookup[key] for key in sorted(bucket_lookup)]
+        for bucket_row in data:
+            for series_item in series:
+                bucket_row.setdefault(series_item["key"], 0)
+        return data, series
+
+    revenue_trend_data, trend_series = _build_series_chart("sales_total")
+    units_trend_data, _ = _build_series_chart("quantity_sold")
+    orders_trend_data, _ = _build_series_chart("order_count")
+    ranked_items = [
+        {
+            "label": row["variant"],
+            "value": row["sales_total"],
+            "format": "currency",
+            "secondary_value": row["quantity_sold"],
+            "secondary_format": "number",
+            "detail": f"{row['order_count']} orders",
+            "barcode": row["barcode"],
+            "image_url": row["image_url"],
+            "meta": {"sku": row["sku"], "barcode": row["barcode"]},
+        }
+        for row in rows[:10]
+    ]
+    table_rows = [
+        {
+            "variant": row["variant"],
+            "barcode": row["barcode"],
+            "sales_total": row["sales_total"],
+            "quantity_sold": row["quantity_sold"],
+            "order_count": row["order_count"],
+            "avg_unit_revenue": row["avg_unit_revenue"],
+        }
+        for row in rows[:15]
+    ]
+    summary = (
+        f"{len(rows)} variants were compared for {window_label}; {leader['variant']} leads revenue."
+        if leader
+        else f"No variant sales were found for {window_label}."
+    )
+    explanation = (
+        f"The leading variant generated {money_label(leader['sales_total'])} from {count_label(leader['quantity_sold'])} units, so compare both revenue and units before deciding what to restock."
+        if leader
+        else "There is not enough completed POS history to compare variants for this product."
+    )
+    return {
+        "kind": "insight_response",
+        "summary": summary,
+        "explanation": explanation,
+        "timeframe": {
+            "label": window_label,
+            "start_date": str(payload.get("_window_start_date") or ""),
+            "end_date": str(payload.get("_window_end_date") or ""),
+            "period": str(payload.get("_window_period") or ""),
+        },
+        "insights": [
+            {
+                "title": "Variant leader",
+                "detail": (
+                    f"{leader['variant']} is ahead with {money_label(leader['sales_total'])} revenue and {count_label(leader['quantity_sold'])} units."
+                    if leader
+                    else "No leading variant could be identified."
+                ),
+            },
+            {
+                "title": "Revenue spread",
+                "detail": (
+                    f"The compared variants generated {money_label(total_sales)} total revenue across {count_label(total_units)} units and {count_label(total_orders)} orders."
+                    if rows
+                    else "No revenue spread is available for this query."
+                ),
+            },
+        ],
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Variant comparison snapshot for {window_label}",
+                "data": [
+                    {"label": "Variants Compared", "value": len(rows), "format": "number"},
+                    {"label": "Revenue", "value": total_sales, "format": "currency"},
+                    {"label": "Units Sold", "value": total_units, "format": "number"},
+                    {"label": "Orders", "value": total_orders, "format": "number"},
+                ],
+            },
+            {
+                "type": "ranked_list",
+                "title": f"Variant revenue ranking for {window_label}",
+                "items": ranked_items,
+                "ordered_by": "sales_total",
+            },
+            {
+                "type": "line_chart",
+                "title": f"Variant revenue trend for {window_label}",
+                "subtitle": "Each line tracks one variant across the selected period.",
+                "x_key": "label",
+                "series": trend_series,
+                "value_format": "currency",
+                "data": revenue_trend_data,
+            },
+            {
+                "type": "line_chart",
+                "title": f"Variant units trend for {window_label}",
+                "subtitle": "Use this to see which variant gained or lost unit momentum.",
+                "x_key": "label",
+                "series": trend_series,
+                "value_format": "number",
+                "data": units_trend_data,
+            },
+            {
+                "type": "line_chart",
+                "title": f"Variant order-count trend for {window_label}",
+                "subtitle": "This separates order frequency from quantity and revenue.",
+                "x_key": "label",
+                "series": trend_series,
+                "value_format": "number",
+                "data": orders_trend_data,
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Variant revenue comparison for {window_label}",
+                "x_key": "variant",
+                "y_key": "sales_total",
+                "value_format": "currency",
+                "data": rows,
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Variant units comparison for {window_label}",
+                "x_key": "variant",
+                "y_key": "quantity_sold",
+                "value_format": "number",
+                "data": rows,
+            },
+            {
+                "type": "comparison_table",
+                "title": f"Variant comparison table for {window_label}",
+                "columns": ["variant", "barcode", "sales_total", "quantity_sold", "order_count", "avg_unit_revenue"],
+                "rows": table_rows,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "pos", "endpoint_or_topic": "get_product_sales_trend", "freshness": "live"},
+            {"service": "products", "endpoint_or_topic": "get_variant_lookup", "freshness": "live"},
+        ],
+        "permissions_checked": ["view_pos_reports", "read_products"],
+        "confidence": "high" if rows else "medium",
+        "warnings": [] if rows else ["No completed sales matched this product family and date range."],
+    }
+
+
+def _build_pos_best_sales_day_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="the available sales history")
+    groups = payload.get("groups") if isinstance(payload, dict) else []
+    groups = groups if isinstance(groups, list) else []
+    daily_rows = [
+        {
+            "day": str(item.get("label") or ""),
+            "sales": round(float(item.get("total_sales") or 0), 2),
+            "orders": int(item.get("order_count") or 0),
+        }
+        for item in groups
+        if isinstance(item, dict)
+    ]
+    peak_row = max(daily_rows, key=lambda row: (row["sales"], row["orders"]), default=None)
+    summary = (
+        f"{peak_row['day']} was the strongest sales day in {window_label}."
+        if peak_row
+        else f"No completed sales days were found for {window_label}."
+    )
+    explanation = (
+        f"The peak day reached {peak_row['sales']} across {peak_row['orders']} completed orders, and the trend below shows how far other days trailed it."
+        if peak_row
+        else "There is no day-level POS history to analyze for the selected period."
+    )
+    ranked_days = [
+        {
+            "label": row["day"],
+            "value": row["sales"],
+            "format": "currency",
+            "secondary_value": row["orders"],
+            "secondary_format": "number",
+            "detail": "orders",
+        }
+        for row in sorted(daily_rows, key=lambda row: (row["sales"], row["orders"]), reverse=True)[:5]
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": summary,
+        "explanation": explanation,
+        "insights": (
+            [
+                {
+                    "title": "Peak day",
+                    "detail": f"{peak_row['day']} produced {peak_row['sales']} across {peak_row['orders']} orders.",
+                }
+            ]
+            if peak_row
+            else []
+        ),
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Best sales day in {window_label}",
+                "data": [
+                    {"label": "Peak Revenue", "value": peak_row["sales"] if peak_row else 0},
+                    {"label": "Peak Orders", "value": peak_row["orders"] if peak_row else 0},
+                    {"label": "Tracked Days", "value": len(daily_rows)},
+                ],
+            },
+            {
+                "type": "line_chart",
+                "title": f"Daily revenue trend for {window_label}",
+                "subtitle": "This shows how daily revenue moved across the selected history.",
+                "x_key": "day",
+                "y_key": "sales",
+                "value_format": "currency",
+                "data": daily_rows,
+            },
+            {
+                "type": "ranked_list",
+                "title": f"Best sales days for {window_label}",
+                "items": ranked_days,
+                "ordered_by": "sales",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "pos", "endpoint_or_topic": "get_sales_summary(day)", "freshness": "live"}],
+        "permissions_checked": ["view_pos_reports"],
+        "confidence": "high",
+        "warnings": [] if peak_row else ["No completed sales matched the requested window."],
+    }
+
+
+async def _enrich_top_seller_results_with_variant_context(
+    *,
+    results_payload: dict[str, Any],
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+    limit: int = 8,
+) -> dict[str, Any]:
+    results = results_payload.get("results")
+    if not isinstance(results, list) or not results:
+        return results_payload
+
+    def _lookup_queries_for_item(item: dict[str, Any]) -> list[str]:
+        ordered: list[str] = []
+
+        def _push(query: str) -> None:
+            value = str(query or "").strip()
+            if value and value not in ordered:
+                ordered.append(value)
+
+        def _text_variants(raw_value: str) -> list[str]:
+            normalized = re.sub(r"[^a-z0-9]+", " ", raw_value.lower()).strip()
+            normalized = re.sub(r"\b\d+(?:\.\d+)?\s*(?:ml|cl|l|g|kg|ct|pcs|pc|oz|lb|pack)\b", " ", normalized).strip()
+            normalized = re.sub(r"\s+", " ", normalized).strip()
+            if not normalized:
+                return []
+            tokens = normalized.split()
+            variants = [normalized]
+            if len(tokens) >= 2:
+                variants.append(" ".join(tokens[:2]))
+                variants.append(" ".join(tokens[-2:]))
+            if len(tokens) >= 3:
+                variants.append(" ".join(tokens[:3]))
+                variants.append(" ".join(tokens[-3:]))
+            if len(tokens) >= 4:
+                variants.append(" ".join(tokens[:4]))
+            return variants
+
+        _push(str(item.get("barcode_snapshot") or ""))
+        _push(str(item.get("sku_snapshot") or ""))
+        for seed in (
+            str(item.get("variant_name") or ""),
+            str(item.get("product_name") or ""),
+        ):
+            _push(seed)
+            for variant in _text_variants(seed):
+                _push(variant)
+        return ordered
+
+    async def _lookup_variant(query: str) -> dict[str, Any] | None:
+        try:
+            lookup = await tool_executor.call_tool(
+                name="product.get_variant_lookup",
+                arguments={"query": query, "limit": 1, "active_only": True},
+                ctx=tool_ctx,
+            )
+        except Exception:
+            return None
+        lookup_results = lookup.get("results") if isinstance(lookup, dict) else None
+        first_match = lookup_results[0] if isinstance(lookup_results, list) and lookup_results else None
+        return first_match if isinstance(first_match, dict) else None
+
+    seed_items = [item for item in results[:limit] if isinstance(item, dict)]
+    lookup_tasks: dict[str, asyncio.Task[dict[str, Any] | None]] = {}
+
+    async def _lookup_cached(query: str) -> dict[str, Any] | None:
+        task = lookup_tasks.get(query)
+        if task is None:
+            task = asyncio.create_task(_lookup_variant(query))
+            lookup_tasks[query] = task
+        return await task
+
+    async def _enrich_item(raw_item: dict[str, Any]) -> dict[str, Any]:
+        item = dict(raw_item)
+        for query in _lookup_queries_for_item(item):
+            first_match = await _lookup_cached(query)
+            if not isinstance(first_match, dict):
+                continue
+            item["image_url"] = str(first_match.get("image_url") or item.get("image_url") or "")
+            item["barcode"] = str(first_match.get("barcode") or item.get("barcode_snapshot") or item.get("barcode") or "")
+            item["sku"] = str(first_match.get("sku") or item.get("sku_snapshot") or item.get("sku") or "")
+            if item.get("image_url") or item.get("barcode") or item.get("sku"):
+                break
+        return item
+
+    enriched_results = await asyncio.gather(*[_enrich_item(raw_item) for raw_item in seed_items])
+
+    if len(results) > limit:
+        enriched_results.extend(item for item in results[limit:] if isinstance(item, dict))
+
+    return {**results_payload, "results": enriched_results}
+
+
+def _build_pos_payment_mix_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    methods = payload.get("payment_methods") if isinstance(payload, dict) else []
+    methods = methods if isinstance(methods, list) else []
+    total_sales = float(payload.get("total_sales") or 0) if isinstance(payload, dict) else 0.0
+    total_orders = int(payload.get("total_orders") or 0) if isinstance(payload, dict) else 0
+    chart_rows = []
+    for item in methods:
+        if not isinstance(item, dict):
+            continue
+        total = float(item.get("total") or 0)
+        count = int(item.get("count") or 0)
+        chart_rows.append(
+            {
+                "label": str(item.get("payment_method") or "unknown").replace("_", " ").title(),
+                "value": total,
+                "count": count,
+                "share": round((total / total_sales) * 100, 2) if total_sales > 0 else 0,
+            }
+        )
+    lead_label = chart_rows[0]["label"] if chart_rows else "No payment data"
+    return {
+        "kind": "insight_response",
+        "summary": f"{lead_label} leads the current payment mix." if chart_rows else "No payment activity was recorded.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Payment mix snapshot",
+                "data": [
+                    {"label": "Sales", "value": round(total_sales, 2)},
+                    {"label": "Orders", "value": total_orders},
+                    {"label": "Methods", "value": len(chart_rows)},
+                    {"label": "Held Orders", "value": int(payload.get("held_orders") or 0)},
+                ],
+            },
+            {
+                "type": "donut_chart",
+                "title": "Sales by payment method",
+                "data": chart_rows,
+                "label_key": "label",
+                "value_key": "value",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "pos", "endpoint_or_topic": "get_pos_daily_summary", "freshness": "live"}],
+        "permissions_checked": ["view_pos_reports"],
+        "confidence": "high",
+        "warnings": [] if chart_rows else ["No payment records matched the requested view."],
+    }
+
+
+def _build_pos_terminal_activity_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="last 7 days")
+    results = payload.get("results") if isinstance(payload, dict) else []
+    results = results if isinstance(results, list) else []
+    rows = []
+    ranked_items = []
+    total_sales = 0.0
+    total_orders = 0
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        sales = float(item.get("total_sales") or 0)
+        orders = int(item.get("order_count") or 0)
+        label = str(item.get("terminal_name") or "Unassigned terminal")
+        row = {
+            "terminal": label,
+            "location": str(item.get("location") or ""),
+            "orders": orders,
+            "completed_orders": int(item.get("completed_orders") or 0),
+            "sales": round(sales, 2),
+            "avg_basket": round(sales / max(orders, 1), 2),
+        }
+        rows.append(row)
+        ranked_items.append({"label": label, "value": sales, "secondary_value": orders})
+        total_sales += sales
+        total_orders += orders
+    return {
+        "kind": "insight_response",
+        "summary": (
+            f"{rows[0]['terminal']} is leading terminal activity for {window_label}."
+            if rows
+            else f"No terminal activity matched {window_label}."
+        ),
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": f"Terminal and cashier activity for {window_label}",
+                "columns": ["terminal", "location", "orders", "completed_orders", "sales", "avg_basket"],
+                "rows": rows,
+            },
+            {
+                "type": "ranked_list",
+                "title": "Highest sales contribution",
+                "items": ranked_items,
+                "ordered_by": "sales",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "pos", "endpoint_or_topic": "get_terminal_activity", "freshness": "live"}],
+        "permissions_checked": ["view_pos_reports"],
+        "confidence": "medium",
+        "warnings": [] if rows else ["No terminal activity matched the requested window."],
+    }
+
+
+def _build_pos_sessions_orders_insight(summary_payload: dict[str, Any], sales_payload: dict[str, Any]) -> dict[str, Any]:
+    total_sales = float(summary_payload.get("total_sales") or 0)
+    total_orders = int(summary_payload.get("total_orders") or 0)
+    groups = sales_payload.get("groups") if isinstance(sales_payload, dict) else []
+    groups = groups if isinstance(groups, list) else []
+    chart_rows = [
+        {
+            "label": str(item.get("label") or "Unassigned"),
+            "value": float(item.get("total_sales") or 0),
+            "orders": int(item.get("order_count") or 0),
+        }
+        for item in groups
+        if isinstance(item, dict)
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": "POS session and order flow is ready." if total_orders else "No POS session or order activity was recorded.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Session and order flow",
+                "data": [
+                    {"label": "Orders", "value": total_orders},
+                    {"label": "Sales", "value": round(total_sales, 2)},
+                    {"label": "Open Sessions", "value": int(summary_payload.get("open_sessions") or 0)},
+                    {"label": "Held Orders", "value": int(summary_payload.get("held_orders") or 0)},
+                ],
+            },
+            {
+                "type": "line_chart",
+                "title": "Order flow by location",
+                "data": chart_rows,
+                "x_key": "label",
+                "y_key": "orders",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "pos", "endpoint_or_topic": "get_pos_daily_summary", "freshness": "live"},
+            {"service": "pos", "endpoint_or_topic": "get_sales_summary", "freshness": "live"},
+        ],
+        "permissions_checked": ["view_pos_reports"],
+        "confidence": "medium",
+        "warnings": [] if total_orders or chart_rows else ["No POS order flow matched the requested view."],
+    }
+
+
+def _build_pos_exceptions_insight(summary_payload: dict[str, Any], terminal_payload: dict[str, Any]) -> dict[str, Any]:
+    methods = summary_payload.get("payment_methods") if isinstance(summary_payload, dict) else []
+    methods = methods if isinstance(methods, list) else []
+    terminals = terminal_payload.get("results") if isinstance(terminal_payload, dict) else []
+    terminals = terminals if isinstance(terminals, list) else []
+    risk_items = []
+    if int(summary_payload.get("held_orders") or 0) > 0:
+        risk_items.append(
+            {
+                "label": "Held orders",
+                "severity": "medium",
+                "description": f"{int(summary_payload.get('held_orders') or 0)} orders still held.",
+            }
+        )
+    if int(summary_payload.get("open_sessions") or 0) > 3:
+        risk_items.append(
+            {
+                "label": "Open sessions",
+                "severity": "medium",
+                "description": f"{int(summary_payload.get('open_sessions') or 0)} sessions remain open.",
+            }
+        )
+    for item in methods:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("payment_method") or "").lower() in {"unknown", ""} and float(item.get("total") or 0) > 0:
+            risk_items.append(
+                {
+                    "label": "Unknown payment mapping",
+                    "severity": "high",
+                    "description": "Some completed sales are attached to an unknown payment method.",
+                }
+            )
+            break
+    ranked_items = []
+    for item in terminals[:5]:
+        if not isinstance(item, dict):
+            continue
+        ranked_items.append(
+            {
+                "label": str(item.get("terminal_name") or "Unassigned terminal"),
+                "value": int(item.get("order_count") or 0),
+                "secondary_value": float(item.get("total_sales") or 0),
+            }
+        )
+    if not risk_items:
+        risk_items.append({"label": "Current POS posture", "severity": "low", "description": "No obvious risk spikes in the current snapshot."})
+    return {
+        "kind": "insight_response",
+        "summary": "POS operational risks are ready.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Risk snapshot",
+                "data": [
+                    {"label": "Open Sessions", "value": int(summary_payload.get("open_sessions") or 0)},
+                    {"label": "Held Orders", "value": int(summary_payload.get("held_orders") or 0)},
+                    {"label": "Payment Methods", "value": len(methods)},
+                    {"label": "Active Terminals", "value": len(terminals)},
+                ],
+            },
+            {
+                "type": "risk_panel",
+                "title": "POS issues to investigate",
+                "items": risk_items,
+            },
+            {
+                "type": "ranked_list",
+                "title": "Most active terminals",
+                "items": ranked_items,
+                "ordered_by": "order_count",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "pos", "endpoint_or_topic": "get_pos_daily_summary", "freshness": "live"},
+            {"service": "pos", "endpoint_or_topic": "get_terminal_activity", "freshness": "live"},
+        ],
+        "permissions_checked": ["view_pos_reports"],
+        "confidence": "medium",
+        "warnings": [],
+    }
+
+
+def _users_named_insight_from_text(text: str) -> str | None:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return None
+    if any(
+        token in normalized
+        for token in (
+            "staff activity",
+            "staff activity from audit events",
+            "staff were most active today",
+            "timeline of recent staff activity",
+            "changed the most operational records",
+            "staff activity by role",
+            "users are touching inventory most often",
+            "recent staff actions across the workspace",
+            "rank staff by audited activity volume",
+            "staff actions need management review",
+            "staff activity summary from the audit trail",
+        )
+    ) or _text_matches_all_terms(normalized, r"\bstaff\b", r"\bactivity\b"):
+        return "staff_activity"
+    if "support access" in normalized or "support sessions should i review first" in normalized:
+        return "support_access_audit"
+    if any(
+        token in normalized
+        for token in (
+            "permission and security activity",
+            "roles or permissions changed recently",
+            "mfa, access, and role-change events",
+            "security-sensitive audit events need attention",
+            "permission changes across the workspace",
+        )
+    ) or _text_matches_all_terms(normalized, r"\b(permission|security)\b", r"\bactivity\b"):
+        return "permission_security_activity"
+    if (
+        any(
+            token in normalized
+            for token in (
+                "audit logs",
+                "audit log",
+                "audit events",
+                "recent audit events",
+                "search audit events",
+                "find audit events",
+                "workspace audit activity",
+            )
+        )
+        and not any(
+            token in normalized
+            for token in (
+                "staff activity",
+                "support access",
+                "permission",
+                "security",
+                "timeline",
+            )
+        )
+    ):
+        return "audit_search"
+    if any(
+        token in normalized
+        for token in (
+            "audit timeline",
+            "event timeline",
+            "timeline of audit events",
+            "timeline for audit events",
+            "chronological audit trail",
+        )
+    ):
+        return "audit_timeline"
+    if (
+        "subscription" in normalized
+        or any(
+            token in normalized
+            for token in (
+                "plan pressure",
+                "plan limits",
+                "remaining headroom",
+                "resources are near the limit",
+                "upgrade pressure",
+                "near exhaustion",
+                "billing status",
+                "entitlements",
+                "capacity planning",
+                "current plan pressure",
+                "limit breaches",
+                "closest limit breaches",
+            )
+        )
+        or _text_matches_all_terms(normalized, r"\blimit\b", r"\bbreaches?\b")
+    ):
+        return "subscription_usage_limits"
+    return None
+
+
+def _audit_timeline_items(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for event in events[:12]:
+        if not isinstance(event, dict):
+            continue
+        items.append(
+            {
+                "timestamp": str(event.get("occurred_at") or event.get("timestamp") or ""),
+                "title": str(event.get("summary") or event.get("event_name") or "Audit event"),
+                "description": str(event.get("action") or event.get("feature_area") or event.get("source_service") or ""),
+                "severity": str(event.get("severity") or "info"),
+            }
+        )
+    return items
+
+
+def _payload_window_label(payload: dict[str, Any], *, fallback: str) -> str:
+    label = str(payload.get("_window_label") or "").strip() if isinstance(payload, dict) else ""
+    return label or fallback
+
+
+def _counter_rows_to_ranked_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        items.append(
+            {
+                "label": str(row.get("key") or "Unknown"),
+                "value": int(row.get("count") or 0),
+            }
+        )
+    return items
+
+
+def _timeline_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for row in rows[:12]:
+        if not isinstance(row, dict):
+            continue
+        detail = (
+            str(row.get("detail") or "").strip()
+            or str(row.get("description") or "").strip()
+            or str(row.get("action") or "").strip()
+            or str(row.get("target_label") or "").strip()
+            or str(row.get("reference_number") or "").strip()
+            or str(row.get("summary") or "").strip()
+        )
+        events.append(
+            {
+                "timestamp": str(row.get("timestamp") or row.get("occurred_at") or ""),
+                "title": str(row.get("title") or row.get("summary") or row.get("event_name") or "Event"),
+                "detail": detail,
+                "severity": str(row.get("severity") or "info"),
+            }
+        )
+    return events
+
+
+def _daily_count_series(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_timestamp = str(row.get("timestamp") or row.get("occurred_at") or row.get("created_at") or "").strip()
+        if len(raw_timestamp) < 10:
+            continue
+        bucket = raw_timestamp[:10]
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return [{"bucket": bucket, "count": count} for bucket, count in sorted(counts.items())]
+
+
+def _purchase_order_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    results = payload.get("results")
+    if isinstance(results, list):
+        return [item for item in results if isinstance(item, dict)]
+    if isinstance(results, dict) and isinstance(results.get("results"), list):
+        return [item for item in results.get("results") if isinstance(item, dict)]
+    return []
+
+
+def _purchase_order_status_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status") or "unknown").strip().lower() or "unknown"
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _build_audit_entity_activity_insight(
+    payload: dict[str, Any],
+    *,
+    summary: str,
+    title: str,
+    source_endpoint: str,
+    preview_kind: str,
+) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="the selected period")
+    action_items = _counter_rows_to_ranked_items(payload.get("actions") if isinstance(payload, dict) else [])
+    timeline_events = _timeline_events(payload.get("recent_events") if isinstance(payload, dict) else [])
+    daily_activity = payload.get("daily_activity") if isinstance(payload, dict) else []
+    daily_activity = daily_activity if isinstance(daily_activity, list) else []
+    recent = payload.get("recent_events") if isinstance(payload, dict) else []
+    recent = recent if isinstance(recent, list) else []
+    first = recent[0] if recent and isinstance(recent[0], dict) else {}
+    preview_title = (
+        str(first.get("target_label") or "").strip()
+        or str(first.get("reference_number") or "").strip()
+        or str(first.get("event_name") or "").strip()
+        or title
+    )
+    preview_meta = []
+    for label, value in (
+        ("Actor", first.get("actor_name") or first.get("actor_email")),
+        ("SKU", first.get("entity_sku")),
+        ("Barcode", first.get("entity_barcode")),
+        ("Terminal", first.get("terminal_id")),
+    ):
+        if str(value or "").strip():
+            preview_meta.append({"label": label, "value": value})
+    return {
+        "kind": "insight_response",
+        "summary": f"{summary.rstrip('.')} for {window_label}.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"{title} for {window_label}",
+                "data": [
+                    {"label": "Events", "value": int(payload.get("event_count") or 0)},
+                    {"label": "Action Types", "value": len(action_items)},
+                    {"label": "Source Services", "value": len(payload.get("source_services") or []) if isinstance(payload, dict) else 0},
+                ],
+            },
+            {
+                "type": "entity_preview",
+                "title": "Most recent focus",
+                "entity": {
+                    "kind": preview_kind,
+                    "title": preview_title,
+                    "subtitle": str(first.get("summary") or ""),
+                    "meta": preview_meta,
+                },
+            },
+            {
+                "type": "line_chart",
+                "title": f"Daily change volume for {window_label}",
+                "data": daily_activity,
+                "x_key": "bucket",
+                "y_key": "count",
+            },
+            {
+                "type": "timeline",
+                "title": f"Audit events for {window_label}",
+                "events": timeline_events,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "audit", "endpoint_or_topic": source_endpoint, "freshness": "live"}],
+        "permissions_checked": ["view_audit_logs"],
+        "confidence": "high",
+        "warnings": [],
+    }
+
+
+def _build_procurement_lifecycle_insight(
+    pipeline_payload: dict[str, Any],
+    activity_payload: dict[str, Any],
+) -> dict[str, Any]:
+    window_label = _payload_window_label(activity_payload, fallback="last 30 days")
+    status_counts = pipeline_payload.get("status_counts") if isinstance(pipeline_payload, dict) else {}
+    status_counts = status_counts if isinstance(status_counts, dict) else {}
+    results = pipeline_payload.get("results") if isinstance(pipeline_payload, dict) else []
+    results = results if isinstance(results, list) else []
+    steps = [
+        {
+            "label": str(status).replace("_", " ").title(),
+            "status": "current" if int(count or 0) > 0 else "pending",
+            "detail": f"{int(count or 0)} purchase orders",
+        }
+        for status, count in status_counts.items()
+    ]
+    rows = [
+        {
+            "reference": str(item.get("reference") or ""),
+            "status": str(item.get("status") or ""),
+            "supplier": str(item.get("supplier_name") or ""),
+            "target_date": str(item.get("target_date") or ""),
+        }
+        for item in results
+        if isinstance(item, dict)
+    ]
+    status_chart = [
+        {"label": str(status).replace("_", " ").title(), "value": int(count or 0)}
+        for status, count in status_counts.items()
+    ]
+    timeline_rows = activity_payload.get("timeline") if isinstance(activity_payload, dict) and isinstance(activity_payload.get("timeline"), list) else []
+    return {
+        "kind": "insight_response",
+        "summary": f"Purchase-order lifecycle status is ready for {window_label}.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"PO pipeline for {window_label}",
+                "data": [
+                    {"label": "Open Statuses", "value": len([count for count in status_counts.values() if int(count or 0) > 0])},
+                    {"label": "Recent POs", "value": len(rows)},
+                    {"label": "Audit Events", "value": int(activity_payload.get("event_count") or 0)},
+                ],
+            },
+            {
+                "type": "progress_tracker",
+                "title": "Workflow progress",
+                "steps": steps,
+            },
+            {
+                "type": "bar_chart",
+                "title": f"PO status distribution for {window_label}",
+                "data": status_chart,
+                "x_key": "label",
+                "y_key": "value",
+            },
+            {
+                "type": "line_chart",
+                "title": f"PO activity volume for {window_label}",
+                "data": _daily_count_series([row for row in timeline_rows if isinstance(row, dict)]),
+                "x_key": "bucket",
+                "y_key": "count",
+            },
+            {
+                "type": "comparison_table",
+                "title": "Recent purchase orders",
+                "columns": ["reference", "status", "supplier", "target_date"],
+                "rows": rows,
+            },
+            {
+                "type": "timeline",
+                "title": f"PO activity timeline for {window_label}",
+                "events": _timeline_events(activity_payload.get("timeline") if isinstance(activity_payload, dict) else []),
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "inventory", "endpoint_or_topic": "get_purchase_order_analytics", "freshness": "live"},
+            {"service": "inventory", "endpoint_or_topic": "search_purchase_orders", "freshness": "live"},
+            {"service": "audit", "endpoint_or_topic": "get_purchase_order_activity", "freshness": "live"},
+        ],
+        "permissions_checked": ["read_inventory", "view_audit_logs"],
+        "confidence": "high",
+        "warnings": [],
+    }
+
+
+def _build_procurement_receiving_insight(
+    pipeline_payload: dict[str, Any],
+    activity_payload: dict[str, Any],
+) -> dict[str, Any]:
+    window_label = _payload_window_label(activity_payload, fallback="last 30 days")
+    results = pipeline_payload.get("results") if isinstance(pipeline_payload, dict) else []
+    results = results if isinstance(results, list) else []
+    timeline_rows = activity_payload.get("timeline") if isinstance(activity_payload, dict) and isinstance(activity_payload.get("timeline"), list) else []
+    steps = [
+        {
+            "label": str(item.get("reference") or "PO"),
+            "status": "current" if str(item.get("status") or "").lower() in {"approved", "issued", "received", "overdue"} else "completed",
+            "detail": f"{str(item.get('status') or '').title()} with supplier {str(item.get('supplier_name') or 'unassigned')}",
+        }
+        for item in results[:10]
+        if isinstance(item, dict)
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": f"Purchase-order receiving lifecycle is ready for {window_label}.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Receiving snapshot for {window_label}",
+                "data": [
+                    {"label": "Tracked POs", "value": len(results)},
+                    {"label": "Audit Events", "value": int(activity_payload.get("event_count") or 0)},
+                ],
+            },
+            {
+                "type": "progress_tracker",
+                "title": "Receiving progress",
+                "steps": steps,
+            },
+            {
+                "type": "line_chart",
+                "title": f"Receiving activity volume for {window_label}",
+                "data": _daily_count_series([row for row in timeline_rows if isinstance(row, dict)]),
+                "x_key": "bucket",
+                "y_key": "count",
+            },
+            {
+                "type": "timeline",
+                "title": f"Receiving activity for {window_label}",
+                "events": _timeline_events(activity_payload.get("timeline") if isinstance(activity_payload, dict) else []),
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "inventory", "endpoint_or_topic": "search_purchase_orders", "freshness": "live"},
+            {"service": "audit", "endpoint_or_topic": "get_purchase_order_activity", "freshness": "live"},
+        ],
+        "permissions_checked": ["read_inventory", "view_audit_logs"],
+        "confidence": "high",
+        "warnings": [] if results else ["No purchase orders are active in the current pipeline."],
+    }
+
+
+def _build_procurement_supplier_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="the selected period")
+    analytics = payload.get("analytics") if isinstance(payload, dict) else {}
+    analytics = analytics if isinstance(analytics, dict) else {}
+    rows = analytics.get("supplier_performance") if isinstance(analytics.get("supplier_performance"), list) else []
+    table_rows = []
+    if rows:
+        table_rows = [
+            {
+                "supplier": str(item.get("supplier_name") or item.get("supplier__name") or ""),
+                "orders": int(item.get("order_count") or 0),
+                "value": float(item.get("total_value") or 0),
+                "avg_delivery_time": str(item.get("avg_delivery_time") or ""),
+                "on_time_deliveries": int(item.get("on_time_deliveries") or 0),
+            }
+            for item in rows
+            if isinstance(item, dict)
+        ]
+    else:
+        grouped: dict[str, dict[str, Any]] = {}
+        for item in _purchase_order_results(payload):
+            supplier = str(item.get("supplier_name") or "Unassigned supplier")
+            current = grouped.setdefault(
+                supplier,
+                {"supplier": supplier, "orders": 0, "value": 0.0, "avg_delivery_time": "", "on_time_deliveries": 0},
+            )
+            current["orders"] += 1
+        table_rows = list(grouped.values())
+    ranked_items = [
+        {"label": row["supplier"], "value": row["value"], "secondary_value": row["orders"]}
+        for row in table_rows
+    ]
+    chart_rows = [{"label": row["supplier"], "value": row["value"]} for row in table_rows[:8]]
+    return {
+        "kind": "insight_response",
+        "summary": f"Supplier performance for {window_label} is ready.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Supplier performance for {window_label}",
+                "data": [
+                    {"label": "Suppliers", "value": len(table_rows)},
+                    {"label": "On-Time Rate", "value": float(analytics.get("on_time_delivery_rate") or 0)},
+                    {"label": "Avg Delivery Days", "value": float(analytics.get("average_delivery_time") or 0)},
+                ],
+            },
+            {
+                "type": "comparison_table",
+                "title": f"Supplier scorecard for {window_label}",
+                "columns": ["supplier", "orders", "value", "avg_delivery_time", "on_time_deliveries"],
+                "rows": table_rows,
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Supplier value contribution for {window_label}",
+                "data": chart_rows,
+                "x_key": "label",
+                "y_key": "value",
+            },
+            {
+                "type": "ranked_list",
+                "title": f"Top suppliers by value for {window_label}",
+                "items": ranked_items,
+                "ordered_by": "value",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "inventory", "endpoint_or_topic": "get_purchase_order_analytics", "freshness": "live"}],
+        "permissions_checked": ["read_inventory"],
+        "confidence": "high",
+        "warnings": [] if table_rows else ["No supplier performance rows were returned."],
+    }
+
+
+def _build_procurement_delay_exception_insight(
+    pipeline_payload: dict[str, Any],
+    activity_payload: dict[str, Any],
+) -> dict[str, Any]:
+    window_label = _payload_window_label(activity_payload, fallback="the selected period")
+    results = pipeline_payload.get("results") if isinstance(pipeline_payload, dict) else []
+    results = results if isinstance(results, list) else []
+    risk_items = [
+        {
+            "label": str(item.get("reference") or "PO"),
+            "severity": "high" if str(item.get("status") or "").lower() == "overdue" else "medium",
+            "description": f"Current status is {str(item.get('status') or 'unknown')} for supplier {str(item.get('supplier_name') or 'unassigned')}.",
+        }
+        for item in results[:10]
+        if isinstance(item, dict)
+    ]
+    ranked_items = [
+        {"label": str(item.get("reference") or "PO"), "value": 100 if str(item.get("status") or "").lower() == "overdue" else 50}
+        for item in results[:10]
+        if isinstance(item, dict)
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": f"Procurement delays and receiving exceptions are ready for {window_label}.",
+        "widgets": [
+            {
+                "type": "risk_panel",
+                "title": f"Open procurement risks for {window_label}",
+                "items": risk_items or [{"label": "Current procurement posture", "severity": "low", "description": "No open receiving exceptions are active."}],
+            },
+            {
+                "type": "ranked_list",
+                "title": f"Largest remaining receipts for {window_label}",
+                "items": ranked_items,
+                "ordered_by": "remaining_quantity",
+            },
+            {
+                "type": "timeline",
+                "title": f"Exception timeline for {window_label}",
+                "events": _timeline_events(activity_payload.get("timeline") if isinstance(activity_payload, dict) else []),
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "inventory", "endpoint_or_topic": "search_purchase_orders", "freshness": "live"},
+            {"service": "audit", "endpoint_or_topic": "get_purchase_order_activity", "freshness": "live"},
+        ],
+        "permissions_checked": ["read_inventory", "view_audit_logs"],
+        "confidence": "high",
+        "warnings": [],
+    }
+
+
+def _build_procurement_cost_variance_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="the selected period")
+    analytics = payload.get("analytics") if isinstance(payload, dict) else {}
+    analytics = analytics if isinstance(analytics, dict) else {}
+    rows = analytics.get("supplier_performance") if isinstance(analytics.get("supplier_performance"), list) else []
+    if rows:
+        table_rows = [
+            {
+                "supplier": str(item.get("supplier_name") or item.get("supplier__name") or ""),
+                "orders": int(item.get("order_count") or 0),
+                "value": float(item.get("total_value") or 0),
+                "avg_delivery_time": str(item.get("avg_delivery_time") or ""),
+            }
+            for item in rows
+            if isinstance(item, dict)
+        ]
+    else:
+        table_rows = [
+            {
+                "supplier": str(item.get("supplier_name") or "Unassigned supplier"),
+                "orders": 1,
+                "value": 0.0,
+                "avg_delivery_time": str(item.get("delivery_date") or ""),
+            }
+            for item in _purchase_order_results(payload)[:10]
+        ]
+    risk_items = [
+        {
+            "label": row["supplier"],
+            "severity": "medium",
+            "description": f"Total order value {row['value']:.2f} across {row['orders']} orders.",
+        }
+        for row in table_rows[:5]
+    ]
+    chart_rows = [{"label": row["supplier"], "value": row["value"]} for row in table_rows[:8]]
+    return {
+        "kind": "insight_response",
+        "summary": f"Procurement cost variance indicators are ready for {window_label}.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Cost baseline for {window_label}",
+                "data": [
+                    {"label": "Total Order Value", "value": float(analytics.get("total_order_value") or 0)},
+                    {"label": "Average Order Value", "value": float(analytics.get("average_order_value") or 0)},
+                    {"label": "Cost Per Order", "value": float(analytics.get("cost_per_order") or 0)},
+                ],
+            },
+            {
+                "type": "comparison_table",
+                "title": f"Supplier cost view for {window_label}",
+                "columns": ["supplier", "orders", "value", "avg_delivery_time"],
+                "rows": table_rows,
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Supplier order value variance for {window_label}",
+                "data": chart_rows,
+                "x_key": "label",
+                "y_key": "value",
+            },
+            {
+                "type": "risk_panel",
+                "title": f"Price review candidates for {window_label}",
+                "items": risk_items or [{"label": "Current cost posture", "severity": "low", "description": "No high-variance supplier rows were returned."}],
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "inventory", "endpoint_or_topic": "get_purchase_order_analytics", "freshness": "live"}],
+        "permissions_checked": ["read_inventory"],
+        "confidence": "medium",
+        "warnings": [] if table_rows else ["No supplier cost rows were returned."],
+    }
+
+
+def _build_product_import_opportunities_insight(matches_payload: dict[str, Any]) -> dict[str, Any]:
+    results = matches_payload.get("results") if isinstance(matches_payload, dict) else []
+    results = results if isinstance(results, list) else []
+    ranked_items = [
+        {
+            "label": str(item.get("name") or "Catalog product"),
+            "value": int(item.get("variant_count") or 0),
+            "secondary_value": str(item.get("brand") or ""),
+        }
+        for item in results
+        if isinstance(item, dict) and not bool(item.get("already_imported"))
+    ]
+    rows = [
+        {
+            "name": str(item.get("name") or ""),
+            "brand": str(item.get("brand") or ""),
+            "category": str(item.get("category_name") or ""),
+            "variants": int(item.get("variant_count") or 0),
+            "already_imported": bool(item.get("already_imported")),
+        }
+        for item in results[:10]
+        if isinstance(item, dict)
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": "Global catalog import opportunities are ready.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Catalog opportunity snapshot",
+                "data": [
+                    {"label": "Matches", "value": int(matches_payload.get("count") or len(rows))},
+                    {"label": "New Opportunities", "value": len(ranked_items)},
+                ],
+            },
+            {
+                "type": "ranked_list",
+                "title": "Top import opportunities",
+                "items": ranked_items,
+                "ordered_by": "variant_count",
+            },
+            {
+                "type": "comparison_table",
+                "title": "Catalog opportunity board",
+                "columns": ["name", "brand", "category", "variants", "already_imported"],
+                "rows": rows,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "products", "endpoint_or_topic": "get_top_catalog_matches", "freshness": "live"}],
+        "permissions_checked": ["read_products"],
+        "confidence": "high",
+        "warnings": [] if rows else ["No global catalog matches were returned."],
+    }
+
+
+def _build_variant_lookup_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    results = payload.get("results") if isinstance(payload, dict) else []
+    results = results if isinstance(results, list) else []
+    first = results[0] if results and isinstance(results[0], dict) else {}
+    rows = [
+        {
+            "product_name": str(item.get("product_name") or ""),
+            "name": str(item.get("name") or ""),
+            "sku": str(item.get("sku") or ""),
+            "barcode": str(item.get("barcode") or ""),
+            "selling_price": float(item.get("selling_price") or 0),
+        }
+        for item in results[:10]
+        if isinstance(item, dict)
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": "Variant lookup results are ready.",
+        "widgets": [
+            {
+                "type": "entity_preview",
+                "title": "Best variant match",
+                "entity": {
+                    "kind": "Variant",
+                    "title": str(first.get("name") or first.get("product_name") or "Variant"),
+                    "subtitle": str(first.get("product_name") or ""),
+                    "meta": [
+                        {"label": "SKU", "value": str(first.get("sku") or "")},
+                        {"label": "Barcode", "value": str(first.get("barcode") or "")},
+                        {"label": "Price", "value": float(first.get("selling_price") or 0)},
+                    ],
+                },
+            },
+            {
+                "type": "comparison_table",
+                "title": "Closest variant matches",
+                "columns": ["product_name", "name", "sku", "barcode", "selling_price"],
+                "rows": rows,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "products", "endpoint_or_topic": "search_product_variants", "freshness": "live"}],
+        "permissions_checked": ["read_products"],
+        "confidence": "high",
+        "warnings": [] if rows else ["No variant matches were returned."],
+    }
+
+
+def _build_catalog_gap_insight(dashboard_payload: dict[str, Any], matches_payload: dict[str, Any], alerts_payload: dict[str, Any]) -> dict[str, Any]:
+    dashboard = dashboard_payload.get("dashboard") if isinstance(dashboard_payload, dict) else {}
+    dashboard = dashboard if isinstance(dashboard, dict) else {}
+    categories = dashboard.get("category_distribution") if isinstance(dashboard.get("category_distribution"), list) else []
+    matches = matches_payload.get("results") if isinstance(matches_payload, dict) else []
+    matches = matches if isinstance(matches, list) else []
+    alerts = alerts_payload.get("alerts") if isinstance(alerts_payload, dict) else {}
+    alerts = alerts if isinstance(alerts, dict) else {}
+    risk_items = [
+        {
+            "label": str(item.get("category_name") or "Category"),
+            "severity": "medium",
+            "description": f"{int(item.get('count') or 0)} active products currently cover this category.",
+        }
+        for item in categories[-5:]
+        if isinstance(item, dict)
+    ]
+    if int(alerts.get("total_alerts") or 0) > 0:
+        risk_items.append(
+            {
+                "label": "Low-stock exposure",
+                "severity": "high",
+                "description": f"{int(alerts.get('total_alerts') or 0)} product-stock alerts may be amplifying catalog gaps.",
+            }
+        )
+    ranked_items = [
+        {"label": str(item.get("name") or "Catalog product"), "value": int(item.get("variant_count") or 0)}
+        for item in matches
+        if isinstance(item, dict) and not bool(item.get("already_imported"))
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": "Catalog gap signals are ready.",
+        "widgets": [
+            {
+                "type": "risk_panel",
+                "title": "Assortment weaknesses",
+                "items": risk_items or [{"label": "Catalog posture", "severity": "low", "description": "No obvious assortment imbalance was detected."}],
+            },
+            {
+                "type": "ranked_list",
+                "title": "Gap-closing opportunities",
+                "items": ranked_items[:10],
+                "ordered_by": "variant_count",
+            },
+            {
+                "type": "comparison_table",
+                "title": "Category distribution",
+                "columns": ["category_name", "count"],
+                "rows": [item for item in categories if isinstance(item, dict)],
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "products", "endpoint_or_topic": "get_product_dashboard_stats", "freshness": "live"},
+            {"service": "products", "endpoint_or_topic": "get_top_catalog_matches", "freshness": "live"},
+            {"service": "products", "endpoint_or_topic": "get_product_stock_alerts", "freshness": "live"},
+        ],
+        "permissions_checked": ["read_products"],
+        "confidence": "medium",
+        "warnings": [],
+    }
+
+
+def _build_duplicate_code_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    results = payload.get("results") if isinstance(payload, dict) else []
+    results = results if isinstance(results, list) else []
+    sku_counts: dict[str, list[dict[str, Any]]] = {}
+    barcode_counts: dict[str, list[dict[str, Any]]] = {}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        sku = str(item.get("sku") or "").strip()
+        barcode = str(item.get("barcode") or "").strip()
+        if sku:
+            sku_counts.setdefault(sku, []).append(item)
+        if barcode:
+            barcode_counts.setdefault(barcode, []).append(item)
+    rows = []
+    for code, items in list(sku_counts.items()) + list(barcode_counts.items()):
+        if len(items) > 1:
+            rows.append(
+                {
+                    "code": code,
+                    "count": len(items),
+                    "products": ", ".join(str(item.get("product_name") or item.get("name") or "") for item in items[:3]),
+                }
+            )
+    if not rows:
+        for item in results[:10]:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "code": str(item.get("sku") or item.get("barcode") or ""),
+                    "count": 1,
+                    "products": str(item.get("product_name") or item.get("name") or ""),
+                }
+            )
+    risk_items = [
+        {
+            "label": row["code"] or "Missing code",
+            "severity": "high" if int(row["count"] or 0) > 1 else "low",
+            "description": f"{int(row['count'] or 0)} matching variant records detected.",
+        }
+        for row in rows[:10]
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": "Duplicate barcode and SKU risk is ready.",
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": "Potential code conflicts",
+                "columns": ["code", "count", "products"],
+                "rows": rows,
+            },
+            {
+                "type": "risk_panel",
+                "title": "Identifier risks",
+                "items": risk_items,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "products", "endpoint_or_topic": "search_product_variants", "freshness": "live"}],
+        "permissions_checked": ["read_products"],
+        "confidence": "medium",
+        "warnings": [],
+    }
+
+
+def _build_product_media_category_insight(dashboard_payload: dict[str, Any], variant_payload: dict[str, Any]) -> dict[str, Any]:
+    dashboard = dashboard_payload.get("dashboard") if isinstance(dashboard_payload, dict) else {}
+    dashboard = dashboard if isinstance(dashboard, dict) else {}
+    categories = dashboard.get("category_distribution") if isinstance(dashboard.get("category_distribution"), list) else []
+    variants = variant_payload.get("results") if isinstance(variant_payload, dict) else []
+    variants = variants if isinstance(variants, list) else []
+    ranked_items = [
+        {"label": str(item.get("category_name") or "Category"), "value": int(item.get("count") or 0)}
+        for item in reversed([item for item in categories if isinstance(item, dict)])
+    ]
+    first = variants[0] if variants and isinstance(variants[0], dict) else {}
+    return {
+        "kind": "insight_response",
+        "summary": "Product media and content quality opportunities are ready.",
+        "widgets": [
+            {
+                "type": "ranked_list",
+                "title": "Category curation opportunities",
+                "items": ranked_items,
+                "ordered_by": "count",
+            },
+            {
+                "type": "entity_preview",
+                "title": "Variant to review",
+                "entity": {
+                    "kind": "Variant",
+                    "title": str(first.get("name") or first.get("product_name") or "Variant"),
+                    "subtitle": str(first.get("product_name") or ""),
+                    "meta": [
+                        {"label": "SKU", "value": str(first.get("sku") or "")},
+                        {"label": "Barcode", "value": str(first.get("barcode") or "")},
+                    ],
+                },
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "products", "endpoint_or_topic": "get_product_dashboard_stats", "freshness": "live"},
+            {"service": "products", "endpoint_or_topic": "search_product_variants", "freshness": "live"},
+        ],
+        "permissions_checked": ["read_products"],
+        "confidence": "medium",
+        "warnings": [],
+    }
+
+
+def _build_host_cross_domain_insight(
+    sales_payload: dict[str, Any],
+    stock_payload: dict[str, Any],
+    pipeline_payload: dict[str, Any],
+    subscription_payload: dict[str, Any],
+) -> dict[str, Any]:
+    window_label = _payload_window_label(sales_payload, fallback="today")
+    summary = stock_payload.get("summary") if isinstance(stock_payload, dict) else {}
+    summary = summary if isinstance(summary, dict) else {}
+    features = subscription_payload.get("features") if isinstance(subscription_payload, dict) else []
+    features = features if isinstance(features, list) else []
+    pipeline_status_counts = pipeline_payload.get("status_counts") if isinstance(pipeline_payload, dict) else {}
+    pipeline_status_counts = pipeline_status_counts if isinstance(pipeline_status_counts, dict) else {}
+    risk_items = [
+        {
+            "label": "Out of stock",
+            "severity": "high" if int(summary.get("out_of_stock_count") or 0) > 0 else "low",
+            "description": f"{int(summary.get('out_of_stock_count') or 0)} items are out of stock.",
+        },
+        {
+            "label": "Open procurement flow",
+            "severity": "medium" if len([count for count in pipeline_status_counts.values() if int(count or 0) > 0]) > 0 else "low",
+            "description": f"{len([count for count in pipeline_status_counts.values() if int(count or 0) > 0])} purchase-order statuses are currently active.",
+        },
+    ]
+    near_limit = [item for item in features if isinstance(item, dict) and str(item.get("status") or "") in {"near_limit", "at_limit"}]
+    if near_limit:
+        risk_items.append(
+            {
+                "label": "Subscription pressure",
+                "severity": "medium",
+                "description": f"{len(near_limit)} tracked resources are near or at their plan limit.",
+            }
+        )
+    return {
+        "kind": "insight_response",
+        "summary": f"Workspace operational summary is ready for {window_label}.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Operational snapshot for {window_label}",
+                "data": [
+                    {"label": "Sales", "value": float(sales_payload.get("total_sales") or 0)},
+                    {"label": "Orders", "value": sum(int(item.get("order_count") or 0) for item in (sales_payload.get("groups") or []) if isinstance(item, dict))},
+                    {"label": "Reorder Candidates", "value": int(summary.get("reorder_count") or 0)},
+                    {"label": "Open PO Statuses", "value": len([count for count in pipeline_status_counts.values() if int(count or 0) > 0])},
+                ],
+            },
+            {
+                "type": "risk_panel",
+                "title": "Operational risks",
+                "items": risk_items,
+            },
+            {
+                "type": "comparison_table",
+                "title": f"Sales by location for {window_label}",
+                "columns": ["label", "order_count", "total_sales"],
+                "rows": [item for item in (sales_payload.get("groups") or []) if isinstance(item, dict)],
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "pos", "endpoint_or_topic": "get_sales_summary", "freshness": "live"},
+            {"service": "inventory", "endpoint_or_topic": "get_stock_risk", "freshness": "live"},
+            {"service": "inventory", "endpoint_or_topic": "get_purchase_order_analytics", "freshness": "live"},
+            {"service": "subscriptions", "endpoint_or_topic": "get_usage_and_limits", "freshness": "live"},
+        ],
+        "permissions_checked": ["view_pos_reports", "read_inventory", "manage_workspace_subscription"],
+        "confidence": "high",
+        "warnings": [],
+    }
+
+
+def _build_host_location_comparison_insight(
+    sales_payload: dict[str, Any],
+    location_payload: dict[str, Any],
+) -> dict[str, Any]:
+    window_label = _payload_window_label(sales_payload, fallback="today")
+    sales_groups = sales_payload.get("groups") if isinstance(sales_payload, dict) else []
+    sales_groups = sales_groups if isinstance(sales_groups, list) else []
+    locations = location_payload.get("results") if isinstance(location_payload, dict) else []
+    locations = locations if isinstance(locations, list) else []
+    by_name = {
+        str(item.get("name") or item.get("label") or "").strip().lower(): item
+        for item in locations
+        if isinstance(item, dict)
+    }
+    rows = []
+    bar_rows = []
+    for sale in sales_groups:
+        if not isinstance(sale, dict):
+            continue
+        label = str(sale.get("label") or "Location")
+        location = by_name.get(label.strip().lower(), {})
+        row = {
+            "location": label,
+            "sales": float(sale.get("total_sales") or 0),
+            "orders": int(sale.get("order_count") or 0),
+            "quantity": float(location.get("total_quantity") or 0),
+            "value": float(location.get("total_value") or 0),
+            "expiring_soon": int(location.get("expiring_soon_count") or 0),
+        }
+        rows.append(row)
+        bar_rows.append({"label": label, "value": row["sales"]})
+    return {
+        "kind": "insight_response",
+        "summary": f"Location comparison across sales and stock health is ready for {window_label}.",
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": f"Location scorecard for {window_label}",
+                "columns": ["location", "sales", "orders", "quantity", "value", "expiring_soon"],
+                "rows": rows,
+            },
+            {
+                "type": "metric_grid",
+                "title": "Location comparison",
+                "data": [
+                    {"label": "Locations", "value": len(rows)},
+                    {"label": "Sales Leaders", "value": rows[0]["location"] if rows else "None"},
+                ],
+            },
+            {
+                "type": "bar_chart",
+                "title": f"Sales by location for {window_label}",
+                "data": bar_rows,
+                "x_key": "label",
+                "y_key": "value",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "pos", "endpoint_or_topic": "get_sales_summary", "freshness": "live"},
+            {"service": "inventory", "endpoint_or_topic": "search_stock_locations", "freshness": "live"},
+        ],
+        "permissions_checked": ["view_pos_reports", "read_inventory"],
+        "confidence": "high",
+        "warnings": [],
+    }
+
+
+def _build_host_recommendations_insight(
+    stock_payload: dict[str, Any],
+    pipeline_payload: dict[str, Any],
+    subscription_payload: dict[str, Any],
+) -> dict[str, Any]:
+    summary = stock_payload.get("summary") if isinstance(stock_payload, dict) else {}
+    summary = summary if isinstance(summary, dict) else {}
+    features = subscription_payload.get("features") if isinstance(subscription_payload, dict) else []
+    features = features if isinstance(features, list) else []
+    pipeline_status_counts = pipeline_payload.get("status_counts") if isinstance(pipeline_payload, dict) else {}
+    pipeline_status_counts = pipeline_status_counts if isinstance(pipeline_status_counts, dict) else {}
+    ranked_items = []
+    risk_items = []
+    if int(summary.get("out_of_stock_count") or 0) > 0:
+        ranked_items.append({"label": "Replenish out-of-stock items", "value": 1})
+        risk_items.append({"label": "Stockouts", "severity": "high", "description": f"{int(summary.get('out_of_stock_count') or 0)} items are already out of stock."})
+    if len([count for count in pipeline_status_counts.values() if int(count or 0) > 0]) > 0:
+        ranked_items.append({"label": "Advance open purchase orders", "value": 2})
+        risk_items.append({"label": "Procurement backlog", "severity": "medium", "description": f"{len([count for count in pipeline_status_counts.values() if int(count or 0) > 0])} purchase-order statuses remain active."})
+    if any(isinstance(item, dict) and str(item.get("status") or "") in {"near_limit", "at_limit"} for item in features):
+        ranked_items.append({"label": "Review plan pressure", "value": 3})
+        risk_items.append({"label": "Capacity pressure", "severity": "medium", "description": "One or more tracked subscription resources are near their limit."})
+    if not ranked_items:
+        ranked_items.append({"label": "Maintain current operating posture", "value": 1})
+        risk_items.append({"label": "Current posture", "severity": "low", "description": "No immediate workspace-wide pressure was detected."})
+    return {
+        "kind": "insight_response",
+        "summary": "Prioritized workspace actions are ready.",
+        "widgets": [
+            {
+                "type": "risk_panel",
+                "title": "Why these actions matter",
+                "items": risk_items,
+            },
+            {
+                "type": "ranked_list",
+                "title": "Top next actions",
+                "items": ranked_items,
+                "ordered_by": "priority",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "inventory", "endpoint_or_topic": "get_stock_risk", "freshness": "live"},
+            {"service": "inventory", "endpoint_or_topic": "get_purchase_order_analytics", "freshness": "live"},
+            {"service": "subscriptions", "endpoint_or_topic": "get_usage_and_limits", "freshness": "live"},
+        ],
+        "permissions_checked": ["read_inventory", "manage_workspace_subscription"],
+        "confidence": "high",
+        "warnings": [],
+    }
+
+
+def _build_host_business_analyst_insight(
+    sales_by_day_payload: dict[str, Any],
+    sales_by_location_payload: dict[str, Any],
+    top_sellers_payload: dict[str, Any],
+    stock_payload: dict[str, Any],
+    pipeline_payload: dict[str, Any],
+    subscription_payload: dict[str, Any],
+) -> dict[str, Any]:
+    window_label = _payload_window_label(sales_by_day_payload, fallback="last 1 year")
+    day_groups = sales_by_day_payload.get("groups") if isinstance(sales_by_day_payload, dict) else []
+    day_groups = day_groups if isinstance(day_groups, list) else []
+    location_groups = sales_by_location_payload.get("groups") if isinstance(sales_by_location_payload, dict) else []
+    location_groups = location_groups if isinstance(location_groups, list) else []
+    top_sellers = top_sellers_payload.get("results") if isinstance(top_sellers_payload, dict) else []
+    top_sellers = top_sellers if isinstance(top_sellers, list) else []
+    stock_summary = stock_payload.get("summary") if isinstance(stock_payload, dict) else {}
+    stock_summary = stock_summary if isinstance(stock_summary, dict) else {}
+    pipeline_status_counts = pipeline_payload.get("status_counts") if isinstance(pipeline_payload, dict) else {}
+    pipeline_status_counts = pipeline_status_counts if isinstance(pipeline_status_counts, dict) else {}
+    features = subscription_payload.get("features") if isinstance(subscription_payload, dict) else []
+    features = features if isinstance(features, list) else []
+
+    total_sales = round(sum(float(item.get("total_sales") or 0) for item in day_groups if isinstance(item, dict)), 2)
+    total_orders = sum(int(item.get("order_count") or 0) for item in day_groups if isinstance(item, dict))
+    active_days = len([item for item in day_groups if isinstance(item, dict) and (float(item.get("total_sales") or 0) > 0 or int(item.get("order_count") or 0) > 0)])
+    avg_daily_sales = round(total_sales / active_days, 2) if active_days else 0
+    best_day = max(
+        (item for item in day_groups if isinstance(item, dict)),
+        key=lambda item: (float(item.get("total_sales") or 0), int(item.get("order_count") or 0)),
+        default={},
+    )
+    top_location = max(
+        (item for item in location_groups if isinstance(item, dict)),
+        key=lambda item: (float(item.get("total_sales") or 0), int(item.get("order_count") or 0)),
+        default={},
+    )
+    out_of_stock_count = int(stock_summary.get("out_of_stock_count") or 0)
+    reorder_count = int(stock_summary.get("reorder_count") or 0)
+    expiring_count = int(stock_summary.get("expiring_count") or 0)
+    active_po_statuses = len([count for count in pipeline_status_counts.values() if int(count or 0) > 0])
+    near_limit = [item for item in features if isinstance(item, dict) and str(item.get("status") or "") in {"near_limit", "at_limit"}]
+
+    currency_code = str(sales_by_day_payload.get("currency_code") or sales_by_day_payload.get("currency") or "NGN").upper()
+    currency_symbol = {
+        "NGN": "₦",
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£",
+        "JPY": "¥",
+        "CAD": "C$",
+        "AUD": "A$",
+        "GHS": "₵",
+        "KES": "KSh",
+        "ZAR": "R",
+    }.get(currency_code, f"{currency_code} ")
+
+    def money_label(amount: Any) -> str:
+        return f"{currency_symbol}{float(amount or 0):,.2f}"
+
+    def count_label(value: Any) -> str:
+        numeric = float(value or 0)
+        return f"{numeric:,.0f}" if numeric.is_integer() else f"{numeric:,.2f}"
+
+    trend_rows = [
+        {
+            "label": str(item.get("label") or item.get("bucket") or ""),
+            "sales": round(float(item.get("total_sales") or 0), 2),
+            "orders": int(item.get("order_count") or 0),
+        }
+        for item in day_groups
+        if isinstance(item, dict)
+    ]
+    location_rows = [
+        {
+            "location": str(item.get("label") or "Location"),
+            "sales": round(float(item.get("total_sales") or 0), 2),
+            "orders": int(item.get("order_count") or 0),
+        }
+        for item in location_groups
+        if isinstance(item, dict)
+    ]
+    ranked_sellers = []
+    for item in top_sellers[:8]:
+        if not isinstance(item, dict):
+            continue
+        ranked_sellers.append(
+            {
+                "label": str(item.get("variant_name") or item.get("product_name") or item.get("name") or "Product"),
+                "value": round(float(item.get("sales_total") or 0), 2),
+                "format": "currency",
+                "secondary_value": round(float(item.get("quantity_sold") or 0), 2),
+                "secondary_format": "number",
+                "detail": f"{count_label(item.get('order_count'))} orders",
+                "barcode": str(item.get("barcode_snapshot") or item.get("barcode") or ""),
+                "image_url": _product_image_url(item),
+            }
+        )
+
+    risk_items = []
+    if out_of_stock_count:
+        risk_items.append({"label": "Stockouts are blocking demand", "severity": "high", "description": f"{out_of_stock_count} items are out of stock."})
+    if reorder_count:
+        risk_items.append({"label": "Reorder queue needs attention", "severity": "medium", "description": f"{reorder_count} items are candidates for replenishment."})
+    if expiring_count:
+        risk_items.append({"label": "Expiry exposure", "severity": "medium", "description": f"{expiring_count} items are close to expiry."})
+    if active_po_statuses:
+        risk_items.append({"label": "Open procurement work", "severity": "medium", "description": f"{active_po_statuses} purchase-order statuses still have active work."})
+    if near_limit:
+        risk_items.append({"label": "Plan capacity pressure", "severity": "medium", "description": f"{len(near_limit)} subscription resources are near or at limit."})
+    if not risk_items:
+        risk_items.append({"label": "No critical cross-service pressure detected", "severity": "low", "description": "Sales, stock, procurement, and plan limits do not show an immediate critical exception."})
+
+    action_items = []
+    if out_of_stock_count or reorder_count:
+        action_items.append({"label": "Prioritize replenishment before sales campaigns", "value": 1, "format": "number", "hide_value": True, "detail": "Resolve stockouts and reorder candidates first so demand generation does not expose unavailable products."})
+    if active_po_statuses:
+        action_items.append({"label": "Close the oldest purchase-order bottlenecks", "value": 2, "format": "number", "hide_value": True, "detail": "Move pending, issued, and receiving POs forward before creating more procurement noise."})
+    if ranked_sellers:
+        action_items.append({"label": "Protect the top sellers from stock disruption", "value": 3, "format": "number", "hide_value": True, "detail": "Use the top-seller list as the first stock-watch set for purchasing and transfer decisions."})
+    if near_limit:
+        action_items.append({"label": "Review subscription limits before adding more data/users", "value": 4, "format": "number", "hide_value": True, "detail": "Plan pressure can block operational scale if not handled before more imports, staff, or AI usage."})
+    if not action_items:
+        action_items.append({"label": "Maintain the current operating posture", "value": 1, "format": "number", "hide_value": True, "detail": "No urgent action surfaced from this cross-service review."})
+
+    insight_rows = [
+        {
+            "title": "Revenue posture",
+            "detail": f"{count_label(total_orders)} completed orders generated {money_label(total_sales)} across {window_label}; average active-day revenue is {money_label(avg_daily_sales)}.",
+        },
+        {
+            "title": "Best day",
+            "detail": (
+                f"{best_day.get('label')} was the strongest day at {money_label(best_day.get('total_sales'))} across {count_label(best_day.get('order_count'))} orders."
+                if best_day
+                else "No peak sales day was available for the selected window."
+            ),
+        },
+        {
+            "title": "Location signal",
+            "detail": (
+                f"{top_location.get('label')} leads location revenue at {money_label(top_location.get('total_sales'))}."
+                if top_location
+                else "No location-level sales signal was available."
+            ),
+        },
+    ]
+
+    return {
+        "kind": "insight_response",
+        "summary": f"Business analyst review is ready for {window_label}.",
+        "explanation": "This combines POS revenue, order frequency, top sellers, stock risk, procurement status, and subscription pressure into one owner-level review.",
+        "timeframe": {
+            "label": window_label,
+            "start_date": str(sales_by_day_payload.get("_window_start_date") or ""),
+            "end_date": str(sales_by_day_payload.get("_window_end_date") or ""),
+            "period": str(sales_by_day_payload.get("_window_period") or ""),
+        },
+        "insights": insight_rows,
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Business analyst snapshot for {window_label}",
+                "data": [
+                    {"label": "Revenue", "value": total_sales, "format": "currency"},
+                    {"label": "Orders", "value": total_orders, "format": "number"},
+                    {"label": "Active Sales Days", "value": active_days, "format": "number"},
+                    {"label": "Avg Active-Day Revenue", "value": avg_daily_sales, "format": "currency"},
+                ],
+            },
+            {
+                "type": "line_chart",
+                "title": f"Revenue trend for {window_label}",
+                "subtitle": "Use this to see when revenue momentum gained or weakened.",
+                "x_key": "label",
+                "series": [
+                    {"key": "sales", "label": "Revenue", "color": "#1d4ed8"},
+                ],
+                "value_format": "currency",
+                "data": trend_rows,
+            },
+            {
+                "type": "line_chart",
+                "title": f"Order-count trend for {window_label}",
+                "subtitle": "Use this to separate purchase frequency from revenue value.",
+                "x_key": "label",
+                "series": [
+                    {"key": "orders", "label": "Orders", "color": "#0f766e"},
+                ],
+                "value_format": "number",
+                "data": trend_rows,
+            },
+            {
+                "type": "comparison_table",
+                "title": f"Location revenue scorecard for {window_label}",
+                "columns": ["location", "sales", "orders"],
+                "rows": location_rows,
+            },
+            {
+                "type": "ranked_list",
+                "title": f"Top products shaping revenue for {window_label}",
+                "items": ranked_sellers,
+                "ordered_by": "sales_total",
+            },
+            {
+                "type": "risk_panel",
+                "title": "What needs management attention",
+                "items": risk_items,
+            },
+            {
+                "type": "ranked_list",
+                "title": "Recommended owner actions",
+                "items": action_items,
+                "ordered_by": "priority",
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [
+            {"service": "pos", "endpoint_or_topic": "get_sales_summary", "freshness": "live"},
+            {"service": "pos", "endpoint_or_topic": "get_top_sellers", "freshness": "live"},
+            {"service": "inventory", "endpoint_or_topic": "get_stock_risk", "freshness": "live"},
+            {"service": "inventory", "endpoint_or_topic": "search_purchase_orders", "freshness": "live"},
+            {"service": "subscriptions", "endpoint_or_topic": "get_usage_and_limits", "freshness": "live"},
+        ],
+        "permissions_checked": ["view_pos_reports", "read_inventory", "manage_workspace_subscription"],
+        "confidence": "high" if day_groups or ranked_sellers else "medium",
+        "warnings": [] if day_groups or ranked_sellers else ["No completed POS sales were available for the selected review window."],
+    }
+
+
+def _build_staff_activity_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="last 30 days")
+    action_items = _counter_rows_to_ranked_items(payload.get("actions") if isinstance(payload, dict) else [])
+    timeline_items = _audit_timeline_items(payload.get("recent_events") if isinstance(payload, dict) else [])
+    daily_activity = payload.get("daily_activity") if isinstance(payload, dict) else []
+    daily_activity = daily_activity if isinstance(daily_activity, list) else []
+    return {
+        "kind": "insight_response",
+        "summary": f"Staff audit activity is ready for {window_label}.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Staff audit activity for {window_label}",
+                "data": [
+                    {"label": "Events", "value": int(payload.get("event_count") or 0)},
+                    {"label": "Action Types", "value": len(action_items)},
+                    {
+                        "label": "Source Services",
+                        "value": len(payload.get("source_services") or []) if isinstance(payload, dict) else 0,
+                    },
+                ],
+            },
+            {
+                "type": "line_chart",
+                "title": f"Daily staff activity for {window_label}",
+                "data": daily_activity,
+                "x_key": "bucket",
+                "y_key": "count",
+            },
+            {
+                "type": "ranked_list",
+                "title": "Most frequent staff actions",
+                "items": action_items,
+                "ordered_by": "count",
+            },
+            {
+                "type": "timeline",
+                "title": f"Audit events for {window_label}",
+                "events": timeline_items,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "audit", "endpoint_or_topic": "get_staff_activity", "freshness": "live"}],
+        "permissions_checked": ["view_audit_logs"],
+        "confidence": "high",
+        "warnings": [],
+    }
+
+
+def _build_permission_security_insight(payload: dict[str, Any], *, support_access_only: bool) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="last 30 days")
+    actor_items = _counter_rows_to_ranked_items(payload.get("actors") if isinstance(payload, dict) else [])
+    grant_items = _counter_rows_to_ranked_items(payload.get("support_access_grants") if isinstance(payload, dict) else [])
+    timeline_items = _audit_timeline_items(payload.get("recent_events") if isinstance(payload, dict) else [])
+    severity_rows = payload.get("severities") if isinstance(payload, dict) else []
+    severity_rows = severity_rows if isinstance(severity_rows, list) else []
+    summary = (
+        f"Support access audit is ready for {window_label}."
+        if support_access_only
+        else f"Permission and security activity is ready for {window_label}."
+    )
+    risk_items = [
+        {
+            "label": str(row.get("key") or "severity"),
+            "severity": "high" if str(row.get("key") or "").lower() in {"warning", "error", "critical"} else "medium",
+            "description": f"{int(row.get('count') or 0)} events",
+        }
+        for row in severity_rows
+        if isinstance(row, dict)
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": summary,
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Security activity for {window_label}",
+                "data": [
+                    {"label": "Events", "value": int(payload.get("event_count") or 0)},
+                    {"label": "Actors", "value": len(actor_items)},
+                    {"label": "Support Grants", "value": len(grant_items)},
+                ],
+            },
+            {
+                "type": "risk_panel",
+                "title": f"Severity profile for {window_label}",
+                "items": risk_items,
+            },
+            {
+                "type": "ranked_list",
+                "title": "Most active actors",
+                "items": actor_items,
+                "ordered_by": "count",
+            },
+            {
+                "type": "timeline",
+                "title": "Recent security events",
+                "events": timeline_items,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "audit", "endpoint_or_topic": "get_permission_security_activity", "freshness": "live"}],
+        "permissions_checked": ["view_audit_logs"],
+        "confidence": "high",
+        "warnings": [],
+    }
+
+
+def _build_subscription_usage_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    features = payload.get("features") if isinstance(payload, dict) else []
+    features = features if isinstance(features, list) else []
+    rows = []
+    risk_items = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        row = {
+            "feature": str(feature.get("name") or feature.get("feature") or "Feature"),
+            "usage": feature.get("usage"),
+            "limit": "Unlimited" if feature.get("is_unlimited") else feature.get("limit_value"),
+            "remaining": feature.get("remaining"),
+            "status": str(feature.get("status") or ""),
+        }
+        rows.append(row)
+        status = str(feature.get("status") or "")
+        if status in {"at_limit", "near_limit", "usage_unavailable"}:
+            risk_items.append(
+                {
+                    "label": row["feature"],
+                    "severity": "high" if status == "at_limit" else "medium",
+                    "description": status.replace("_", " "),
+                }
+            )
+    subscription = payload.get("subscription") if isinstance(payload, dict) else {}
+    subscription = subscription if isinstance(subscription, dict) else {}
+    return {
+        "kind": "insight_response",
+        "summary": "Subscription usage and limits are ready.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Workspace subscription",
+                "data": [
+                    {"label": "Status", "value": str(subscription.get("status") or "none")},
+                    {"label": "Plan", "value": str(((subscription.get("plan") or {}) if isinstance(subscription.get("plan"), dict) else {}).get("name") or "No active plan")},
+                    {"label": "Tracked Features", "value": len(rows)},
+                ],
+            },
+            {
+                "type": "comparison_table",
+                "title": "Usage against limits",
+                "columns": ["feature", "usage", "limit", "remaining", "status"],
+                "rows": rows,
+            },
+            {
+                "type": "risk_panel",
+                "title": "Usage risks",
+                "items": risk_items or [{"label": "All tracked features", "severity": "low", "description": "No current limit warnings."}],
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "subscriptions", "endpoint_or_topic": "get_usage_and_limits", "freshness": "live"}],
+        "permissions_checked": ["manage_workspace_subscription"],
+        "confidence": "high",
+        "warnings": [str(item) for item in (payload.get("warnings") or []) if str(item).strip()],
+    }
+
+
+def _build_audit_search_insight(payload: dict[str, Any], *, title: str = "Audit search results") -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="the selected period")
+    results = payload.get("results") if isinstance(payload, dict) else []
+    results = results if isinstance(results, list) else []
+    timeline_items = _audit_timeline_items([row for row in results if isinstance(row, dict)])
+    source_counts: dict[str, int] = {}
+    severity_counts: dict[str, int] = {}
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        source = str(row.get("source_service") or "unknown").strip() or "unknown"
+        severity = str(row.get("severity") or "info").strip() or "info"
+        source_counts[source] = source_counts.get(source, 0) + 1
+        severity_counts[severity] = severity_counts.get(severity, 0) + 1
+    ranked_sources = [
+        {"label": key, "value": value}
+        for key, value in sorted(source_counts.items(), key=lambda item: item[1], reverse=True)
+    ]
+    risk_items = [
+        {
+            "label": severity.replace("_", " ").title(),
+            "severity": "high" if severity in {"critical", "error", "high"} else "medium" if severity in {"warning", "warn"} else "low",
+            "detail": f"{count} events in {window_label}",
+            "next_action": "Review the matching audit events.",
+        }
+        for severity, count in sorted(severity_counts.items(), key=lambda item: item[1], reverse=True)[:4]
+    ]
+    return {
+        "kind": "insight_response",
+        "summary": f"{int(payload.get('count') or len(results))} audit events matched for {window_label}.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": title,
+                "data": [
+                    {"label": "Matches", "value": int(payload.get("count") or len(results))},
+                    {"label": "Sources", "value": len(ranked_sources)},
+                    {"label": "Severities", "value": len(severity_counts)},
+                ],
+            },
+            {
+                "type": "ranked_list",
+                "title": "Most active source services",
+                "items": ranked_sources,
+                "ordered_by": "count",
+            },
+            {
+                "type": "risk_panel",
+                "title": "Severity mix",
+                "items": risk_items,
+            },
+            {
+                "type": "timeline",
+                "title": f"Matching audit events for {window_label}",
+                "events": timeline_items,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "audit", "endpoint_or_topic": "search_events", "freshness": "live"}],
+        "permissions_checked": ["view_audit_logs"],
+        "confidence": "high",
+        "warnings": [] if results else ["No audit events matched the requested window."],
+    }
+
+
+def _build_audit_timeline_insight(payload: dict[str, Any], *, title: str = "Audit event timeline") -> dict[str, Any]:
+    timeline_rows = payload.get("timeline") if isinstance(payload, dict) else []
+    timeline_rows = timeline_rows if isinstance(timeline_rows, list) else []
+    events = _timeline_events([row for row in timeline_rows if isinstance(row, dict)])
+    first_event = events[0] if events else {}
+    return {
+        "kind": "insight_response",
+        "summary": f"{len(events)} audit timeline events are ready.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": title,
+                "data": [
+                    {"label": "Timeline Events", "value": len(events)},
+                    {"label": "Has Focus", "value": 1 if first_event else 0},
+                ],
+            },
+            {
+                "type": "entity_preview",
+                "title": "Latest timeline event",
+                "entity": {
+                    "kind": "Audit Event",
+                    "title": str(first_event.get("title") or "Audit event"),
+                    "subtitle": str(first_event.get("detail") or ""),
+                    "meta": [{"label": "Severity", "value": str(first_event.get("severity") or "info")}],
+                },
+            },
+            {
+                "type": "timeline",
+                "title": title,
+                "events": events,
+            },
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "audit", "endpoint_or_topic": "get_event_timeline", "freshness": "live"}],
+        "permissions_checked": ["view_audit_logs"],
+        "confidence": "high",
+        "warnings": [] if events else ["No audit timeline events were returned."],
+    }
+
+
+def _build_access_denied_insight(*, summary: str, detail: str, permission: str, source: str) -> dict[str, Any]:
+    return {
+        "kind": "insight_response",
+        "summary": summary,
+        "widgets": [
+            {
+                "type": "risk_panel",
+                "title": "Access required",
+                "items": [
+                    {
+                        "label": permission,
+                        "severity": "high",
+                        "description": detail,
+                    }
+                ],
+            }
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": source, "endpoint_or_topic": "permission_guard", "freshness": "live"}],
+        "permissions_checked": [permission],
+        "confidence": "high",
+        "warnings": [detail],
+    }
+
+
+def _insight_window_tool_arguments(
+    window: InsightTimeWindow,
+    *,
+    include_date: bool = False,
+    include_date_range: bool = False,
+    include_period_label: bool = False,
+) -> dict[str, Any]:
+    arguments: dict[str, Any] = {"days": int(window["days"])}
+    if include_date:
+        arguments["date"] = window["anchor_date"]
+    if include_date_range:
+        arguments["date_from"] = window["start_date"]
+        arguments["date_to"] = window["end_date"]
+    if include_period_label:
+        arguments["period_label"] = window["label"]
+    return arguments
+
+
+def _with_window_label(payload: Any, *, window: InsightTimeWindow) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        enriched = dict(payload)
+        enriched.setdefault("_window_label", window["label"])
+        enriched.setdefault("_window_start_date", window["start_date"])
+        enriched.setdefault("_window_end_date", window["end_date"])
+        enriched.setdefault("_window_period", window["period"])
+        return enriched
+    return {
+        "_window_label": window["label"],
+        "_window_start_date": window["start_date"],
+        "_window_end_date": window["end_date"],
+        "_window_period": window["period"],
+    }
+
+
+async def _users_named_insight_payload(
+    *,
+    insight_key: str,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+    user_text: str = "",
+) -> dict[str, Any] | None:
+    user_window = _resolve_insight_time_window(user_text, default_days=30, default_label="last 30 days")
+    if insight_key == "staff_activity":
+        output = await tool_executor.call_tool(
+            name="audit.get_staff_activity",
+            arguments={
+                **_insight_window_tool_arguments(
+                    user_window,
+                    include_date=True,
+                    include_date_range=True,
+                    include_period_label=True,
+                ),
+                "limit": 50,
+            },
+            ctx=tool_ctx,
+        )
+        return _build_staff_activity_insight(_with_window_label(output, window=user_window))
+    if insight_key == "support_access_audit":
+        output = await tool_executor.call_tool(
+            name="audit.get_permission_security_activity",
+            arguments={
+                **_insight_window_tool_arguments(
+                    user_window,
+                    include_date=True,
+                    include_date_range=True,
+                    include_period_label=True,
+                ),
+                "support_access_only": True,
+                "limit": 50,
+            },
+            ctx=tool_ctx,
+        )
+        return _build_permission_security_insight(_with_window_label(output, window=user_window), support_access_only=True)
+    if insight_key == "permission_security_activity":
+        output = await tool_executor.call_tool(
+            name="audit.get_permission_security_activity",
+            arguments={
+                **_insight_window_tool_arguments(
+                    user_window,
+                    include_date=True,
+                    include_date_range=True,
+                    include_period_label=True,
+                ),
+                "limit": 50,
+            },
+            ctx=tool_ctx,
+        )
+        return _build_permission_security_insight(_with_window_label(output, window=user_window), support_access_only=False)
+    if insight_key == "audit_search":
+        output = await tool_executor.call_tool(
+            name="audit.search_events",
+            arguments={
+                "occurred_from": user_window["start_date"],
+                "occurred_to": user_window["end_date"],
+                "period_label": user_window["label"],
+                "limit": 50,
+            },
+            ctx=tool_ctx,
+        )
+        return _build_audit_search_insight(_with_window_label(output if isinstance(output, dict) else {}, window=user_window))
+    if insight_key == "audit_timeline":
+        output = await tool_executor.call_tool(
+            name="audit.get_event_timeline",
+            arguments={"search": user_text, "limit": 100},
+            ctx=tool_ctx,
+        )
+        return _build_audit_timeline_insight(output if isinstance(output, dict) else {})
+    if insight_key == "subscription_usage_limits":
+        output = await tool_executor.call_tool(
+            name="subscriptions.get_usage_and_limits",
+            arguments={},
+            ctx=tool_ctx,
+        )
+        return _build_subscription_usage_insight(output if isinstance(output, dict) else {})
+    return None
+
+
+async def _pos_admin_named_insight_payload(
+    *,
+    insight_key: str,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+    user_text: str = "",
+) -> dict[str, Any] | None:
+    sales_window = _resolve_insight_time_window(user_text, default_days=1, default_label="today")
+    trailing_window = _resolve_insight_time_window(user_text, default_days=7, default_label="last 7 days")
+
+    async def _optional_product_lookup(arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            output = await tool_executor.call_tool(
+                name="product.get_variant_lookup",
+                arguments=arguments,
+                ctx=tool_ctx,
+            )
+        except Exception as exc:
+            logger.warning("Optional product variant lookup failed for POS insight: %s", exc)
+            return {}
+        return output if isinstance(output, dict) else {}
+
+    if insight_key == "variant_comparison":
+        product_query = _extract_product_query_from_text(user_text)
+        if not product_query:
+            return {
+                "kind": "insight_response",
+                "summary": "I need a product name, barcode, SKU, or variant id to compare variants.",
+                "widgets": [
+                    {
+                        "type": "action_form",
+                        "title": "Choose product family to compare",
+                        "fields": [
+                            {
+                                "name": "product_query",
+                                "label": "Product name, barcode, SKU, or variant id",
+                                "type": "text",
+                                "required": True,
+                            }
+                        ],
+                    }
+                ],
+                "suggested_actions": [],
+                "data_sources": [],
+                "permissions_checked": ["view_pos_reports", "read_products"],
+                "confidence": "medium",
+                "warnings": ["No product identifier was detected in the question."],
+            }
+        trend_window = _resolve_insight_time_window(user_text, default_days=365, default_label="last 1 year")
+        group_by = "month" if trend_window["days"] > 120 else "week" if trend_window["days"] > 45 else "day"
+        variant_payload = await _optional_product_lookup({"query": product_query, "limit": 10, "active_only": True})
+        trend_output = await tool_executor.call_tool(
+            name="pos.get_product_sales_trend",
+            arguments={
+                **_insight_window_tool_arguments(trend_window, include_date=True),
+                "query": product_query,
+                "group_by": group_by,
+                "limit": 25,
+                "include_series": True,
+                "include_locations": False,
+                "include_recent": False,
+            },
+            ctx=tool_ctx,
+        )
+        return _build_pos_variant_comparison_insight(
+            _with_window_label(trend_output if isinstance(trend_output, dict) else {}, window=trend_window),
+            variant_payload=variant_payload,
+        )
+    if insight_key == "product_comparison":
+        product_queries = _extract_product_comparison_queries_from_text(user_text)
+        if len(product_queries) < 2:
+            return {
+                "kind": "insight_response",
+                "summary": "I need at least two product names, barcodes, or SKUs to compare products.",
+                "widgets": [
+                    {
+                        "type": "action_form",
+                        "title": "Choose products to compare",
+                        "fields": [
+                            {
+                                "name": "products",
+                                "label": "Products to compare",
+                                "type": "text",
+                                "required": True,
+                            }
+                        ],
+                    }
+                ],
+                "suggested_actions": [],
+                "data_sources": [],
+                "permissions_checked": ["view_pos_reports"],
+                "confidence": "medium",
+                "warnings": ["Fewer than two product identifiers were detected in the question."],
+            }
+        trend_window = _resolve_insight_time_window(user_text, default_days=365, default_label="last 1 year")
+        group_by = "month" if trend_window["days"] > 120 else "week" if trend_window["days"] > 45 else "day"
+        comparison_payloads: list[dict[str, Any]] = []
+        for product_query in product_queries[:5]:
+            trend_output = await tool_executor.call_tool(
+                name="pos.get_product_sales_trend",
+                arguments={
+                    **_insight_window_tool_arguments(trend_window, include_date=True),
+                    "query": product_query,
+                    "group_by": group_by,
+                    "limit": 10,
+                    "include_series": False,
+                    "include_locations": False,
+                    "include_recent": False,
+                },
+                ctx=tool_ctx,
+            )
+            comparison_payloads.append(_with_window_label(trend_output if isinstance(trend_output, dict) else {}, window=trend_window))
+        return _build_pos_product_comparison_insight(comparison_payloads, window=trend_window)
+    if insight_key == "product_sales_trend":
+        product_query = _extract_product_query_from_text(user_text)
+        if not product_query:
+            return {
+                "kind": "insight_response",
+                "summary": "I need a product name, barcode, SKU, or variant id to analyze product sales.",
+                "widgets": [
+                    {
+                        "type": "action_form",
+                        "title": "Choose product to analyze",
+                        "fields": [
+                            {
+                                "name": "product_query",
+                                "label": "Product barcode, SKU, or name",
+                                "type": "text",
+                                "required": True,
+                            }
+                        ],
+                    }
+                ],
+                "suggested_actions": [],
+                "data_sources": [],
+                "permissions_checked": ["view_pos_reports", "read_products"],
+                "confidence": "medium",
+                "warnings": ["No product identifier was detected in the question."],
+            }
+        trend_window = _resolve_insight_time_window(user_text, default_days=365, default_label="last 1 year")
+        group_by = "month" if trend_window["days"] > 120 else "week" if trend_window["days"] > 45 else "day"
+        variant_payload = await _optional_product_lookup({"query": product_query, "limit": 1, "active_only": True})
+        trend_output = await tool_executor.call_tool(
+            name="pos.get_product_sales_trend",
+            arguments={
+                **_insight_window_tool_arguments(trend_window, include_date=True),
+                "query": product_query,
+                "group_by": group_by,
+                "limit": 10,
+            },
+            ctx=tool_ctx,
+        )
+        return _build_pos_product_sales_trend_insight(
+            _with_window_label(trend_output if isinstance(trend_output, dict) else {}, window=trend_window),
+            variant_payload=variant_payload,
+        )
+    if insight_key == "sales_overview":
+        output = await tool_executor.call_tool(
+            name="pos.get_sales_summary",
+            arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "location"},
+            ctx=tool_ctx,
+        )
+        daily_output = await tool_executor.call_tool(
+            name="pos.get_sales_summary",
+            arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "day"},
+            ctx=tool_ctx,
+        )
+        top_sellers_output = await tool_executor.call_tool(
+            name="pos.get_top_sellers",
+            arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "limit": 5},
+            ctx=tool_ctx,
+        )
+        top_sellers_output = await _enrich_top_seller_results_with_variant_context(
+            results_payload=top_sellers_output if isinstance(top_sellers_output, dict) else {},
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            limit=5,
+        )
+        return _build_pos_sales_overview_insight(
+            _with_window_label(output, window=sales_window),
+            top_sellers_payload=_with_window_label(top_sellers_output, window=sales_window),
+            daily_sales_payload=_with_window_label(daily_output if isinstance(daily_output, dict) else {}, window=sales_window),
+        )
+    if insight_key == "sales_by_location_today":
+        output = await tool_executor.call_tool(
+            name="pos.get_sales_summary",
+            arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "location"},
+            ctx=tool_ctx,
+        )
+        return _build_pos_sales_by_location_insight(_with_window_label(output, window=sales_window))
+    if insight_key == "top_sellers_seven_days":
+        output = await tool_executor.call_tool(
+            name="pos.get_top_sellers",
+            arguments={**_insight_window_tool_arguments(trailing_window, include_date=True), "limit": 5},
+            ctx=tool_ctx,
+        )
+        output = await _enrich_top_seller_results_with_variant_context(
+            results_payload=output if isinstance(output, dict) else {},
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            limit=5,
+        )
+        return _build_pos_top_sellers_insight(_with_window_label(output, window=trailing_window))
+    if insight_key == "best_sales_day":
+        output = await tool_executor.call_tool(
+            name="pos.get_sales_summary",
+            arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "day"},
+            ctx=tool_ctx,
+        )
+        return _build_pos_best_sales_day_insight(_with_window_label(output if isinstance(output, dict) else {}, window=sales_window))
+    if insight_key == "payment_mix":
+        output = await tool_executor.call_tool(
+            name="pos.get_pos_daily_summary",
+            arguments={"date": sales_window["anchor_date"]},
+            ctx=tool_ctx,
+        )
+        return _build_pos_payment_mix_insight(_with_window_label(output, window=sales_window))
+    if insight_key == "terminal_cashier_activity":
+        output = await tool_executor.call_tool(
+            name="pos.get_terminal_activity",
+            arguments={**_insight_window_tool_arguments(trailing_window, include_date=True), "limit": 10},
+            ctx=tool_ctx,
+        )
+        return _build_pos_terminal_activity_insight(_with_window_label(output, window=trailing_window))
+    if insight_key == "pos_audit_activity":
+        output = await tool_executor.call_tool(
+            name="audit.get_pos_activity",
+            arguments={
+                **_insight_window_tool_arguments(
+                    trailing_window,
+                    include_date=True,
+                    include_date_range=True,
+                    include_period_label=True,
+                ),
+                "limit": 50,
+            },
+            ctx=tool_ctx,
+        )
+        return _build_audit_entity_activity_insight(
+            _with_window_label(output, window=trailing_window),
+            summary="POS audit activity is ready.",
+            title="POS audit activity",
+            source_endpoint="get_pos_activity",
+            preview_kind="POS",
+        )
+    if insight_key == "sessions_orders":
+        summary_output = await tool_executor.call_tool(
+            name="pos.get_pos_daily_summary",
+            arguments={"date": sales_window["anchor_date"]},
+            ctx=tool_ctx,
+        )
+        sales_output = await tool_executor.call_tool(
+            name="pos.get_sales_summary",
+            arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "location"},
+            ctx=tool_ctx,
+        )
+        return _build_pos_sessions_orders_insight(
+            _with_window_label(summary_output, window=sales_window),
+            _with_window_label(sales_output, window=sales_window),
+        )
+    if insight_key == "pos_exceptions":
+        summary_output = await tool_executor.call_tool(
+            name="pos.get_pos_daily_summary",
+            arguments={"date": sales_window["anchor_date"]},
+            ctx=tool_ctx,
+        )
+        terminal_output = await tool_executor.call_tool(
+            name="pos.get_terminal_activity",
+            arguments={**_insight_window_tool_arguments(trailing_window, include_date=True), "limit": 10},
+            ctx=tool_ctx,
+        )
+        return _build_pos_exceptions_insight(
+            _with_window_label(summary_output, window=sales_window),
+            _with_window_label(terminal_output, window=trailing_window),
+        )
+    return None
+
+
+async def _inventory_visibility_named_insight_payload(
+    *,
+    insight_key: str,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+    user_text: str = "",
+) -> dict[str, Any] | None:
+    movement_window = _resolve_insight_time_window(user_text, default_days=30, default_label="last 30 days")
+    if insight_key in {"stock_risk_out_of_stock", "stock_risk_low_stock", "stock_risk"}:
+        output = await tool_executor.call_tool(
+            name="inventory.get_stock_risk",
+            arguments={"limit": 12, "expiring_days": 30},
+            ctx=tool_ctx,
+        )
+        focus_map = {
+            "stock_risk_out_of_stock": "out_of_stock",
+            "stock_risk_low_stock": "low_stock",
+            "stock_risk": None,
+        }
+        return _build_inventory_stock_risk_insight(output if isinstance(output, dict) else {}, focus=focus_map[insight_key])
+    if insight_key == "reorder_candidates":
+        output = await tool_executor.call_tool(
+            name="inventory.get_reorder_candidates",
+            arguments={"limit": 12},
+            ctx=tool_ctx,
+        )
+        rows = output.get("results") if isinstance(output, dict) and isinstance(output.get("results"), list) else []
+        return _build_inventory_stock_risk_insight(
+            {
+                "summary": {
+                    "out_of_stock_count": len([row for row in rows if isinstance(row, dict) and float(row.get("quantity_available") or row.get("quantity") or 0) <= 0]),
+                    "reorder_count": int(output.get("count") or 0) if isinstance(output, dict) else len(rows),
+                    "low_stock_count": 0,
+                    "expiring_count": 0,
+                },
+                "risk_items": {"needs_reorder": rows},
+            },
+            focus="needs_reorder",
+        )
+    if insight_key == "stock_movements":
+        output = await tool_executor.call_tool(
+            name="inventory.get_stock_movements",
+            arguments={
+                "limit": 20,
+                "date_from": movement_window["start_date"],
+                "date_to": movement_window["end_date"],
+            },
+            ctx=tool_ctx,
+        )
+        return _build_inventory_movements_insight(output if isinstance(output, dict) else {})
+    if insight_key == "location_health":
+        output = await tool_executor.call_tool(
+            name="inventory.search_stock_locations",
+            arguments={"limit": 25},
+            ctx=tool_ctx,
+        )
+        return _build_inventory_location_health_insight(output if isinstance(output, dict) else {})
+    if insight_key == "stock_value_changes":
+        analytics_output = await tool_executor.call_tool(
+            name="inventory.get_stock_analytics",
+            arguments={},
+            ctx=tool_ctx,
+        )
+        movements_output = await tool_executor.call_tool(
+            name="inventory.get_stock_movements",
+            arguments={
+                "limit": 25,
+                "date_from": movement_window["start_date"],
+                "date_to": movement_window["end_date"],
+            },
+            ctx=tool_ctx,
+        )
+        return _build_stock_value_change_insight(
+            analytics_output if isinstance(analytics_output, dict) else {},
+            movements_output if isinstance(movements_output, dict) else {},
+            window_label=movement_window["label"],
+        )
+    if insight_key == "realtime_snapshot":
+        snapshot_output = await tool_executor.call_tool(
+            name="audit.get_realtime_dashboard_snapshot",
+            arguments={},
+            ctx=tool_ctx,
+        )
+        alerts_output = await tool_executor.call_tool(
+            name="notifications.get_alert_summary",
+            arguments={"limit": 10},
+            ctx=tool_ctx,
+        )
+        return _build_realtime_dashboard_snapshot_insight(
+            snapshot_output if isinstance(snapshot_output, dict) else {},
+            alerts_output if isinstance(alerts_output, dict) else {},
+        )
+    if insight_key == "adjustment_risk":
+        output = await tool_executor.call_tool(
+            name="inventory.get_stock_movements",
+            arguments={
+                "limit": 20,
+                "movement_type": "adjustment",
+                "date_from": movement_window["start_date"],
+                "date_to": movement_window["end_date"],
+            },
+            ctx=tool_ctx,
+        )
+        return _build_inventory_adjustment_risk_insight(output if isinstance(output, dict) else {})
+    return None
+
+
+async def _inventory_procurement_named_insight_payload(
+    *,
+    insight_key: str,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+    user_text: str = "",
+) -> dict[str, Any] | None:
+    window = _resolve_insight_time_window(user_text, default_days=30, default_label="last 30 days")
+    purchase_order_arguments = {
+        "limit": 20,
+        "date_from": window["start_date"],
+        "date_to": window["end_date"],
+    }
+    audit_arguments = {**_insight_window_tool_arguments(window, include_date=True), "limit": 50}
+    audit_arguments.update(
+        _insight_window_tool_arguments(
+            window,
+            include_date_range=True,
+            include_period_label=True,
+        )
+    )
+
+    async def _safe_purchase_order_activity() -> dict[str, Any]:
+        try:
+            output = await tool_executor.call_tool(
+                name="audit.get_purchase_order_activity",
+                arguments=audit_arguments,
+                ctx=tool_ctx,
+            )
+        except Exception:
+            return {}
+        return output if isinstance(output, dict) else {}
+
+    if insight_key == "po_lifecycle":
+        orders_output = await tool_executor.call_tool(
+            name="inventory.search_purchase_orders",
+            arguments=purchase_order_arguments,
+            ctx=tool_ctx,
+        )
+        activity_output = await _safe_purchase_order_activity()
+        order_rows = _purchase_order_results(orders_output if isinstance(orders_output, dict) else {})
+        return _build_procurement_lifecycle_insight(
+            {
+                "status_counts": _purchase_order_status_counts(order_rows),
+                "results": order_rows,
+            },
+            _with_window_label(activity_output, window=window),
+        )
+    if insight_key == "receiving_lifecycle":
+        orders_output = await tool_executor.call_tool(
+            name="inventory.search_purchase_orders",
+            arguments=purchase_order_arguments,
+            ctx=tool_ctx,
+        )
+        activity_output = await _safe_purchase_order_activity()
+        return _build_procurement_receiving_insight(
+            {"results": _purchase_order_results(orders_output if isinstance(orders_output, dict) else {})},
+            _with_window_label(activity_output, window=window),
+        )
+    if insight_key == "supplier_performance":
+        output = await tool_executor.call_tool(
+            name="inventory.get_purchase_order_analytics",
+            arguments={
+                "date_from": window["start_date"],
+                "date_to": window["end_date"],
+            },
+            ctx=tool_ctx,
+        )
+        return _build_procurement_supplier_insight(_with_window_label(output, window=window))
+    if insight_key == "delay_exceptions":
+        orders_output = await tool_executor.call_tool(
+            name="inventory.search_purchase_orders",
+            arguments=purchase_order_arguments,
+            ctx=tool_ctx,
+        )
+        activity_output = await _safe_purchase_order_activity()
+        return _build_procurement_delay_exception_insight(
+            {"results": _purchase_order_results(orders_output if isinstance(orders_output, dict) else {})},
+            _with_window_label(activity_output, window=window),
+        )
+    if insight_key == "cost_variance":
+        output = await tool_executor.call_tool(
+            name="inventory.get_purchase_order_analytics",
+            arguments={
+                "date_from": window["start_date"],
+                "date_to": window["end_date"],
+            },
+            ctx=tool_ctx,
+        )
+        return _build_procurement_cost_variance_insight(_with_window_label(output, window=window))
+    return None
+
+
+async def _product_discovery_named_insight_payload(
+    *,
+    insight_key: str,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+    user_text: str = "",
+) -> dict[str, Any] | None:
+    if insight_key == "product_audit_activity":
+        window = _resolve_insight_time_window(user_text, default_days=30, default_label="last 30 days")
+        output = await tool_executor.call_tool(
+            name="audit.get_product_activity",
+            arguments={**_insight_window_tool_arguments(window, include_date=True), "limit": 50},
+            ctx=tool_ctx,
+        )
+        return _build_audit_entity_activity_insight(
+            _with_window_label(output, window=window),
+            summary="Product audit activity is ready.",
+            title="Product audit activity",
+            source_endpoint="get_product_activity",
+            preview_kind="Product",
+        )
+    if insight_key == "import_opportunities":
+        dashboard_output = await tool_executor.call_tool(
+            name="product.get_product_dashboard_stats",
+            arguments={},
+            ctx=tool_ctx,
+        )
+        variant_output = await tool_executor.call_tool(
+            name="product.search_product_variants",
+            arguments={"limit": 12, "active_only": True},
+            ctx=tool_ctx,
+        )
+        dashboard = dashboard_output.get("dashboard") if isinstance(dashboard_output, dict) else {}
+        categories = dashboard.get("category_distribution") if isinstance(dashboard, dict) else []
+        results: list[dict[str, Any]] = []
+        if not results:
+            results = [
+                {
+                    "name": str(item.get("product_name") or item.get("name") or "Catalog opportunity"),
+                    "brand": "",
+                    "category_name": "",
+                    "variant_count": 1,
+                    "already_imported": False,
+                }
+                for item in (variant_output.get("results") or [])
+                if isinstance(item, dict)
+            ]
+        if not results and isinstance(categories, list):
+            results = [
+                {
+                    "name": str(item.get("category_name") or "Category opportunity"),
+                    "brand": "",
+                    "category_name": str(item.get("category_name") or ""),
+                    "variant_count": int(item.get("count") or 0),
+                    "already_imported": False,
+                }
+                for item in categories
+                if isinstance(item, dict)
+            ]
+        return _build_product_import_opportunities_insight({"count": len(results), "results": results})
+    if insight_key == "variant_lookup":
+        output = await tool_executor.call_tool(
+            name="product.search_product_variants",
+            arguments={"limit": 8, "active_only": True},
+            ctx=tool_ctx,
+        )
+        return _build_variant_lookup_insight(output if isinstance(output, dict) else {})
+    if insight_key == "catalog_gaps":
+        dashboard_output = await tool_executor.call_tool(
+            name="product.get_product_dashboard_stats",
+            arguments={},
+            ctx=tool_ctx,
+        )
+        variant_output = await tool_executor.call_tool(
+            name="product.search_product_variants",
+            arguments={"limit": 12, "active_only": True},
+            ctx=tool_ctx,
+        )
+        alerts_output = await tool_executor.call_tool(
+            name="product.get_product_stock_alerts",
+            arguments={},
+            ctx=tool_ctx,
+        )
+        return _build_catalog_gap_insight(
+            dashboard_output if isinstance(dashboard_output, dict) else {},
+            variant_output if isinstance(variant_output, dict) else {},
+            alerts_output if isinstance(alerts_output, dict) else {},
+        )
+    if insight_key == "duplicate_codes":
+        output = await tool_executor.call_tool(
+            name="product.search_product_variants",
+            arguments={"limit": 25, "active_only": False},
+            ctx=tool_ctx,
+        )
+        return _build_duplicate_code_insight(output if isinstance(output, dict) else {})
+    if insight_key == "media_category":
+        dashboard_output = await tool_executor.call_tool(
+            name="product.get_product_dashboard_stats",
+            arguments={},
+            ctx=tool_ctx,
+        )
+        variant_output = await tool_executor.call_tool(
+            name="product.search_product_variants",
+            arguments={"limit": 10, "active_only": True},
+            ctx=tool_ctx,
+        )
+        return _build_product_media_category_insight(
+            dashboard_output if isinstance(dashboard_output, dict) else {},
+            variant_output if isinstance(variant_output, dict) else {},
+        )
+    return None
+
+
+async def _host_named_insight_payload(
+    *,
+    insight_key: str,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+    user_text: str = "",
+) -> dict[str, Any] | None:
+    sales_window = _resolve_insight_time_window(user_text, default_days=1, default_label="today")
+    analyst_window = _resolve_insight_time_window(user_text, default_days=365, default_label="last 1 year")
+    procurement_window = _resolve_insight_time_window(user_text, default_days=30, default_label="last 30 days")
+
+    async def _safe_subscription_usage_payload() -> dict[str, Any]:
+        try:
+            output = await tool_executor.call_tool(
+                name="subscriptions.get_usage_and_limits",
+                arguments={},
+                ctx=tool_ctx,
+            )
+        except Exception as exc:
+            lowered_error = str(exc).strip().lower()
+            if "owner" in lowered_error or "permission" in lowered_error or "forbidden" in lowered_error:
+                return {}
+            raise
+        return output if isinstance(output, dict) else {}
+
+    if insight_key.startswith("pos::"):
+        return await _pos_admin_named_insight_payload(
+            insight_key=insight_key.split("::", 1)[1],
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            user_text=user_text,
+        )
+    if insight_key.startswith("inventory_visibility::"):
+        return await _inventory_visibility_named_insight_payload(
+            insight_key=insight_key.split("::", 1)[1],
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            user_text=user_text,
+        )
+    if insight_key.startswith("inventory_procurement::"):
+        return await _inventory_procurement_named_insight_payload(
+            insight_key=insight_key.split("::", 1)[1],
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            user_text=user_text,
+        )
+    if insight_key.startswith("users::"):
+        user_insight_key = insight_key.split("::", 1)[1]
+        try:
+            return await _users_named_insight_payload(
+                insight_key=user_insight_key,
+                tool_executor=tool_executor,
+                tool_ctx=tool_ctx,
+                user_text=user_text,
+            )
+        except Exception as exc:
+            lowered_error = str(exc).strip().lower()
+            if "owner" in lowered_error or "permission" in lowered_error or "forbidden" in lowered_error:
+                if user_insight_key == "subscription_usage_limits":
+                    return _build_access_denied_insight(
+                        summary="Subscription usage is restricted.",
+                        detail=str(exc).strip() or "Only the workspace owner can view subscription usage and limits.",
+                        permission="manage_workspace_subscription",
+                        source="subscriptions",
+                    )
+                return _build_access_denied_insight(
+                    summary="Audit insight access is restricted.",
+                    detail=str(exc).strip() or "You need audit visibility to view this insight.",
+                    permission="view_audit_logs",
+                    source="audit",
+                )
+            raise
+    if insight_key.startswith("product_discovery::"):
+        return await _product_discovery_named_insight_payload(
+            insight_key=insight_key.split("::", 1)[1],
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            user_text=user_text,
+        )
+    if insight_key == "business_analyst_review":
+        async def call_optional_tool(name: str, arguments: dict[str, Any], *, timeout_s: float = 12.0) -> dict[str, Any]:
+            try:
+                direct_lookup = getattr(tool_executor, "_direct_executor_for_tool_name", None)
+                direct_executor = direct_lookup(name) if callable(direct_lookup) else None
+                executor = direct_executor or tool_executor
+                output = await asyncio.wait_for(
+                    executor.call_tool(name=name, arguments=arguments, ctx=tool_ctx),
+                    timeout=timeout_s,
+                )
+            except Exception as exc:
+                logger.warning("business_analyst_review optional tool failed name=%s error=%s", name, exc)
+                return {}
+            return output if isinstance(output, dict) else {}
+
+        sales_by_day_output, sales_by_location_output, top_sellers_output = await asyncio.gather(
+            call_optional_tool(
+                "pos.get_sales_summary",
+                {**_insight_window_tool_arguments(analyst_window, include_date=True), "group_by": "day"},
+                timeout_s=14.0,
+            ),
+            call_optional_tool(
+                "pos.get_sales_summary",
+                {**_insight_window_tool_arguments(analyst_window, include_date=True), "group_by": "location"},
+                timeout_s=14.0,
+            ),
+            call_optional_tool(
+                "pos.get_top_sellers",
+                {**_insight_window_tool_arguments(analyst_window, include_date=True), "limit": 8},
+                timeout_s=14.0,
+            ),
+        )
+        top_sellers_output = await _enrich_top_seller_results_with_variant_context(
+            results_payload=top_sellers_output if isinstance(top_sellers_output, dict) else {},
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            limit=8,
+        )
+        stock_output, orders_output, subscription_output = await asyncio.gather(
+            call_optional_tool("inventory.get_stock_risk", {"limit": 12, "expiring_days": 30}, timeout_s=8.0),
+            call_optional_tool(
+                "inventory.search_purchase_orders",
+                {
+                    "limit": 50,
+                    "date_from": analyst_window["start_date"],
+                    "date_to": analyst_window["end_date"],
+                },
+                timeout_s=8.0,
+            ),
+            asyncio.wait_for(_safe_subscription_usage_payload(), timeout=8.0),
+            return_exceptions=True,
+        )
+        stock_output = stock_output if isinstance(stock_output, dict) else {}
+        orders_output = orders_output if isinstance(orders_output, dict) else {}
+        subscription_output = subscription_output if isinstance(subscription_output, dict) else {}
+        order_rows = _purchase_order_results(orders_output)
+        return _build_host_business_analyst_insight(
+            _with_window_label(sales_by_day_output, window=analyst_window),
+            _with_window_label(sales_by_location_output, window=analyst_window),
+            _with_window_label(top_sellers_output if isinstance(top_sellers_output, dict) else {}, window=analyst_window),
+            stock_output,
+            {"status_counts": _purchase_order_status_counts(order_rows)},
+            subscription_output,
+        )
+    if insight_key == "cross_domain_ops":
+        sales_output = await tool_executor.call_tool(
+            name="pos.get_sales_summary",
+            arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "location"},
+            ctx=tool_ctx,
+        )
+        stock_output = await tool_executor.call_tool(
+            name="inventory.get_stock_risk",
+            arguments={"limit": 12, "expiring_days": 30},
+            ctx=tool_ctx,
+        )
+        orders_output = await tool_executor.call_tool(
+            name="inventory.search_purchase_orders",
+            arguments={
+                "limit": 20,
+                "date_from": procurement_window["start_date"],
+                "date_to": procurement_window["end_date"],
+            },
+            ctx=tool_ctx,
+        )
+        order_rows = _purchase_order_results(orders_output if isinstance(orders_output, dict) else {})
+        subscription_output = await _safe_subscription_usage_payload()
+        return _build_host_cross_domain_insight(
+            _with_window_label(sales_output, window=sales_window),
+            stock_output if isinstance(stock_output, dict) else {},
+            {"status_counts": _purchase_order_status_counts(order_rows)},
+            subscription_output,
+        )
+    if insight_key == "location_comparison":
+        sales_output = await tool_executor.call_tool(
+            name="pos.get_sales_summary",
+            arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "location"},
+            ctx=tool_ctx,
+        )
+        location_output = await tool_executor.call_tool(
+            name="inventory.search_stock_locations",
+            arguments={"limit": 25},
+            ctx=tool_ctx,
+        )
+        return _build_host_location_comparison_insight(
+            _with_window_label(sales_output, window=sales_window),
+            location_output if isinstance(location_output, dict) else {},
+        )
+    if insight_key == "recommendations":
+        stock_output = await tool_executor.call_tool(
+            name="inventory.get_stock_risk",
+            arguments={"limit": 12, "expiring_days": 30},
+            ctx=tool_ctx,
+        )
+        orders_output = await tool_executor.call_tool(
+            name="inventory.search_purchase_orders",
+            arguments={
+                "limit": 20,
+                "date_from": procurement_window["start_date"],
+                "date_to": procurement_window["end_date"],
+            },
+            ctx=tool_ctx,
+        )
+        subscription_output = await _safe_subscription_usage_payload()
+        order_rows = _purchase_order_results(orders_output if isinstance(orders_output, dict) else {})
+        return _build_host_recommendations_insight(
+            stock_output if isinstance(stock_output, dict) else {},
+            {"status_counts": _purchase_order_status_counts(order_rows)},
+            subscription_output,
+        )
     return None
 
 
@@ -5302,6 +11524,10 @@ def _infer_domain_agent_name(query: str) -> str | None:
     if not text:
         return None
 
+    strong_override = _strong_domain_agent_override(text)
+    if strong_override:
+        return strong_override
+
     scored: list[tuple[str, int]] = []
     for agent_name, keywords in HOST_DOMAIN_KEYWORDS.items():
         score = sum(1 for keyword in keywords if keyword in text)
@@ -5689,6 +11915,14 @@ def _select_router_specialist_agent(
                 "discount",
                 "daily summary",
                 "sales summary",
+                "revenue",
+                "gross sales",
+                "sales made",
+                "how many sales",
+                "order count",
+                "sales by location",
+                "top sellers",
+                "best sellers",
                 "pos session details",
                 "list pos sessions",
             )
@@ -6184,7 +12418,62 @@ def _relation_option_from_item(lookup_tool: str, item: dict[str, Any]) -> dict[s
     option: dict[str, Any] = {"value": identifier, "label": label}
     if description_parts:
         option["description"] = " | ".join(description_parts[:2])
+    if lookup_tool in {"inventory.list_stock_locations", "inventory.search_stock_locations"}:
+        metadata: dict[str, Any] = {}
+        structural_location_id = _first_string(item, ["structural_location_id"])
+        structural_location_name = _first_string(item, ["structural_location_name"])
+        if structural_location_id:
+            metadata["structural_location_id"] = structural_location_id
+        if structural_location_name:
+            metadata["structural_location_name"] = structural_location_name
+        if metadata:
+            option["metadata"] = metadata
     return option
+
+
+def _dynamic_form_option_metadata(
+    interaction_payload: dict[str, Any] | None,
+    *,
+    field_name: str,
+    selected_value: str | None,
+) -> dict[str, Any]:
+    target_value = str(selected_value or "").strip()
+    if not target_value or not isinstance(interaction_payload, dict):
+        return {}
+    fields = interaction_payload.get("fields")
+    if not isinstance(fields, list):
+        return {}
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        if str(field.get("name") or "").strip() != field_name:
+            continue
+        options = field.get("options")
+        if not isinstance(options, list):
+            return {}
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            if str(option.get("value") or "").strip() != target_value:
+                continue
+            metadata = option.get("metadata")
+            return metadata if isinstance(metadata, dict) else {}
+        return {}
+    return {}
+
+
+def _selected_structural_location_id_from_form(
+    interaction_payload: dict[str, Any] | None,
+    *,
+    field_name: str,
+    selected_value: str | None,
+) -> str | None:
+    metadata = _dynamic_form_option_metadata(
+        interaction_payload,
+        field_name=field_name,
+        selected_value=selected_value,
+    )
+    return str(metadata.get("structural_location_id") or "").strip() or None
 
 
 async def _load_relation_options(
@@ -6261,7 +12550,6 @@ async def _recover_relation_error_as_interaction(
     if spec is None or not isinstance(spec.input_schema, dict):
         return None
 
-    relation_cache: dict[str, list[dict[str, Any]]] = {}
     fields: list[dict[str, Any]] = []
     seen_field_names: set[str] = set()
     current_values: dict[str, Any] = {}
@@ -7117,7 +13405,7 @@ def make_langgraph_chat_processor_from_env(
             nonlocal host_agent_listing
             if host_agent_listing is not None:
                 return host_agent_listing
-            if agent_name != "host" or tool_executor is None or "list_available_agents" not in tool_names:
+            if _canonical_host_domain_agent(agent_name) != "host" or tool_executor is None or "list_available_agents" not in tool_names:
                 host_agent_listing = {"agents": [], "registered_agents": [], "hidden_agents": []}
                 return host_agent_listing
             try:
@@ -7135,6 +13423,294 @@ def make_langgraph_chat_processor_from_env(
         interaction_response = _interaction_response_from_text(user_text_for_memory)
         saved_workflow_state = await _load_workflow_state(context_id=task.context_id, metadata=metadata)
 
+        if _canonical_host_domain_agent(agent_name) == "host" and interaction_response is None and user_text_for_memory:
+            logger.info(
+                "host conversation history probe count=%s has_insight=%s",
+                len(history) if isinstance(history, list) else 0,
+                bool(_latest_history_insight_payload(history)),
+            )
+            repeated_response_parts = _latest_repeated_question_response_parts(user_text_for_memory, history)
+            if repeated_response_parts:
+                response_parts = repeated_response_parts
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.completed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    user_text=user_text_for_memory,
+                    assistant_text=_parts_to_text(response_parts),
+                    history=history if isinstance(history, list) else None,
+                )
+                return
+            follow_up_answer = _latest_insight_follow_up_answer(user_text_for_memory, history)
+            if follow_up_answer:
+                response_parts = [TextPart(text=follow_up_answer)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.completed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=follow_up_answer,
+                )
+                return
+
+        if agent_name == "pos_admin" and interaction_response is None and user_text_for_memory and tool_executor is not None:
+            named_insight = _pos_admin_named_insight_from_text(user_text_for_memory)
+            if named_insight:
+                insight_output = await _pos_admin_named_insight_payload(
+                    insight_key=named_insight,
+                    tool_executor=tool_executor,
+                    tool_ctx=tool_ctx,
+                    user_text=user_text_for_memory,
+                )
+                if isinstance(insight_output, dict):
+                    response_text = str(insight_output.get("summary") or "").strip() or "POS insight ready."
+                    response_parts = [DataPart(data=insight_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+        if agent_name == "inventory_visibility" and interaction_response is None and user_text_for_memory and tool_executor is not None:
+            named_insight = _inventory_visibility_named_insight_from_text(user_text_for_memory)
+            if named_insight:
+                try:
+                    insight_output = await _inventory_visibility_named_insight_payload(
+                        insight_key=named_insight,
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                        user_text=user_text_for_memory,
+                    )
+                except Exception:
+                    logger.exception(
+                        "host deterministic insight failed agent=%s insight_key=%s user_text=%s",
+                        agent_name,
+                        named_insight,
+                        user_text_for_memory,
+                    )
+                    insight_output = None
+                if isinstance(insight_output, dict):
+                    response_text = str(insight_output.get("summary") or "").strip() or "Inventory insight ready."
+                    response_parts = [DataPart(data=insight_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+        if agent_name == "users" and interaction_response is None and user_text_for_memory and tool_executor is not None:
+            named_insight = _users_named_insight_from_text(user_text_for_memory)
+            if named_insight:
+                try:
+                    insight_output = await _users_named_insight_payload(
+                        insight_key=named_insight,
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                        user_text=user_text_for_memory,
+                    )
+                except Exception as exc:
+                    error_text = str(exc).strip()
+                    lowered_error = error_text.lower()
+                    if "owner" in lowered_error or "permission" in lowered_error or "forbidden" in lowered_error:
+                        if named_insight == "subscription_usage_limits":
+                            insight_output = _build_access_denied_insight(
+                                summary="Subscription usage is restricted.",
+                                detail=error_text or "Only the workspace owner can view subscription usage and limits.",
+                                permission="manage_workspace_subscription",
+                                source="subscriptions",
+                            )
+                        else:
+                            insight_output = _build_access_denied_insight(
+                                summary="Audit insight access is restricted.",
+                                detail=error_text or "You need audit visibility to view this insight.",
+                                permission="view_audit_logs",
+                                source="audit",
+                            )
+                    else:
+                        raise
+                if isinstance(insight_output, dict):
+                    response_text = str(insight_output.get("summary") or "").strip() or "User insight ready."
+                    response_parts = [DataPart(data=insight_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+        if agent_name == "product_discovery" and interaction_response is None and user_text_for_memory and tool_executor is not None:
+            named_insight = _product_discovery_named_insight_from_text(user_text_for_memory)
+            if named_insight:
+                try:
+                    insight_output = await _product_discovery_named_insight_payload(
+                        insight_key=named_insight,
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                        user_text=user_text_for_memory,
+                    )
+                except Exception:
+                    insight_output = None
+                if isinstance(insight_output, dict):
+                    response_text = str(insight_output.get("summary") or "").strip() or "Product insight ready."
+                    response_parts = [DataPart(data=insight_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+        if agent_name == "inventory_procurement" and interaction_response is None and user_text_for_memory and tool_executor is not None:
+            named_insight = _inventory_procurement_named_insight_from_text(user_text_for_memory)
+            if named_insight:
+                try:
+                    insight_output = await _inventory_procurement_named_insight_payload(
+                        insight_key=named_insight,
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                        user_text=user_text_for_memory,
+                    )
+                except Exception:
+                    insight_output = None
+                if isinstance(insight_output, dict):
+                    response_text = str(insight_output.get("summary") or "").strip() or "Procurement insight ready."
+                    response_parts = [DataPart(data=insight_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
+        if _canonical_host_domain_agent(agent_name) == "host" and interaction_response is None and user_text_for_memory and tool_executor is not None:
+            named_insight = _host_named_insight_from_text(user_text_for_memory)
+            logger.info(
+                "host deterministic insight probe agent=%s user_text=%r named_insight=%r",
+                agent_name,
+                user_text_for_memory,
+                named_insight,
+            )
+            if named_insight:
+                try:
+                    insight_output = await _host_named_insight_payload(
+                        insight_key=named_insight,
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                        user_text=user_text_for_memory,
+                    )
+                except Exception:
+                    insight_output = None
+                if isinstance(insight_output, dict):
+                    response_text = str(insight_output.get("summary") or "").strip() or "Workspace insight ready."
+                    response_parts = [DataPart(data=insight_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
+
         async def _update_host_orchestration_state_after_delegation(
             *,
             delegated_response: dict[str, Any],
@@ -7143,7 +13719,7 @@ def make_langgraph_chat_processor_from_env(
             prior_completed_agents: list[str] | None = None,
         ) -> dict[str, Any] | None:
             nonlocal saved_workflow_state
-            if agent_name != "host":
+            if _canonical_host_domain_agent(agent_name) != "host":
                 return None
             prior_state = saved_workflow_state if isinstance(saved_workflow_state, dict) else None
             prior_plan = prior_state.get("plan") if isinstance(prior_state, dict) and isinstance(prior_state.get("plan"), list) else []
@@ -7274,7 +13850,7 @@ def make_langgraph_chat_processor_from_env(
             return None
 
         if (
-            agent_name == "host"
+            _canonical_host_domain_agent(agent_name) == "host"
             and tool_executor is not None
             and "list_available_agents" in tool_names
             and user_text_for_memory
@@ -7346,7 +13922,7 @@ def make_langgraph_chat_processor_from_env(
             return
 
         if (
-            agent_name == "host"
+            _canonical_host_domain_agent(agent_name) == "host"
             and tool_executor is not None
             and "delegate_to_agent" in tool_names
             and interaction_response is not None
@@ -7577,7 +14153,7 @@ def make_langgraph_chat_processor_from_env(
             return
 
         if (
-            agent_name == "host"
+            _canonical_host_domain_agent(agent_name) == "host"
             and tool_executor is not None
             and "delegate_to_agent" in tool_names
             and interaction_response is not None
@@ -7856,7 +14432,7 @@ def make_langgraph_chat_processor_from_env(
             return
 
         if (
-            agent_name == "host"
+            _canonical_host_domain_agent(agent_name) == "host"
             and tool_executor is not None
             and "delegate_to_agent" in tool_names
             and interaction_response is not None
@@ -8005,7 +14581,7 @@ def make_langgraph_chat_processor_from_env(
             return
 
         if (
-            agent_name == "host"
+            _canonical_host_domain_agent(agent_name) == "host"
             and tool_executor is not None
             and "delegate_to_agent" in tool_names
             and user_text_for_memory
@@ -8143,7 +14719,7 @@ def make_langgraph_chat_processor_from_env(
 
         delegated_interaction = _delegated_interaction_context(last_interaction_payload)
         if (
-            agent_name == "host"
+            _canonical_host_domain_agent(agent_name) == "host"
             and tool_executor is not None
             and "delegate_to_agent" in tool_names
             and interaction_response is not None
@@ -8285,7 +14861,7 @@ def make_langgraph_chat_processor_from_env(
             return
 
         if (
-            agent_name == "host"
+            _canonical_host_domain_agent(agent_name) == "host"
             and tool_executor is not None
             and "delegate_to_agent" in tool_names
             and interaction_response is None
@@ -8469,7 +15045,7 @@ def make_langgraph_chat_processor_from_env(
                 return
 
         if (
-            agent_name == "host"
+            _canonical_host_domain_agent(agent_name) == "host"
             and tool_executor is not None
             and "create_multiple_choice" in tool_names
             and user_text_for_memory
@@ -8929,11 +15505,6 @@ def make_langgraph_chat_processor_from_env(
                         else {}
                     )
                 )
-                failed_operations = (
-                    last_interaction_payload.get("failed_operations")
-                    if isinstance(last_interaction_payload.get("failed_operations"), list)
-                    else []
-                )
                 company_context = (
                     last_interaction_payload.get("company_context")
                     if isinstance(last_interaction_payload.get("company_context"), dict)
@@ -8973,12 +15544,6 @@ def make_langgraph_chat_processor_from_env(
                     ),
                 )
 
-                planned_operations = _onboarding_plan_operations(
-                    scope=selected_scope,
-                    onboarding_data=onboarding_data,
-                    tool_specs=tool_specs,
-                    company_context=company_context,
-                )
                 created_map = {
                     key: value for key, value in created_operations.items() if isinstance(value, dict)
                 }
@@ -9431,6 +15996,7 @@ def make_langgraph_chat_processor_from_env(
                         action=action,
                         form_data=form_data,
                         tool_specs=tool_specs,
+                        interaction_payload=last_interaction_payload if isinstance(last_interaction_payload, dict) else None,
                     )
                 elif agent_name == "inventory_procurement":
                     tool_name, arguments, missing_required = _inventory_procurement_execute_action(
@@ -9653,12 +16219,80 @@ def make_langgraph_chat_processor_from_env(
                     action = _inventory_fulfillment_action_from_text(user_text_for_memory)
                 elif agent_name == "inventory_procurement":
                     action = _inventory_procurement_action_from_text(user_text_for_memory)
+                elif agent_name == "inventory_visibility":
+                    named_insight = _inventory_visibility_named_insight_from_text(user_text_for_memory)
+                    if named_insight and tool_executor is not None:
+                        try:
+                            insight_output = await _inventory_visibility_named_insight_payload(
+                                insight_key=named_insight,
+                                tool_executor=tool_executor,
+                                tool_ctx=tool_ctx,
+                                user_text=user_text_for_memory,
+                            )
+                        except Exception:
+                            insight_output = None
+                        if isinstance(insight_output, dict):
+                            response_text = str(insight_output.get("summary") or "").strip() or "Inventory insight ready."
+                            response_parts = [DataPart(data=insight_output)]
+                            yield Artifact(name="result", parts=response_parts)
+                            yield TaskStatus(
+                                state=TaskState.completed,
+                                message=Message(
+                                    role=Role.agent,
+                                    parts=response_parts,
+                                    context_id=task.context_id,
+                                ),
+                            )
+                            await _maybe_update_memory(
+                                llm=llm,
+                                context_id=task.context_id,
+                                metadata=metadata,
+                                existing=mem,
+                                history=history if isinstance(history, list) else None,
+                                user_text=user_text_for_memory,
+                                assistant_text=response_text,
+                            )
+                            return
+                    action = None
                 elif agent_name == "product_merchandising":
                     action = _product_merchandising_action_from_text(user_text_for_memory)
                 elif agent_name == "product_pricing":
                     direct_lookup = _product_pricing_lookup_from_text(user_text_for_memory)
                     action = _product_pricing_action_from_text(user_text_for_memory)
                 elif agent_name == "pos_admin":
+                    named_insight = _pos_admin_named_insight_from_text(user_text_for_memory)
+                    if named_insight and tool_executor is not None:
+                        try:
+                            insight_output = await _pos_admin_named_insight_payload(
+                                insight_key=named_insight,
+                                tool_executor=tool_executor,
+                                tool_ctx=tool_ctx,
+                                user_text=user_text_for_memory,
+                            )
+                        except Exception:
+                            insight_output = None
+                        if isinstance(insight_output, dict):
+                            response_text = str(insight_output.get("summary") or "").strip() or "POS insight ready."
+                            response_parts = [DataPart(data=insight_output)]
+                            yield Artifact(name="result", parts=response_parts)
+                            yield TaskStatus(
+                                state=TaskState.completed,
+                                message=Message(
+                                    role=Role.agent,
+                                    parts=response_parts,
+                                    context_id=task.context_id,
+                                ),
+                            )
+                            await _maybe_update_memory(
+                                llm=llm,
+                                context_id=task.context_id,
+                                metadata=metadata,
+                                existing=mem,
+                                history=history if isinstance(history, list) else None,
+                                user_text=user_text_for_memory,
+                                assistant_text=response_text,
+                            )
+                            return
                     action = _pos_admin_action_from_text(user_text_for_memory)
                 else:
                     action = _product_pricing_action_from_text(user_text_for_memory)
@@ -10018,7 +16652,7 @@ def make_langgraph_chat_processor_from_env(
                 return
 
         if (
-            agent_name == "host"
+            _canonical_host_domain_agent(agent_name) == "host"
             and tool_executor is not None
             and "delegate_to_agent" in tool_names
             and user_text_for_memory
@@ -10111,6 +16745,40 @@ def make_langgraph_chat_processor_from_env(
                     assistant_text=response_text,
                 )
                 return
+
+            named_insight = _host_named_insight_from_text(user_text_for_memory)
+            if named_insight:
+                try:
+                    insight_output = await _host_named_insight_payload(
+                        insight_key=named_insight,
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                        user_text=user_text_for_memory,
+                    )
+                except Exception:
+                    insight_output = None
+                if isinstance(insight_output, dict):
+                    response_text = str(insight_output.get("summary") or "").strip() or "Workspace insight ready."
+                    response_parts = [DataPart(data=insight_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                    )
+                    return
 
             selected_agent = _select_host_delegation_agent(user_text_for_memory, agent_summaries)
             if selected_agent or len(agent_summaries) == 1 or not agent_summaries:
