@@ -20,6 +20,18 @@ def _strip_trailing_slash(value: str) -> str:
     return value.rstrip("/")
 
 
+def _default_base_url(env_map: dict[str, str]) -> str | None:
+    explicit = _strip_trailing_slash((env_map.get("KA2A_CONTROL_PLANE_BASE_URL") or "").strip())
+    if explicit:
+        return explicit
+    runtime_shared_token = (env_map.get("KA2A_RUNTIME_SHARED_TOKEN") or "").strip()
+    if not runtime_shared_token:
+        return None
+    host = (env_map.get("KA2A_CONTROL_PLANE_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    port = (env_map.get("KA2A_GATEWAY_PORT") or "7006").strip() or "7006"
+    return f"http://{host}:{port}"
+
+
 @dataclass(slots=True)
 class ControlPlaneClientConfig:
     base_url: str | None = None
@@ -30,7 +42,7 @@ class ControlPlaneClientConfig:
     def from_env(cls, env: dict[str, str] | None = None) -> "ControlPlaneClientConfig":
         env_map = env or os.environ
         return cls(
-            base_url=_strip_trailing_slash((env_map.get("KA2A_CONTROL_PLANE_BASE_URL") or "").strip()) or None,
+            base_url=_default_base_url(env_map),
             runtime_shared_token=(env_map.get("KA2A_RUNTIME_SHARED_TOKEN") or "").strip() or None,
             timeout_s=float(env_map.get("KA2A_CONTROL_PLANE_TIMEOUT_S") or "10"),
         )

@@ -21,6 +21,7 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 # Run as non-root.
 RUN useradd -m -u 10001 ka2a
+RUN mkdir -p /app/.data /tmp/ka2a-data && chown -R ka2a:ka2a /app/.data /tmp/ka2a-data
 USER ka2a
 
 EXPOSE 8000 8001

@@ -21,6 +21,10 @@ def _default_data_dir(repo_root: Path) -> Path:
     return repo_root / ".data"
 
 
+def _fallback_data_dir() -> Path:
+    return Path("/tmp/ka2a-data")
+
+
 @dataclass(slots=True)
 class A2AAppSettings:
     repo_root: Path
@@ -44,5 +48,12 @@ class A2AAppSettings:
         )
 
     def ensure_dirs(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.control_plane_store_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self.control_plane_store_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            fallback_dir = _fallback_data_dir()
+            self.data_dir = fallback_dir
+            self.control_plane_store_path = fallback_dir / self.control_plane_store_path.name
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self.control_plane_store_path.parent.mkdir(parents=True, exist_ok=True)
