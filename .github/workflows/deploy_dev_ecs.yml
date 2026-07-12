@@ -25,6 +25,10 @@ jobs:
       ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
       ECS_DEPLOY_TARGETS: ${{ secrets.ECS_DEPLOY_TARGETS }}
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      ECS_EXECUTION_ROLE_ARN: ${{ secrets.ECS_EXECUTION_ROLE_ARN }}
+      ECS_TASK_ROLE_ARN: ${{ secrets.ECS_TASK_ROLE_ARN }}
+      ECS_PARAMETER_PATHS: ${{ secrets.ECS_PARAMETER_PATHS }}
+      ECS_MIGRATION_COMMAND: ${{ secrets.ECS_MIGRATION_COMMAND }}
       ECS_TASK_SUBNET_IDS: ${{ secrets.ECS_TASK_SUBNET_IDS }}
       ECS_TASK_SECURITY_GROUP_IDS: ${{ secrets.ECS_TASK_SECURITY_GROUP_IDS }}
       ECS_TASK_ASSIGN_PUBLIC_IP: ${{ secrets.ECS_TASK_ASSIGN_PUBLIC_IP }}
@@ -142,6 +146,14 @@ jobs:
           cluster = os.environ['ECS_CLUSTER']
           image_uri = os.environ['IMAGE_URI']
           deploy_targets = json.loads(os.environ['ECS_DEPLOY_TARGETS'])
+          parameter_paths = json.loads(os.environ.get('ECS_PARAMETER_PATHS') or '{}')
+          common_secrets = [
+              {'name': key, 'valueFrom': parameter_paths[key]}
+              for key in sorted(parameter_paths)
+              if str(key).strip() and str(parameter_paths[key]).strip()
+          ]
+          execution_role_arn = os.environ.get('ECS_EXECUTION_ROLE_ARN', '').strip()
+          task_role_arn = os.environ.get('ECS_TASK_ROLE_ARN', '').strip()
           manifest = json.loads(Path('.aws/ecs/task-definitions.json').read_text())
           manifest_targets = manifest.get('targets') or {}
           render_dir = Path('.aws/ecs/rendered')
@@ -176,8 +188,31 @@ jobs:
               if target not in manifest_targets:
                   raise SystemExit(f'Manifest missing target {target}')
               spec = copy.deepcopy(manifest_targets[target])
+              spec['family'] = target_info.get('task_family') or spec.get('family')
+              if execution_role_arn:
+                  spec['executionRoleArn'] = execution_role_arn
+              if task_role_arn:
+                  spec['taskRoleArn'] = task_role_arn
               for container in spec.get('containerDefinitions', []):
                   container['image'] = image_uri
+                  merged_secrets = {
+                      secret['name']: secret['valueFrom']
+                      for secret in common_secrets
+                  }
+                  container['secrets'] = [
+                      {'name': key, 'valueFrom': merged_secrets[key]}
+                      for key in sorted(merged_secrets)
+                  ]
+                  container['environment'] = container.get('environment', [])
+                  if 'logConfiguration' not in container and target_info.get('log_group'):
+                      container['logConfiguration'] = {
+                          'logDriver': 'awslogs',
+                          'options': {
+                              'awslogs-group': target_info['log_group'],
+                              'awslogs-region': region,
+                              'awslogs-stream-prefix': container['name'],
+                          },
+                      }
               task_file = render_dir / f'{target}.json'
               task_file.write_text(json.dumps(spec, indent=2) + '\n')
               response = aws_json('ecs', 'register-task-definition', '--cli-input-json', f'file://{task_file}')
@@ -185,7 +220,8 @@ jobs:
               print(f'Registered {target}: {registered_task_arns[target]}')
 
           migration = manifest.get('migration') or {}
-          migration_command = migration.get('command')
+          raw_migration_command = os.environ.get('ECS_MIGRATION_COMMAND', '').strip()
+          migration_command = json.loads(raw_migration_command) if raw_migration_command else migration.get('command')
           migration_target = migration.get('target')
           migration_container_name = migration.get('container_name')
 
