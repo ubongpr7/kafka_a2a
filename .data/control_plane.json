@@ -62,7 +62,7 @@
       "name": "Users",
       "description": "MCP server for users tools.",
       "transport": "mcp",
-      "server_url": "http://users_mcp:8000/mcp/",
+      "server_url": "https://users-mcp.dev.interaims.com/mcp/",
       "tool_name_prefix": "users.",
       "auth_mode": "forward_bearer",
       "auth_config": {
@@ -70,7 +70,7 @@
       },
       "metadata": {
         "id": "users",
-        "serverUrl": "http://users_mcp:8000/mcp/",
+        "serverUrl": "https://users-mcp.dev.interaims.com/mcp/",
         "toolNamePrefix": "users.",
         "auth": {
           "mode": "forward_bearer"
@@ -90,7 +90,7 @@
       "name": "Products",
       "description": "MCP server for products tools.",
       "transport": "mcp",
-      "server_url": "http://product_mcp:8000/mcp/",
+      "server_url": "https://product-mcp.dev.interaims.com/mcp/",
       "tool_name_prefix": "product.",
       "auth_mode": "forward_bearer",
       "auth_config": {
@@ -98,7 +98,7 @@
       },
       "metadata": {
         "id": "products",
-        "serverUrl": "http://product_mcp:8000/mcp/",
+        "serverUrl": "https://product-mcp.dev.interaims.com/mcp/",
         "toolNamePrefix": "product.",
         "auth": {
           "mode": "forward_bearer"
@@ -118,7 +118,7 @@
       "name": "Inventory",
       "description": "MCP server for inventory tools.",
       "transport": "mcp",
-      "server_url": "http://inventory_mcp:8000/mcp/",
+      "server_url": "https://inventory-mcp.dev.interaims.com/mcp/",
       "tool_name_prefix": "inventory.",
       "auth_mode": "forward_bearer",
       "auth_config": {
@@ -126,7 +126,7 @@
       },
       "metadata": {
         "id": "inventory",
-        "serverUrl": "http://inventory_mcp:8000/mcp/",
+        "serverUrl": "https://inventory-mcp.dev.interaims.com/mcp/",
         "toolNamePrefix": "inventory.",
         "auth": {
           "mode": "forward_bearer"
@@ -146,7 +146,7 @@
       "name": "Pos",
       "description": "MCP server for pos tools.",
       "transport": "mcp",
-      "server_url": "http://pos_mcp:8000/mcp/",
+      "server_url": "https://pos-mcp.dev.interaims.com/mcp/",
       "tool_name_prefix": "pos.",
       "auth_mode": "forward_bearer",
       "auth_config": {
@@ -154,7 +154,7 @@
       },
       "metadata": {
         "id": "pos",
-        "serverUrl": "http://pos_mcp:8000/mcp/",
+        "serverUrl": "https://pos-mcp.dev.interaims.com/mcp/",
         "toolNamePrefix": "pos.",
         "auth": {
           "mode": "forward_bearer"
@@ -174,7 +174,7 @@
       "name": "Audit",
       "description": "MCP server for audit tools.",
       "transport": "mcp",
-      "server_url": "http://audit_mcp:8000/mcp/",
+      "server_url": "https://audit-mcp.dev.interaims.com/mcp/",
       "tool_name_prefix": "audit.",
       "auth_mode": "forward_bearer",
       "auth_config": {
@@ -182,7 +182,7 @@
       },
       "metadata": {
         "id": "audit",
-        "serverUrl": "http://audit_mcp:8000/mcp/",
+        "serverUrl": "https://audit-mcp.dev.interaims.com/mcp/",
         "toolNamePrefix": "audit.",
         "auth": {
           "mode": "forward_bearer"
@@ -202,7 +202,7 @@
       "name": "Notifications",
       "description": "MCP server for notifications tools.",
       "transport": "mcp",
-      "server_url": "http://notifications_mcp:8000/mcp/",
+      "server_url": "https://notifications-mcp.dev.interaims.com/mcp/",
       "tool_name_prefix": "notifications.",
       "auth_mode": "forward_bearer",
       "auth_config": {
@@ -210,7 +210,7 @@
       },
       "metadata": {
         "id": "notifications",
-        "serverUrl": "http://notifications_mcp:8000/mcp/",
+        "serverUrl": "https://notifications-mcp.dev.interaims.com/mcp/",
         "toolNamePrefix": "notifications.",
         "auth": {
           "mode": "forward_bearer"
@@ -230,7 +230,7 @@
       "name": "Subscriptions",
       "description": "MCP server for subscriptions tools.",
       "transport": "mcp",
-      "server_url": "http://subscriptions_mcp:8000/mcp/",
+      "server_url": "https://subscriptions-mcp.dev.interaims.com/mcp/",
       "tool_name_prefix": "subscriptions.",
       "auth_mode": "forward_bearer",
       "auth_config": {
@@ -238,7 +238,7 @@
       },
       "metadata": {
         "id": "subscriptions",
-        "serverUrl": "http://subscriptions_mcp:8000/mcp/",
+        "serverUrl": "https://subscriptions-mcp.dev.interaims.com/mcp/",
         "toolNamePrefix": "subscriptions.",
         "auth": {
           "mode": "forward_bearer"
@@ -258,7 +258,7 @@
       "name": "Purchasing",
       "description": "MCP server for purchasing tools.",
       "transport": "mcp",
-      "server_url": "http://inventory_mcp:8000/mcp/",
+      "server_url": "https://inventory-mcp.dev.interaims.com/mcp/",
       "tool_name_prefix": "purchasing.",
       "auth_mode": "forward_bearer",
       "auth_config": {
@@ -266,7 +266,7 @@
       },
       "metadata": {
         "id": "purchasing",
-        "serverUrl": "http://inventory_mcp:8000/mcp/",
+        "serverUrl": "https://inventory-mcp.dev.interaims.com/mcp/",
         "toolNamePrefix": "purchasing.",
         "auth": {
           "mode": "forward_bearer"

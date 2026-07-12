@@ -706,6 +706,7 @@ def _select_history_insight_payload(user_text: str, history: Any) -> dict[str, A
         return None
     text = _normalize_user_text(user_text)
     wants_business = any(term in text for term in ("business", "analyst", "analysis", "analyze", "analyse", "entire system", "whole system", "owner review", "first analysis", "first review"))
+    wants_location = any(term in text for term in ("location", "branch", "store", "warehouse", "outlet", "site"))
     wants_comparison = any(term in text for term in ("comparison", "compare", "product comparison", "variant comparison")) or (
         any(term in text for term in ("product", "variant"))
         and any(term in text for term in ("revenue", "sales", "units", "quantity", "orders", "generated", "sold", "leader", "led", "best"))
@@ -715,6 +716,8 @@ def _select_history_insight_payload(user_text: str, history: Any) -> dict[str, A
 
     if wants_business:
         terms = ("business analyst review", "recommended owner actions", "revenue posture", "entire system")
+    elif wants_location:
+        terms = ("location contribution", "location revenue", "store revenue", "branch revenue", "location ranking")
     elif wants_comparison:
         terms = ("product comparison table", "product revenue ranking", "product units trend", "variant comparison")
     elif wants_procurement:
@@ -733,7 +736,7 @@ def _select_history_insight_payload(user_text: str, history: Any) -> dict[str, A
     if scored:
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return scored[0][2]
-    if wants_business or wants_comparison or wants_procurement or wants_staff:
+    if wants_business or wants_location or wants_comparison or wants_procurement or wants_staff:
         return None
     return payloads[-1]
 
@@ -995,12 +998,42 @@ def _latest_insight_follow_up_answer(user_text: str, history: Any) -> str | None
         if any(phrase in text for phrase in ("revenue", "sales total", "generated more", "made more", "led")):
             ranked = sorted(
                 comparison_rows,
-                key=lambda item: _insight_comparison_value(item, "sales_total", "total_sales", "revenue", "sales", "value"),
+                key=lambda item: _insight_comparison_value(
+                    item,
+                    "sales_total",
+                    "total_sales",
+                    "total_revenue",
+                    "gross_sales",
+                    "revenue",
+                    "sales",
+                    "amount",
+                    "value",
+                ),
                 reverse=True,
             )
             leader, runner = ranked[0], ranked[1]
-            leader_value = _insight_comparison_value(leader, "sales_total", "total_sales", "revenue", "sales", "value")
-            runner_value = _insight_comparison_value(runner, "sales_total", "total_sales", "revenue", "sales", "value")
+            leader_value = _insight_comparison_value(
+                leader,
+                "sales_total",
+                "total_sales",
+                "total_revenue",
+                "gross_sales",
+                "revenue",
+                "sales",
+                "amount",
+                "value",
+            )
+            runner_value = _insight_comparison_value(
+                runner,
+                "sales_total",
+                "total_sales",
+                "total_revenue",
+                "gross_sales",
+                "revenue",
+                "sales",
+                "amount",
+                "value",
+            )
             return (
                 f"From the comparison{timeframe_suffix}, {_insight_comparison_name(leader)} led revenue with "
                 f"{_format_plain_money(leader_value, payload)}. It was ahead of {_insight_comparison_name(runner)} by "
@@ -1009,12 +1042,12 @@ def _latest_insight_follow_up_answer(user_text: str, history: Any) -> str | None
         if any(phrase in text for phrase in ("unit", "quantity", "sold more", "volume")):
             ranked = sorted(
                 comparison_rows,
-                key=lambda item: _insight_comparison_value(item, "quantity_sold", "units_sold", "quantity", "units"),
+                key=lambda item: _insight_comparison_value(item, "quantity_sold", "units_sold", "items_sold", "quantity", "units"),
                 reverse=True,
             )
             leader, runner = ranked[0], ranked[1]
-            leader_value = _insight_comparison_value(leader, "quantity_sold", "units_sold", "quantity", "units")
-            runner_value = _insight_comparison_value(runner, "quantity_sold", "units_sold", "quantity", "units")
+            leader_value = _insight_comparison_value(leader, "quantity_sold", "units_sold", "items_sold", "quantity", "units")
+            runner_value = _insight_comparison_value(runner, "quantity_sold", "units_sold", "items_sold", "quantity", "units")
             return (
                 f"From the comparison{timeframe_suffix}, {_insight_comparison_name(leader)} sold more units: "
                 f"{_format_plain_number(leader_value)} units vs {_format_plain_number(runner_value)} for {_insight_comparison_name(runner)}."
@@ -1059,25 +1092,45 @@ def _latest_insight_follow_up_answer(user_text: str, history: Any) -> str | None
             if best:
                 return f"From the last analysis{timeframe_suffix}, the strongest day was {best.get('label')} at {_format_plain_money(best.get('sales') or best.get('value'), payload)}."
 
-    if any(phrase in text for phrase in ("which location", "top location", "best location", "leading location", "location led", "far behind", "lagging", "lowest revenue", "least revenue", "underperforming")):
+    if any(
+        phrase in text
+        for phrase in (
+            "which location",
+            "top location",
+            "best location",
+            "leading location",
+            "location led",
+            "far behind",
+            "lagging",
+            "lowest revenue",
+            "least revenue",
+            "underperforming",
+            "branch",
+            "store",
+            "warehouse",
+            "outlet",
+        )
+    ):
         table = _insight_widget_by_title(payload, "location")
         rows = table.get("rows") if isinstance(table, dict) else []
         if not rows and isinstance(table, dict):
             rows = table.get("data") if isinstance(table.get("data"), list) else []
         if isinstance(rows, list) and rows:
             valid_rows = [row for row in rows if isinstance(row, dict)]
-            best = max(valid_rows, key=lambda row: float(row.get("sales") or row.get("value") or 0), default=None)
-            worst = min(valid_rows, key=lambda row: float(row.get("sales") or row.get("value") or 0), default=None)
+            value_keys = ("sales", "value", "total_sales", "revenue", "amount", "total_revenue")
+            order_keys = ("orders", "count", "order_count", "orderCount", "transaction_count")
+            best = max(valid_rows, key=lambda row: _insight_comparison_value(row, *value_keys), default=None)
+            worst = min(valid_rows, key=lambda row: _insight_comparison_value(row, *value_keys), default=None)
             if best and worst:
                 best_label = best.get("location") or best.get("label")
-                best_sales = best.get("sales") or best.get("value") or best.get("total_sales")
-                best_orders = best.get("orders") or best.get("count") or best.get("order_count")
+                best_sales = best.get("sales") or best.get("value") or best.get("total_sales") or best.get("revenue") or best.get("amount") or best.get("total_revenue")
+                best_orders = best.get("orders") or best.get("count") or best.get("order_count") or best.get("orderCount") or best.get("transaction_count")
                 worst_label = worst.get("location") or worst.get("label")
-                worst_sales = worst.get("sales") or worst.get("value") or worst.get("total_sales")
-                total_sales = sum(float(row.get("sales") or row.get("value") or row.get("total_sales") or 0) for row in rows if isinstance(row, dict))
+                worst_sales = worst.get("sales") or worst.get("value") or worst.get("total_sales") or worst.get("revenue") or worst.get("amount") or worst.get("total_revenue")
+                total_sales = sum(_insight_comparison_value(row, *value_keys) for row in rows if isinstance(row, dict))
                 order_leader = max(
                     valid_rows,
-                    key=lambda row: float(row.get("orders") or row.get("count") or row.get("order_count") or 0),
+                    key=lambda row: _insight_comparison_value(row, *order_keys),
                     default=None,
                 )
                 share = ""
@@ -1101,12 +1154,47 @@ def _latest_insight_follow_up_answer(user_text: str, history: Any) -> str | None
     if any(phrase in text for phrase in ("top product", "top products", "which product", "what product", "products drove", "best seller")):
         ranked = _insight_widget_by_title(payload, "top", "product") or _insight_widget_by_title(payload, "top", "seller")
         items = ranked.get("items") if isinstance(ranked, dict) else []
+        if not (isinstance(items, list) and items):
+            items = _insight_comparison_rows(payload) or list(payload.get("products") or [])
         if isinstance(items, list) and items:
+            ranked_items = [
+                item for item in items if isinstance(item, dict)
+            ]
+            if ranked_items:
+                ranked_items.sort(
+                    key=lambda item: _insight_comparison_value(
+                        item,
+                        "sales_total",
+                        "total_sales",
+                        "total_revenue",
+                        "gross_sales",
+                        "revenue",
+                        "sales",
+                        "amount",
+                        "value",
+                    ),
+                    reverse=True,
+                )
             lines = []
-            for index, item in enumerate([row for row in items if isinstance(row, dict)][:5], start=1):
-                label = str(item.get("label") or item.get("title") or "Product").strip()
-                value = _format_plain_money(item.get("value") or item.get("count"), payload)
-                detail = str(item.get("detail") or "").strip()
+            for index, item in enumerate(ranked_items[:5], start=1):
+                label = str(
+                    item.get("label")
+                    or item.get("title")
+                    or item.get("product_name")
+                    or item.get("variant_name")
+                    or item.get("name")
+                    or "Product"
+                ).strip()
+                value = _format_plain_money(
+                    item.get("value")
+                    or item.get("count")
+                    or item.get("sales_total")
+                    or item.get("total_sales")
+                    or item.get("revenue")
+                    or item.get("amount"),
+                    payload,
+                )
+                detail = str(item.get("detail") or item.get("variant_name") or item.get("barcode") or item.get("barcode_snapshot") or "").strip()
                 lines.append(f"{index}. {label}: {value}{f' ({detail})' if detail else ''}")
             if lines:
                 return "From the last analysis, the top products were:\n" + "\n".join(lines)
@@ -1133,7 +1221,9 @@ def _latest_insight_follow_up_answer(user_text: str, history: Any) -> str | None
                 lines.append(f"{index}. {label}{f': {detail}' if detail else ''}")
             return "From the last analysis, these need attention:\n" + "\n".join(lines)
 
-    if any(phrase in text for phrase in ("total revenue", "how much", "total sales", "how many orders", "order count", "revenue")):
+    if any(phrase in text for phrase in ("total revenue", "how much", "total sales", "how many orders", "order count", "revenue")) and not any(
+        phrase in text for phrase in ("which product", "which products", "top product", "top products", "products drove", "best seller", "top seller")
+    ):
         revenue = _insight_metric_value(payload, "Revenue")
         orders = _insight_metric_value(payload, "Orders")
         if revenue is not None or orders is not None:
