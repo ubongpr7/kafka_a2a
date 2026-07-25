@@ -213,15 +213,18 @@ async def _get_workspace_ai_setup_cached(
                 logger.info("voice ai setup cache hit", extra={"profile_id": profile_id})
                 return cached[1]
 
-    setup_source = (os.getenv("KA2A_VOICE_AI_SETUP_SOURCE") or "control_plane").strip().lower()
+    setup_source = (os.getenv("KA2A_VOICE_AI_SETUP_SOURCE") or "database_first").strip().lower()
     setup: dict[str, Any] | None = None
-    if setup_source != "database":
+    if setup_source in {"database", "database_first"}:
+        setup = await asyncio.to_thread(_get_workspace_ai_setup_from_database, profile_id=profile_id)
+
+    if setup is None and setup_source not in {"database"}:
         try:
             setup = await asyncio.to_thread(control_plane.get_internal_workspace_ai_setup, profile_id=profile_id)
         except Exception:
             logger.debug("voice control-plane AI setup load failed", extra={"profile_id": profile_id}, exc_info=True)
 
-    if setup is None:
+    if setup is None and setup_source not in {"control_plane"}:
         setup = await asyncio.to_thread(_get_workspace_ai_setup_from_database, profile_id=profile_id)
 
     if setup is None:

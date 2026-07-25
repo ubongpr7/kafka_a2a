@@ -406,3 +406,26 @@ async def test_voice_ai_setup_prefers_control_plane_cache(monkeypatch: pytest.Mo
 
     assert setup["configured"] is True
     assert direct_db_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_voice_ai_setup_defaults_to_database_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KA2A_VOICE_AI_SETUP_SOURCE", raising=False)
+    monkeypatch.setenv("KA2A_VOICE_AI_SETUP_CACHE_TTL_S", "0")
+    control_plane_calls = 0
+
+    def direct_db_lookup(*, profile_id: str) -> dict[str, object] | None:
+        return {"configured": True, "agent": {"profile": profile_id, "api_key": "key"}, "available_versions": []}
+
+    class ControlPlane:
+        def get_internal_workspace_ai_setup(self, *, profile_id: str) -> dict[str, object]:
+            nonlocal control_plane_calls
+            control_plane_calls += 1
+            return {"configured": False, "agent": None, "available_versions": []}
+
+    monkeypatch.setattr(voice_worker, "_get_workspace_ai_setup_from_database", direct_db_lookup)
+
+    setup = await _get_workspace_ai_setup_cached(ControlPlane(), profile_id="4")  # type: ignore[arg-type]
+
+    assert setup["configured"] is True
+    assert control_plane_calls == 0
