@@ -2,7 +2,13 @@ import asyncio
 
 import pytest
 
-from kafka_a2a.local_tools import HybridDelegationBackend, KafkaDelegationBackend, LocalInteractionToolExecutor, _score_card
+from kafka_a2a.local_tools import (
+    DELEGATION_TRACE_METADATA_KEY,
+    HybridDelegationBackend,
+    KafkaDelegationBackend,
+    LocalInteractionToolExecutor,
+    _score_card,
+)
 from kafka_a2a.models import AgentCard, AgentSkill
 from kafka_a2a.tenancy import Principal
 from kafka_a2a.tools import ToolContext
@@ -320,6 +326,55 @@ def test_kafka_delegation_backend_ignores_zero_gateway_timeout(monkeypatch: pyte
     backend = KafkaDelegationBackend(agent_name="inventory")
 
     assert backend._request_timeout_s == 30.0
+
+
+def test_kafka_delegation_backend_adds_delegation_trace_metadata() -> None:
+    backend = KafkaDelegationBackend(agent_name="host")
+    selected = AgentCard(
+        name="wa-p4-pos_admin-1234",
+        description="POS admin specialist",
+        url="kafka://pos_admin",
+        version="0.1.0",
+        metadata={"ka2aRuntime": {"publicSlug": "pos_admin"}},
+    )
+
+    metadata = backend._metadata_for_delegation({"profileId": "4"}, selected)
+
+    assert metadata["profileId"] == "4"
+    assert metadata[DELEGATION_TRACE_METADATA_KEY] == [{"source": "host", "target": "pos_admin"}]
+
+
+def test_kafka_delegation_backend_blocks_downstream_host_delegation() -> None:
+    backend = KafkaDelegationBackend(agent_name="inventory")
+    selected = AgentCard(
+        name="wa-p4-host-1234",
+        description="Host agent",
+        url="kafka://host",
+        version="0.1.0",
+        metadata={"ka2aRuntime": {"publicSlug": "host"}},
+    )
+
+    with pytest.raises(RuntimeError, match="cannot delegate requests back to host"):
+        backend._metadata_for_delegation({}, selected)
+
+
+def test_kafka_delegation_backend_blocks_excessive_delegation_depth(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KA2A_DELEGATION_MAX_DEPTH", "1")
+    backend = KafkaDelegationBackend(agent_name="inventory")
+    selected = AgentCard(
+        name="inventory_visibility",
+        description="Inventory visibility specialist",
+        url="kafka://inventory_visibility",
+        version="0.1.0",
+    )
+    metadata = {
+        DELEGATION_TRACE_METADATA_KEY: [
+            {"source": "host", "target": "inventory"},
+        ]
+    }
+
+    with pytest.raises(RuntimeError, match="maximum delegation depth 1 reached"):
+        backend._metadata_for_delegation(metadata, selected)
 
 
 @pytest.mark.asyncio

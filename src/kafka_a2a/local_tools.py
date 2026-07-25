@@ -37,6 +37,8 @@ UTILITY_MODULES: tuple[str, ...] = (
     "kafka_a2a.utilities.mcp.insight_widget_tools",
 )
 
+DELEGATION_TRACE_METADATA_KEY = "urn:ka2a:delegation_trace"
+
 QUERY_TOKEN_ALLOWLIST: set[str] = {"pos", "sku", "api", "ui"}
 
 QUERY_TOKEN_STOPWORDS: set[str] = {
@@ -227,6 +229,30 @@ def _score_card(card: AgentCard, query: str) -> int:
             score += sum(1 for token in tokens if token in ex)
 
     return score
+
+
+def _delegation_trace_from_metadata(metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
+    raw_trace = (metadata or {}).get(DELEGATION_TRACE_METADATA_KEY)
+    if not isinstance(raw_trace, list):
+        return []
+
+    trace: list[dict[str, Any]] = []
+    for item in raw_trace:
+        if isinstance(item, dict):
+            source = str(item.get("source") or "").strip()
+            target = str(item.get("target") or "").strip()
+            if source or target:
+                trace.append({"source": source, "target": target})
+            continue
+        value = str(item or "").strip()
+        if value:
+            trace.append({"source": "", "target": value})
+    return trace
+
+
+def _is_host_delegation_target(name: str) -> bool:
+    normalized = str(name or "").strip().lower().replace("_", "-")
+    return bool(normalized) and (normalized == "host" or normalized.endswith("-host") or "-host-" in normalized)
 
 
 def _preferred_agent_slugs_for_query(query: str) -> list[str]:
@@ -478,6 +504,10 @@ class KafkaDelegationBackend:
         self._directory_warmup_timeout_s = float(os.getenv("KA2A_DIRECTORY_WARMUP_TIMEOUT_S") or "3.0")
         self._directory_warmup_settle_s = float(os.getenv("KA2A_DIRECTORY_WARMUP_SETTLE_S") or "0.5")
         self._explicit_agent_wait_timeout_s = float(os.getenv("KA2A_EXPLICIT_AGENT_WAIT_TIMEOUT_S") or "12.0")
+        try:
+            self._max_delegation_depth = max(1, int(os.getenv("KA2A_DELEGATION_MAX_DEPTH") or "4"))
+        except Exception:
+            self._max_delegation_depth = 4
         self._control_plane = ControlPlaneClient()
         self._state = _DelegationState()
 
@@ -665,6 +695,27 @@ class KafkaDelegationBackend:
             raise RuntimeError("Could not determine an appropriate specialist agent for this request.")
         return selected
 
+    def _metadata_for_delegation(self, metadata: dict[str, Any] | None, selected: AgentCard) -> dict[str, Any]:
+        target_slug = (card_public_slug(selected) or selected.name or "").strip()
+        if _is_host_delegation_target(target_slug) or _is_host_delegation_target(selected.name):
+            raise RuntimeError("Delegation loop prevented: downstream agents cannot delegate requests back to host.")
+
+        child_metadata = dict(metadata or {})
+        trace = _delegation_trace_from_metadata(child_metadata)
+        if len(trace) >= self._max_delegation_depth:
+            raise RuntimeError(
+                f"Delegation loop prevented: maximum delegation depth {self._max_delegation_depth} reached."
+            )
+
+        trace.append(
+            {
+                "source": self._agent_name,
+                "target": target_slug or selected.name,
+            }
+        )
+        child_metadata[DELEGATION_TRACE_METADATA_KEY] = trace
+        return child_metadata
+
     async def delegate(
         self,
         *,
@@ -685,20 +736,22 @@ class KafkaDelegationBackend:
             visible_cards = self._visible_downstream_cards(registered_cards)
             selected = self._select_agent(cards=visible_cards, request=request, agent_name=agent_name)
 
+        child_metadata = self._metadata_for_delegation(ctx.metadata, selected)
         assert self._state.client is not None
+
         async def _run_delegation() -> dict[str, Any]:
             if delegated_task_id:
                 stream = await self._state.client.continue_task_stream(
                     agent_name=selected.name,
                     task_id=delegated_task_id,
                     message=Message(role=Role.user, parts=[TextPart(text=request)]),
-                    metadata=ctx.metadata,
+                    metadata=child_metadata,
                 )
             else:
                 stream = await self._state.client.stream_message(
                     agent_name=selected.name,
                     message=Message(role=Role.user, parts=[TextPart(text=request)]),
-                    metadata=ctx.metadata,
+                    metadata=child_metadata,
                 )
 
             child_task_id: str | None = None

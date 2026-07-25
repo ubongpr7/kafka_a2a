@@ -1597,6 +1597,72 @@ class AgentControlPlaneService:
             "available_versions": model_versions,
         }
 
+    def get_workspace_ai_runtime_setup(self, *, profile_id: str) -> dict[str, Any]:
+        cache_key = ("get_workspace_ai_runtime_setup", profile_id)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        ai = self._get_workspace_ai_settings_record(profile_id=profile_id)
+        if ai is None:
+            return self._cache_set(cache_key, {
+                "configured": False,
+                "agent": None,
+                "available_versions": [],
+            })
+
+        version = next((item for item in self._list_model_version_records() if item.id == ai.version), None)
+        provider = version.provider if version else ""
+        provider_label = version.provider_label if version else ""
+        model_name = version.model_name if version else ai.version
+        effective_base_url = ai.base_url or (version.base_url if version else "")
+        api_key = _decrypt_secret(ai.api_key)
+        if not api_key or api_key.startswith("gAAAA"):
+            api_key = ""
+        tavily_api_key = _decrypt_secret(ai.tavily_api_key)
+        if not tavily_api_key or tavily_api_key.startswith("gAAAA"):
+            tavily_api_key = ""
+        host_agent = self._get_workspace_agent_record(profile_id=profile_id, slug="host", enabled_only=True)
+        host_runtime_name = host_agent.build_runtime_name() if host_agent is not None else ""
+
+        return self._cache_set(cache_key, {
+            "configured": True,
+            "agent": {
+                "id": ai.id,
+                "profile": ai.profile,
+                "name": ai.name,
+                "version": ai.version,
+                "provider": provider,
+                "provider_label": provider_label,
+                "model_name": model_name,
+                "provider_base_url": version.base_url if version else None,
+                "effective_base_url": effective_base_url or None,
+                "special_instruction": ai.special_instruction,
+                "system_instruction": ai.system_instruction,
+                "assistant_instruction": ai.assistant_instruction,
+                "host_runtime_name": host_runtime_name,
+                "api_key": api_key,
+                "tavily_api_key": tavily_api_key,
+                "has_api_key": bool(api_key),
+                "has_tavily_api_key": bool(tavily_api_key),
+            },
+            "available_versions": [],
+        })
+
+    def warm_workspace_ai_runtime_setup_cache(self, *, profile_ids: list[str]) -> dict[str, int]:
+        warmed = 0
+        failed = 0
+        for profile_id in profile_ids:
+            normalized_profile_id = str(profile_id or "").strip()
+            if not normalized_profile_id:
+                continue
+            try:
+                self.get_workspace_ai_runtime_setup(profile_id=normalized_profile_id)
+                warmed += 1
+            except Exception:
+                failed += 1
+        return {"warmed": warmed, "failed": failed}
+
     def save_workspace_ai_setup(self, *, profile_id: str, data: dict[str, Any]) -> dict[str, Any]:
         ai = self._get_workspace_ai_settings_record(profile_id=profile_id)
         if ai is None:
@@ -1881,7 +1947,7 @@ class AgentControlPlaneService:
             llm_claim["baseUrl"] = base_url
         api_key = _decrypt_secret(ai.api_key)
         if not api_key or api_key.startswith("gAAAA"):
-            api_key = _resolve_env_llm_api_key(version.provider)
+            api_key = ""
         if api_key:
             llm_claim["apiKey"] = _secret_for_claim(api_key)
         payload: dict[str, Any] = {
@@ -1903,7 +1969,7 @@ class AgentControlPlaneService:
             api_key = _decrypt_secret(ai.tavily_api_key)
             if api_key and not api_key.startswith("gAAAA"):
                 return api_key
-        return _resolve_env_secret("TAVILY_API_KEY")
+        return ""
 
     def _workspace_agent_payloads(self, agents: list[WorkspaceAgent]) -> list[dict[str, Any]]:
         if not agents:

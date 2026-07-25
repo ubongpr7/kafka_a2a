@@ -18,6 +18,7 @@ class ContextMemory:
     summary: str | None = None
     profile: dict[str, Any] | None = None
     workflow_state: dict[str, Any] | None = None
+    analysis: dict[str, Any] | None = None
     updated_at: str | None = None
 
     def to_json(self) -> str:
@@ -26,6 +27,7 @@ class ContextMemory:
                 "summary": self.summary,
                 "profile": self.profile,
                 "workflowState": self.workflow_state,
+                "analysis": self.analysis,
                 "updatedAt": self.updated_at,
             },
             separators=(",", ":"),
@@ -39,11 +41,13 @@ class ContextMemory:
         summary = obj.get("summary")
         profile = obj.get("profile")
         workflow_state = obj.get("workflowState") or obj.get("workflow_state")
+        analysis = obj.get("analysis") or obj.get("analysis_payload")
         updated_at = obj.get("updatedAt") or obj.get("updated_at")
         return cls(
             summary=str(summary) if isinstance(summary, str) and summary.strip() else None,
             profile=profile if isinstance(profile, dict) else None,
             workflow_state=workflow_state if isinstance(workflow_state, dict) else None,
+            analysis=analysis if isinstance(analysis, dict) else None,
             updated_at=str(updated_at) if isinstance(updated_at, str) and updated_at.strip() else None,
         )
 

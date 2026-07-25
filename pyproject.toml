@@ -51,6 +51,9 @@ redis = [
 mcp = [
   "mcp>=1.0.0",
 ]
+voice = [
+  "livekit-agents[openai]~=1.6.1",
+]
 dev = [
   "alembic>=1.14.0",
   "pytest>=8.2.0",

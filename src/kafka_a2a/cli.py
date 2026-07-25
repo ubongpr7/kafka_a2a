@@ -403,8 +403,30 @@ def _run_gateway(args: argparse.Namespace) -> None:
     default_agent = args.default_agent or os.getenv("KA2A_DEFAULT_AGENT", "host")
     host = args.host or os.getenv("KA2A_GATEWAY_HOST", "0.0.0.0")
     port = int(args.port or os.getenv("KA2A_GATEWAY_PORT", "8000"))
+    reload_enabled = args.reload
+    if reload_enabled is None:
+        reload_enabled = _parse_bool(os.getenv("KA2A_GATEWAY_RELOAD"), default=False)
+
+    os.environ["KA2A_BOOTSTRAP_SERVERS"] = bootstrap
+    os.environ["KA2A_DEFAULT_AGENT"] = default_agent
+    os.environ["KA2A_GATEWAY_HOST"] = host
+    os.environ["KA2A_GATEWAY_PORT"] = str(port)
 
     jwt = _jwt_from_env()
+
+    uvicorn = _require_uvicorn()
+    if reload_enabled:
+        reload_dir = str(Path(__file__).resolve().parents[1])
+        uvicorn.run(
+            "kafka_a2a.cli:create_gateway_app_for_uvicorn_reload",
+            factory=True,
+            host=host,
+            port=port,
+            reload=True,
+            reload_dirs=[reload_dir],
+            log_level=os.getenv("KA2A_LOG_LEVEL", "info"),
+        )
+        return
 
     app = create_gateway_app(
         GatewayConfig(
@@ -422,8 +444,27 @@ def _run_gateway(args: argparse.Namespace) -> None:
         )
     )
 
-    uvicorn = _require_uvicorn()
     uvicorn.run(app, host=host, port=port, log_level=os.getenv("KA2A_LOG_LEVEL", "info"))
+
+
+def create_gateway_app_for_uvicorn_reload():
+    bootstrap = os.getenv("KA2A_BOOTSTRAP_SERVERS", "localhost:9092")
+    default_agent = os.getenv("KA2A_DEFAULT_AGENT", "host")
+    return create_gateway_app(
+        GatewayConfig(
+            bootstrap_servers=bootstrap,
+            default_agent=default_agent,
+            client_id=os.getenv("KA2A_GATEWAY_CLIENT_ID"),
+            request_timeout_s=_parse_optional_timeout_s(
+                os.getenv("KA2A_GATEWAY_REQUEST_TIMEOUT_S"),
+                os.getenv("KA2A_REQUEST_TIMEOUT_S"),
+            ),
+            stream_request_timeout_s=(
+                _parse_optional_timeout_s(os.getenv("KA2A_GATEWAY_STREAM_REQUEST_TIMEOUT_S")) or 120.0
+            ),
+            jwt=_jwt_from_env(),
+        )
+    )
 
 
 def _run_proxy(args: argparse.Namespace) -> None:
@@ -662,6 +703,13 @@ def _sync_control_plane_snapshot(args: argparse.Namespace) -> None:
     print(f" - workspace_skill_bindings: {len(state.workspace_skill_bindings)}")
 
 
+def _run_voice(args: argparse.Namespace) -> None:
+    _ = args
+    from kafka_a2a.livekit_voice.worker import run_voice_server
+
+    run_voice_server()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ka2a", description="K-A2A (Kafka A2A) CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -722,6 +770,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_gw.add_argument("--default-agent", dest="default_agent")
     p_gw.add_argument("--host")
     p_gw.add_argument("--port")
+    p_gw.add_argument(
+        "--reload",
+        dest="reload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable uvicorn auto-reload for local development. Defaults to KA2A_GATEWAY_RELOAD.",
+    )
     p_gw.set_defaults(func=_run_gateway)
 
     p_px = sub.add_parser("proxy", help="Run the A2A JSON-RPC over HTTP proxy")
@@ -773,6 +828,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Copy the current database-backed control-plane state into the local JSON snapshot.",
     )
     p_sync_snapshot.set_defaults(func=_sync_control_plane_snapshot)
+
+    p_voice = sub.add_parser(
+        "voice",
+        help="Run the LiveKit voice conversation worker backed by workspace AI settings.",
+    )
+    p_voice.set_defaults(func=_run_voice)
 
     return parser
 

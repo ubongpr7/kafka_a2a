@@ -2,7 +2,9 @@ FROM python:3.13-slim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    UV_HTTP_TIMEOUT=600 \
+    UV_HTTP_RETRIES=10
 
 WORKDIR /app
 

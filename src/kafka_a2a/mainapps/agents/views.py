@@ -623,4 +623,9 @@ def build_agents_router(
         _require_runtime_token(request)
         return await run_in_threadpool(service.internal_runtime_registry)
 
+    @router.get("/runtime/internal/workspaces/{profile_id}/ai-setup/")
+    async def runtime_internal_workspace_ai_setup(profile_id: str, request: Request):
+        _require_runtime_token(request)
+        return await run_in_threadpool(service.get_workspace_ai_runtime_setup, profile_id=profile_id)
+
     return router

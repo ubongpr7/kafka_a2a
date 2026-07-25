@@ -5,7 +5,7 @@ x-ka2a-image: &ka2a_image
   build:
     context: .
     args:
-      KA2A_UV_EXTRAS: "server,auth,lang,redis,mcp"
+      KA2A_UV_EXTRAS: "server,auth,lang,redis,mcp,voice"
   env_file:
     # Production deploys should export `KA2A_ENV_FILE=.env.prod` so the
     # containers do not start with the local development `.env`.
@@ -350,9 +350,30 @@ services:
       - pos-agent
       - pos-live-agent
       - pos-admin-agent
+    environment:
+      KA2A_RUNTIME_SHARED_TOKEN: ${KA2A_RUNTIME_SHARED_TOKEN:-interaims-local-ka2a-runtime}
     ports:
       - "7006:7006"
     command: ["gateway", "--default-agent", "host", "--host", "0.0.0.0", "--port", "7006"]
+    restart: unless-stopped
+
+  voice-agent:
+    <<: *ka2a_image
+    depends_on:
+      - gateway
+      - host-agent
+    environment:
+      KA2A_RUNTIME_SHARED_TOKEN: ${KA2A_RUNTIME_SHARED_TOKEN:-interaims-local-ka2a-runtime}
+      KA2A_CONTROL_PLANE_BASE_URL: http://gateway:7006
+      KA2A_LIVEKIT_AGENT_NAME: ka2a-voice
+      KA2A_VOICE_HOST_AGENT_NAME: host
+      KA2A_VOICE_TTS_VOICE: marin
+      KA2A_VOICE_STT_MODEL: whisper-1
+      KA2A_VOICE_TTS_MODEL: gpt-4o-mini-tts
+      KA2A_VOICE_LLM_MODEL: gpt-4.1-mini
+      KA2A_VOICE_HOST_TIMEOUT_S: "240"
+      KA2A_VOICE_BACKEND_DELEGATION_ENABLED: "false"
+    command: ["voice"]
     restart: unless-stopped
 
   a2a-proxy:

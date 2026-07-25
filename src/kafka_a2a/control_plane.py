@@ -116,3 +116,12 @@ class ControlPlaneClient:
             path="/agent_api/runtime/internal/registry/",
             headers=headers,
         )
+
+    def get_internal_workspace_ai_setup(self, *, profile_id: str) -> dict[str, Any]:
+        headers: dict[str, str] = {}
+        if self._cfg.runtime_shared_token:
+            headers["X-KA2A-Runtime-Token"] = self._cfg.runtime_shared_token
+        return self._request_json(
+            path=f"/agent_api/runtime/internal/workspaces/{quote(profile_id, safe='')}/ai-setup/",
+            headers=headers,
+        )

@@ -189,13 +189,13 @@ class FakeToolExecutor(ToolExecutor):
         agents = [
             {
                 "name": "onboarding",
-                "description": "Workflow specialist agent for guided inventory onboarding and setup.",
+                "description": "Workflow specialist agent for guided product import and catalog selection.",
                 "skills": [
                     {
-                        "name": "Inventory Environment Onboarding",
-                        "description": "Guide stock-location, category, inventory, and initial product setup.",
-                        "tags": ["onboarding", "setup", "inventory", "stock-locations", "categories"],
-                        "examples": ["Help me set up my inventory workspace from scratch."],
+                        "name": "Product Import Workflow",
+                        "description": "Guide category selection, brand selection, catalog browsing, product selection, and import review.",
+                        "tags": ["onboarding", "product-import", "catalog", "selection", "import"],
+                        "examples": ["Help me import products into my workspace."],
                     }
                 ],
             },
@@ -949,7 +949,7 @@ class FakeToolExecutor(ToolExecutor):
                             "kind": "data",
                             "data": {
                                 "interaction_type": "multiple_choice",
-                                "title": "Start Inventory Onboarding",
+                                "title": "Start Product Import",
                                 "description": "Choose the setup area you want to complete first. I will guide you step by step.",
                                 "options": [
                                     {"value": "full_setup", "label": "Full Inventory Setup"},

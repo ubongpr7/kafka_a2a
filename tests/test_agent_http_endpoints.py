@@ -308,6 +308,48 @@ def test_runtime_internal_registry_requires_shared_runtime_token(
         assert slugs == {"runtime-host"}
 
 
+def test_runtime_internal_workspace_ai_setup_returns_decrypted_workspace_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    owner_token = _make_token(
+        user_id="81",
+        profile_id="51",
+        owner_id="81",
+        permissions=["manage_agent_settings", "interact_with_agent"],
+    )
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        setup_response = client.post(
+            "/agent_api/management/agent-setup/",
+            headers=_auth_headers(owner_token),
+            json={
+                "name": "Voice GPT",
+                "provider": "chatgpt",
+                "provider_label": "ChatGPT",
+                "version": "gpt-4.1-mini",
+                "api_key": "sk-test-voice",
+                "tavily_api_key": "tvly-voice",
+            },
+        )
+        assert setup_response.status_code == 200
+
+        denied = client.get("/agent_api/runtime/internal/workspaces/51/ai-setup/")
+        assert denied.status_code == 403
+
+        allowed = client.get(
+            "/agent_api/runtime/internal/workspaces/51/ai-setup/",
+            headers={"X-KA2A-Runtime-Token": RUNTIME_SYNC_TOKEN},
+        )
+        assert allowed.status_code == 200
+        payload = allowed.json()
+        assert payload["configured"] is True
+        assert payload["agent"]["name"] == "Voice GPT"
+        assert payload["agent"]["api_key"] == "sk-test-voice"
+        assert payload["agent"]["tavily_api_key"] == "tvly-voice"
+        assert payload["agent"]["has_api_key"] is True
+        assert payload["agent"]["has_tavily_api_key"] is True
+
+
 def test_conversation_crud_is_scoped_to_workspace_user_and_installed_agents(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:

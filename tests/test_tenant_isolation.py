@@ -5,7 +5,7 @@ import pytest
 from kafka_a2a.errors import A2AError, A2AErrorCode
 from kafka_a2a.models import Message, TextPart, Task
 from kafka_a2a.protocol import METHOD_MESSAGE_SEND, METHOD_TASKS_GET, RpcRequest
-from kafka_a2a.runtime.agent import Ka2aAgent, Ka2aAgentConfig
+from kafka_a2a.runtime.agent import Ka2aAgent, Ka2aAgentConfig, _user_safe_failure_message
 from kafka_a2a.tenancy import KA2A_PRINCIPAL_METADATA_KEY, Principal, with_principal
 from kafka_a2a.transport.kafka import KafkaConfig, KafkaEnvelope, KafkaTransport
 
@@ -16,6 +16,31 @@ def _agent(*, tenant_isolation: bool) -> Ka2aAgent:
         config=Ka2aAgentConfig(agent_name="t", tenant_isolation=tenant_isolation),
         transport=transport,
     )
+
+
+def test_user_safe_failure_message_redacts_invalid_openai_key_payload() -> None:
+    message = _user_safe_failure_message(
+        RuntimeError(
+            "OpenAI-compatible upstream error (401): {"
+            "\"error\":{\"message\":\"Incorrect API key provided: sk-proj-secret-value\","
+            "\"code\":\"invalid_api_key\"}}"
+        )
+    )
+
+    assert message == (
+        "I could not complete that request because the workspace AI provider key is invalid. "
+        "Update the workspace AI settings, then retry."
+    )
+    assert "sk-proj" not in message
+    assert "Incorrect API key" not in message
+
+
+def test_user_safe_failure_message_summarizes_delegation_loop() -> None:
+    message = _user_safe_failure_message(
+        RuntimeError("Delegation loop prevented: downstream agents cannot delegate requests back to host.")
+    )
+
+    assert "agent routing became circular" in message
 
 
 @pytest.mark.asyncio
@@ -63,4 +88,3 @@ async def test_tenant_isolation_stores_and_enforces_task_principal() -> None:
     with pytest.raises(A2AError) as err:
         await agent._route(bad_req, env)  # type: ignore[attr-defined]
     assert err.value.code == A2AErrorCode.PERMISSION_DENIED
-

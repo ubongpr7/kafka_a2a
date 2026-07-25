@@ -93,8 +93,12 @@ def test_render_tool_prompt_block_discourages_tool_calls_for_plain_conversation(
 def test_is_simple_greeting_query_matches_plain_greetings() -> None:
     assert _is_simple_greeting_query("hi")
     assert _is_simple_greeting_query("hello there")
+    assert _is_simple_greeting_query("hello again")
+    assert _is_simple_greeting_query("are you there?")
+    assert _is_simple_greeting_query("can you hear me now?")
     assert _is_simple_greeting_query("good evening")
     assert not _is_simple_greeting_query("hi, create my inventory")
+    assert not _is_simple_greeting_query("hello, can you analyse sales for last year?")
 
 
 def test_pos_admin_named_insight_from_text_detects_priority_flows() -> None:
@@ -215,6 +219,7 @@ def test_build_pos_top_sellers_insight_returns_ranked_widget_payload() -> None:
     assert payload["widgets"][1]["title"] == "Top sellers for 3 months ago"
     assert payload["widgets"][1]["items"][0]["image_url"].startswith("data:image/svg+xml")
     assert payload["data_sources"][0]["endpoint_or_topic"] == "get_top_sellers"
+    assert payload["insights"][1]["detail"] == "12 units contributed ₦7,800.00 in sales across the ranked set."
 
 
 def test_build_pos_best_sales_day_insight_returns_trend_payload() -> None:
@@ -847,6 +852,54 @@ async def test_enrich_top_sellers_deduplicates_lookup_queries() -> None:
     assert results[2]["barcode"] == "FANTA OR-BAR"
 
 
+@pytest.mark.asyncio
+async def test_enrich_top_sellers_caps_lookup_queries_to_identifier_and_name() -> None:
+    class _FallbackLookupExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        async def call_tool(self, *, name: str, arguments: dict[str, object], ctx: ToolContext) -> dict[str, object]:
+            _ = ctx
+            self.calls.append((name, dict(arguments)))
+            query = str(arguments.get("query") or "")
+            if query == "Eva Premium Water 75cl":
+                return {
+                    "results": [
+                        {
+                            "product_name": "Eva Premium Water",
+                            "name": "Eva Premium Water 75cl",
+                            "sku": "EVA-75CL",
+                            "barcode": "8800000001101",
+                            "image_url": "https://example.com/eva.png",
+                        }
+                    ]
+                }
+            return {"results": []}
+
+    executor = _FallbackLookupExecutor()
+
+    payload = await _enrich_top_seller_results_with_variant_context(
+        results_payload={
+            "results": [
+                {
+                    "variant_name": "Eva Premium Water 75cl",
+                    "product_name": "Eva Premium Water",
+                    "sku_snapshot": "EVA-STALE",
+                    "quantity_sold": 16,
+                    "sales_total": 5600.0,
+                }
+            ]
+        },
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        limit=1,
+    )
+
+    product_lookup_calls = [call for call in executor.calls if call[0] == "product.get_variant_lookup"]
+    assert [call[1]["query"] for call in product_lookup_calls] == ["Eva Premium Water 75cl"]
+    assert payload["results"][0]["image_url"] == "https://example.com/eva.png"
+
+
 def test_inventory_visibility_named_insight_from_text_detects_priority_flows() -> None:
     assert _inventory_visibility_named_insight_from_text("Show out-of-stock products.") == "stock_risk_out_of_stock"
     assert _inventory_visibility_named_insight_from_text("Show low-stock products.") == "stock_risk_low_stock"
@@ -1024,6 +1077,16 @@ def test_latest_insight_follow_up_answer_uses_previous_structured_payload() -> N
             "structured_payload": payload,
         }
     ]
+    wrapped_history = [
+        {
+            "role": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": "Business analyst review for last 1 year.",
+                "structuredPayload": payload,
+            },
+        }
+    ]
     direct_stream_history = [
         {
             "role": "assistant",
@@ -1044,6 +1107,7 @@ def test_latest_insight_follow_up_answer_uses_previous_structured_payload() -> N
 
     assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location led?", history) or "")
     assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location led?", frontend_history) or "")
+    assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location was far behind in terms of revenue in that period?", wrapped_history) or "")
     assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location led?", direct_stream_history) or "")
     assert "Prioritize replenishment" in (_latest_insight_follow_up_answer("What should I do first?", history) or "")
     assert "Prioritize replenishment" in (
@@ -1053,6 +1117,7 @@ def test_latest_insight_follow_up_answer_uses_previous_structured_payload() -> N
     assert "Eva Premium Water" in (_latest_insight_follow_up_answer("Which products drove revenue?", history) or "")
     assert "₦35,000.00" in (_latest_insight_follow_up_answer("What was total revenue?", history) or "")
     assert _latest_insight_follow_up_answer("Give me last month sales instead", history) is None
+    assert _latest_insight_follow_up_answer("Can you hear me now?", history) is None
 
     procurement_payload = {
         "kind": "insight_response",
@@ -1701,7 +1766,7 @@ def test_select_router_delegation_agent_prefers_best_matching_subspecialist() ->
     assert selected == "inventory_setup"
 
 
-def test_select_router_handoff_agent_prefers_host_for_cross_domain_request() -> None:
+def test_select_router_handoff_agent_does_not_delegate_back_to_host_for_cross_domain_request() -> None:
     selected = _select_router_handoff_agent(
         "product",
         "please help me set up my inventory",
@@ -1724,7 +1789,7 @@ def test_select_router_handoff_agent_prefers_host_for_cross_domain_request() -> 
         ],
     )
 
-    assert selected == "host"
+    assert selected is None
 
 
 def test_select_router_handoff_agent_prefers_own_marketplace_specialist_for_mixed_inventory_prompt() -> None:
@@ -1904,7 +1969,7 @@ def test_select_host_delegation_agent_prefers_best_matching_specialist() -> None
         {
             "name": "onboarding",
             "description": "Onboarding workflow specialist.",
-            "skills": [{"name": "Inventory Onboarding", "description": "Guide setup", "tags": ["onboarding", "setup"]}],
+            "skills": [{"name": "Product Import", "description": "Guide setup", "tags": ["onboarding", "setup"]}],
         },
         {
             "name": "product",
@@ -2127,7 +2192,7 @@ async def test_host_capability_query_uses_multiple_choice_tool() -> None:
                 "title": "Choose What You Need Help With",
                 "description": "Select the area you want help with. I can continue from your choice.",
                 "options": [
-                    {"value": "onboarding", "label": "Inventory Onboarding"},
+                    {"value": "onboarding", "label": "Product Import"},
                     {"value": "product", "label": "Product Management"},
                     {"value": "inventory", "label": "Inventory Management"},
                     {"value": "pos", "label": "Point of Sale (POS)"},
@@ -2155,7 +2220,7 @@ async def test_host_capability_selection_routes_to_selected_agent() -> None:
         "title": "Choose What You Need Help With",
         "description": "Select the area you want help with. I can continue from your choice.",
         "options": [
-            {"value": "onboarding", "label": "Inventory Onboarding"},
+            {"value": "onboarding", "label": "Product Import"},
             {"value": "product", "label": "Product Management"},
             {"value": "inventory", "label": "Inventory Management"},
             {"value": "pos", "label": "Point of Sale (POS)"},
@@ -2217,7 +2282,7 @@ async def test_host_capability_selection_routes_onboarding_to_guided_flow_reques
         "title": "Choose What You Need Help With",
         "description": "Select the area you want help with. I can continue from your choice.",
         "options": [
-            {"value": "onboarding", "label": "Inventory Onboarding"},
+            {"value": "onboarding", "label": "Product Import"},
             {"value": "product", "label": "Product Management"},
             {"value": "inventory", "label": "Inventory Management"},
             {"value": "pos", "label": "Point of Sale (POS)"},
@@ -2255,8 +2320,8 @@ async def test_host_capability_selection_routes_onboarding_to_guided_flow_reques
             "delegate_to_agent",
             {
                 "request": (
-                    "Start a guided inventory onboarding flow. Ask the user what setup they want to complete first, "
-                    "then collect the required details step by step using structured interactions."
+                    "Start a guided product import flow. Ask the user which product categories or brands they want to import first, "
+                    "then browse global catalog products in pages, keep already-imported products filtered out, and collect selection step by step using structured interactions."
                 ),
                 "agent_name": "onboarding",
             },
@@ -2282,7 +2347,7 @@ async def test_host_capability_selection_inventory_opens_domain_area_picker() ->
         "title": "Choose What You Need Help With",
         "description": "Select the area you want help with. I can continue from your choice.",
         "options": [
-            {"value": "onboarding", "label": "Inventory Onboarding"},
+            {"value": "onboarding", "label": "Product Import"},
             {"value": "product", "label": "Product Management"},
             {"value": "inventory", "label": "Inventory Management"},
             {"value": "pos", "label": "Point of Sale (POS)"},
@@ -2615,7 +2680,7 @@ async def test_host_registered_agents_query_stays_with_host() -> None:
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == (
-        "Currently registered specialist agents: Inventory Management, Inventory Onboarding, "
+        "Currently registered specialist agents: Inventory Management, Product Import, "
         "Point of Sale (POS), Product Management, User and Workspace Management."
     )
 
@@ -2654,7 +2719,7 @@ async def test_host_registered_agents_query_reports_hidden_agents_when_not_host_
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == (
-        "Currently registered specialist agents: Inventory Management, Inventory Onboarding, "
+        "Currently registered specialist agents: Inventory Management, Product Import, "
         "Point of Sale (POS), Product Management, User and Workspace Management. "
         "The host is currently configured to route to: Inventory Management, Point of Sale (POS), Product Management."
     )
@@ -3455,7 +3520,7 @@ async def test_host_unavailable_selected_agent_reprompts_instead_of_misrouting(
         "title": "Choose What You Need Help With",
         "description": "Select the area you want help with. I can continue from your choice.",
         "options": [
-            {"value": "onboarding", "label": "Inventory Onboarding"},
+            {"value": "onboarding", "label": "Product Import"},
             {"value": "product", "label": "Product Management"},
             {"value": "inventory", "label": "Inventory Management"},
             {"value": "pos", "label": "Point of Sale (POS)"},
@@ -3498,7 +3563,7 @@ async def test_host_unavailable_selected_agent_reprompts_instead_of_misrouting(
                     "Choose one of the areas that is available right now."
                 ),
                 "options": [
-                    {"value": "onboarding", "label": "Inventory Onboarding"},
+                    {"value": "onboarding", "label": "Product Import"},
                     {"value": "product", "label": "Product Management"},
                     {"value": "inventory", "label": "Inventory Management"},
                     {"value": "pos", "label": "Point of Sale (POS)"},
@@ -3563,7 +3628,7 @@ async def test_host_free_text_onboarding_reply_after_picker_reprompts_when_onboa
             {
                 "title": "Choose What You Need Help With",
                 "description": (
-                    "Inventory Onboarding is not currently available. "
+                    "Product Import is not currently available. "
                     "Choose one of the areas that is available right now."
                 ),
                 "options": [
@@ -3619,7 +3684,7 @@ async def test_host_answers_unavailable_agent_diagnostics_without_misrouting(
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert _text_from_parts(result_artifact.parts) == (
-        "Inventory Onboarding is registered in the current agent directory, but it is not currently exposed to the host "
+        "Product Import is registered in the current agent directory, but it is not currently exposed to the host "
         "for routing. The host currently routes to these available areas: Inventory Management, Point of Sale (POS), "
         "Product Management. "
         "There is no specialist error message to show here because the host did not delegate this request. "
@@ -4783,6 +4848,28 @@ async def test_inventory_agent_greeting_short_circuits_tool_and_llm_work() -> No
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert result_artifact.parts[0].text == "I’m your Inventory Management agent. What can I help you with?"
+
+
+@pytest.mark.asyncio
+async def test_host_status_check_short_circuits_tool_and_llm_work() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-status-host",
+        context_id="ctx-status-host",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="hello again, are you there?")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="hello again, are you there?")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == []
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].text == "I’m your workspace host agent. What can I help you with?"
 
 
 @pytest.mark.asyncio

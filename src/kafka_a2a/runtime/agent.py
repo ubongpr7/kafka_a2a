@@ -75,6 +75,32 @@ TaskProcessor = Callable[
 
 logger = logging.getLogger("kafka_a2a.agent")
 
+
+def _user_safe_failure_message(exc: Exception) -> str:
+    text = str(exc).strip()
+    normalized = text.lower()
+    if (
+        "invalid_api_key" in normalized
+        or "incorrect api key" in normalized
+        or ("upstream error (401)" in normalized and "openai" in normalized)
+    ):
+        return (
+            "I could not complete that request because the workspace AI provider key is invalid. "
+            "Update the workspace AI settings, then retry."
+        )
+    if "delegation loop prevented" in normalized:
+        return (
+            "I could not complete that request because agent routing became circular. "
+            "Please retry; the routing guard has stopped the loop."
+        )
+    if "timed out waiting for delegated response" in normalized:
+        return (
+            "I could not complete that request because the specialist agent took too long to respond. "
+            "Please retry, or ask for a narrower analysis."
+        )
+    return text or "I could not complete that request. Please retry."
+
+
 @dataclass(slots=True)
 class Ka2aAgentConfig:
     agent_name: str
@@ -973,7 +999,7 @@ class Ka2aAgent:
                     task_id=task.id,
                     status=TaskStatus(
                         state=TaskState.failed,
-                        message=Message(role=Role.agent, parts=[TextPart(text=str(exc))]),
+                        message=Message(role=Role.agent, parts=[TextPart(text=_user_safe_failure_message(exc))]),
                     ),
                 )
                 self._enqueue_push(task_id=task.id, event=failed_event)
@@ -1038,7 +1064,7 @@ class Ka2aAgent:
                     task_id=task.id,
                     status=TaskStatus(
                         state=TaskState.failed,
-                        message=Message(role=Role.agent, parts=[TextPart(text=str(exc))]),
+                        message=Message(role=Role.agent, parts=[TextPart(text=_user_safe_failure_message(exc))]),
                     ),
                 )
                 self._enqueue_push(task_id=task.id, event=failed_event)

@@ -665,32 +665,97 @@ def _history_insight_payloads(history: Any) -> list[dict[str, Any]]:
         role = str(item.get("role") or "").strip().lower()
         if role not in {"assistant", "agent", "ai"}:
             continue
-        for key in ("structured_payload", "structuredPayload", "payload", "data"):
-            payload_candidate = item.get(key)
-            if isinstance(payload_candidate, dict):
-                if str(payload_candidate.get("kind") or "").strip() == "insight_response":
-                    payloads.append(payload_candidate)
-                    break
-                nested = payload_candidate.get("structured_payload")
-                if isinstance(nested, dict) and str(nested.get("kind") or "").strip() == "insight_response":
-                    payloads.append(nested)
-                    break
-        else:
-            content = item.get("content")
-            if not isinstance(content, str) or not content.strip():
-                continue
-            try:
-                payload = json.loads(content)
-            except Exception:
-                continue
-            if isinstance(payload, dict) and str(payload.get("kind") or "").strip() == "insight_response":
-                payloads.append(payload)
-                continue
-            if isinstance(payload, dict):
-                nested = payload.get("structured_payload") or payload.get("payload") or payload.get("data")
-                if isinstance(nested, dict) and str(nested.get("kind") or "").strip() == "insight_response":
-                    payloads.append(nested)
+        sources = [item]
+        message = item.get("message")
+        if isinstance(message, dict):
+            sources.append(message)
+        for source in sources:
+            for key in ("structured_payload", "structuredPayload", "payload", "data"):
+                payload_candidate = source.get(key)
+                if isinstance(payload_candidate, dict):
+                    if str(payload_candidate.get("kind") or "").strip() == "insight_response":
+                        payloads.append(payload_candidate)
+                        break
+                    nested = payload_candidate.get("structured_payload") or payload_candidate.get("structuredPayload")
+                    if isinstance(nested, dict) and str(nested.get("kind") or "").strip() == "insight_response":
+                        payloads.append(nested)
+                        break
+                elif isinstance(payload_candidate, str):
+                    try:
+                        decoded = json.loads(payload_candidate)
+                    except Exception:
+                        decoded = None
+                    if isinstance(decoded, dict) and str(decoded.get("kind") or "").strip() == "insight_response":
+                        payloads.append(decoded)
+                        break
+            else:
+                content = source.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                try:
+                    payload = json.loads(content)
+                except Exception:
+                    continue
+                if isinstance(payload, dict) and str(payload.get("kind") or "").strip() == "insight_response":
+                    payloads.append(payload)
+                    continue
+                if isinstance(payload, dict):
+                    nested = payload.get("structured_payload") or payload.get("structuredPayload") or payload.get("payload") or payload.get("data")
+                    if isinstance(nested, dict) and str(nested.get("kind") or "").strip() == "insight_response":
+                        payloads.append(nested)
     return payloads
+
+
+def _insight_row_contains_keys(row: dict[str, Any], *keywords: str) -> bool:
+    keys = " ".join(str(key).lower() for key in row.keys())
+    return any(keyword.lower() in keys for keyword in keywords)
+
+
+def _insight_location_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    widget = _insight_widget_by_title(payload, "location")
+    rows = widget.get("rows") if isinstance(widget, dict) else []
+    if not rows and isinstance(widget, dict):
+        rows = widget.get("data") if isinstance(widget.get("data"), list) else []
+    if isinstance(rows, list):
+        location_rows = [row for row in rows if isinstance(row, dict)]
+        if location_rows:
+            return location_rows
+
+    candidate_widgets = payload.get("widgets")
+    if not isinstance(candidate_widgets, list):
+        candidate_widgets = []
+    for candidate in candidate_widgets:
+        if not isinstance(candidate, dict):
+            continue
+        widget_type = str(candidate.get("type") or "").strip().lower()
+        if widget_type not in {"comparison_table", "table", "ranked_list"}:
+            continue
+        for key in ("rows", "data", "items"):
+            value = candidate.get(key)
+            if not isinstance(value, list):
+                continue
+            rows = [row for row in value if isinstance(row, dict)]
+            if not rows:
+                continue
+            if any(
+                _insight_row_contains_keys(row, "location", "store", "branch", "outlet", "warehouse", "site")
+                and _insight_row_contains_keys(row, "sales", "revenue", "value", "amount", "total")
+                for row in rows
+            ):
+                return rows
+
+    for key in ("location_rows", "locations", "rows", "groups"):
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        rows = [row for row in value if isinstance(row, dict)]
+        if rows and any(
+            _insight_row_contains_keys(row, "location", "store", "branch", "outlet", "warehouse", "site")
+            and _insight_row_contains_keys(row, "sales", "revenue", "value", "amount", "total")
+            for row in rows
+        ):
+            return rows
+    return []
 
 
 def _payload_search_text(payload: dict[str, Any]) -> str:
@@ -719,7 +784,7 @@ def _select_history_insight_payload(user_text: str, history: Any) -> dict[str, A
     elif wants_location:
         terms = ("location contribution", "location revenue", "store revenue", "branch revenue", "location ranking")
     elif wants_comparison:
-        terms = ("product comparison table", "product revenue ranking", "product units trend", "variant comparison")
+        terms = ("product comparison table", "product revenue ranking", "product units trend", "variant comparison", "top products", "top sellers")
     elif wants_procurement:
         terms = ("receiving progress", "receiving lifecycle", "receiving activity", "purchase-order receiving")
     elif wants_staff:
@@ -941,13 +1006,22 @@ def _insight_comparison_value(item: dict[str, Any], *keys: str) -> float:
     return 0.0
 
 
-def _latest_insight_follow_up_answer(user_text: str, history: Any) -> str | None:
+def _latest_insight_follow_up_answer(
+    user_text: str,
+    history: Any,
+    *,
+    memory: ContextMemory | None = None,
+) -> str | None:
     text = _normalize_user_text(user_text)
     if not text:
+        return None
+    if _is_simple_greeting_query(text):
         return None
     if _is_new_scoped_insight_request(text):
         return None
     payload = _select_history_insight_payload(user_text, history)
+    if not payload and memory is not None and isinstance(memory.analysis, dict):
+        payload = memory.analysis
     if not payload:
         return None
 
@@ -995,49 +1069,44 @@ def _latest_insight_follow_up_answer(user_text: str, history: Any) -> str | None
 
     comparison_rows = _insight_comparison_rows(payload)
     if len(comparison_rows) >= 2:
-        if any(phrase in text for phrase in ("revenue", "sales total", "generated more", "made more", "led")):
-            ranked = sorted(
-                comparison_rows,
-                key=lambda item: _insight_comparison_value(
-                    item,
-                    "sales_total",
-                    "total_sales",
-                    "total_revenue",
-                    "gross_sales",
-                    "revenue",
-                    "sales",
-                    "amount",
-                    "value",
-                ),
-                reverse=True,
-            )
-            leader, runner = ranked[0], ranked[1]
-            leader_value = _insight_comparison_value(
-                leader,
-                "sales_total",
-                "total_sales",
-                "total_revenue",
-                "gross_sales",
-                "revenue",
-                "sales",
-                "amount",
-                "value",
-            )
-            runner_value = _insight_comparison_value(
-                runner,
-                "sales_total",
-                "total_sales",
-                "total_revenue",
-                "gross_sales",
-                "revenue",
-                "sales",
-                "amount",
-                "value",
-            )
+        value_keys = (
+            "sales_total",
+            "total_sales",
+            "total_revenue",
+            "gross_sales",
+            "revenue",
+            "sales",
+            "amount",
+            "value",
+        )
+        ordered = sorted(comparison_rows, key=lambda item: _insight_comparison_value(item, *value_keys), reverse=True)
+        leader, runner = ordered[0], ordered[1]
+        leader_value = _insight_comparison_value(leader, *value_keys)
+        runner_value = _insight_comparison_value(runner, *value_keys)
+        if any(phrase in text for phrase in ("revenue", "sales total", "generated more", "made more", "led", "highest", "best", "top")):
             return (
                 f"From the comparison{timeframe_suffix}, {_insight_comparison_name(leader)} led revenue with "
                 f"{_format_plain_money(leader_value, payload)}. It was ahead of {_insight_comparison_name(runner)} by "
                 f"{_format_plain_money(leader_value - runner_value, payload)}."
+            )
+        if any(phrase in text for phrase in ("far behind", "lagging", "lowest revenue", "least revenue", "underperforming", "worst", "behind")):
+            laggard = min(comparison_rows, key=lambda item: _insight_comparison_value(item, *value_keys), default=runner)
+            laggard_value = _insight_comparison_value(laggard, *value_keys)
+            return (
+                f"From the comparison{timeframe_suffix}, {_insight_comparison_name(laggard)} was farthest behind with "
+                f"{_format_plain_money(laggard_value, payload)}, trailing {_insight_comparison_name(leader)} by "
+                f"{_format_plain_money(leader_value - laggard_value, payload)}."
+            )
+        if any(phrase in text for phrase in ("difference", "gap", "spread", "compare", "comparison", "versus", "vs")):
+            return (
+                f"From the comparison{timeframe_suffix}, {_insight_comparison_name(leader)} led with "
+                f"{_format_plain_money(leader_value, payload)} and {_insight_comparison_name(runner)} followed with "
+                f"{_format_plain_money(runner_value, payload)}. The gap was {_format_plain_money(leader_value - runner_value, payload)}."
+            )
+        if any(phrase in text for phrase in ("trend", "change", "moving", "movement", "progress")):
+            return (
+                f"From the comparison{timeframe_suffix}, {_insight_comparison_name(leader)} and {_insight_comparison_name(runner)} show the clearest split in the saved result. "
+                "Ask for revenue, units, gap, or laggard if you want the comparison narrowed further."
             )
         if any(phrase in text for phrase in ("unit", "quantity", "sold more", "volume")):
             ranked = sorted(
@@ -1111,10 +1180,7 @@ def _latest_insight_follow_up_answer(user_text: str, history: Any) -> str | None
             "outlet",
         )
     ):
-        table = _insight_widget_by_title(payload, "location")
-        rows = table.get("rows") if isinstance(table, dict) else []
-        if not rows and isinstance(table, dict):
-            rows = table.get("data") if isinstance(table.get("data"), list) else []
+        rows = _insight_location_rows(payload)
         if isinstance(rows, list) and rows:
             valid_rows = [row for row in rows if isinstance(row, dict)]
             value_keys = ("sales", "value", "total_sales", "revenue", "amount", "total_revenue")
@@ -1350,20 +1416,82 @@ def _canonical_host_domain_agent(name: str) -> str:
 
 SIMPLE_GREETING_QUERIES: set[str] = {
     "hello",
+    "hello again",
+    "hello are you there",
     "hello there",
     "hey",
+    "hey are you there",
     "hey there",
     "hi",
+    "hi are you there",
     "hi there",
     "good morning",
     "good afternoon",
     "good evening",
 }
 
+SIMPLE_STATUS_CHECK_QUERIES: set[str] = {
+    "are you listening",
+    "are you still there",
+    "are you there",
+    "can you hear me",
+    "can you hear me now",
+    "did you get my message",
+    "is my message delivered",
+    "is this working",
+    "still there",
+    "what is going on",
+    "whats going on",
+    "you there",
+}
+
+CONVERSATIONAL_SHORT_CIRCUIT_BLOCKERS: tuple[str, ...] = (
+    "add",
+    "analyse",
+    "analysis",
+    "analyze",
+    "audit",
+    "barcode",
+    "business",
+    "cashier",
+    "compare",
+    "create",
+    "delete",
+    "import",
+    "inventory",
+    "location",
+    "order",
+    "orders",
+    "po",
+    "pos",
+    "product",
+    "products",
+    "purchase",
+    "report",
+    "revenue",
+    "sales",
+    "staff",
+    "stock",
+    "subscription",
+    "supplier",
+    "update",
+    "variant",
+    "variants",
+)
+
 
 def _is_simple_greeting_query(value: str) -> bool:
     text = _normalize_user_text(value)
-    return text in SIMPLE_GREETING_QUERIES
+    if text in SIMPLE_GREETING_QUERIES or text in SIMPLE_STATUS_CHECK_QUERIES:
+        return True
+    words = text.split()
+    if len(words) > 8:
+        return False
+    if any(re.search(rf"\b{re.escape(term)}\b", text) for term in CONVERSATIONAL_SHORT_CIRCUIT_BLOCKERS):
+        return False
+    if words and words[0] in {"hello", "hey", "hi"}:
+        return True
+    return "are you there" in text or "can you hear me" in text
 
 
 def _agent_intro_text(agent_name: str | None) -> str:
@@ -1389,7 +1517,6 @@ HOST_DOMAIN_AREA_PICKERS: dict[str, dict[str, Any]] = {
         "title": "Inventory Management",
         "description": "Choose the inventory area you want help with. You can also type a specific inventory question.",
         "options": [
-            {"value": "inventory_setup", "label": "Set Up Inventory"},
             {"value": "inventory_visibility", "label": "Stock and Warehouse Visibility"},
             {"value": "inventory_procurement", "label": "Purchase Orders and Receiving"},
             {"value": "inventory_fulfillment", "label": "Transfers, Adjustments, and Fulfillment"},
@@ -1474,22 +1601,18 @@ HOST_DOMAIN_AREA_REQUESTS: dict[str, dict[str, str]] = {
 
 HOST_DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
     "onboarding": (
+        "product import",
+        "import products",
+        "catalog import",
+        "global catalog",
+        "curated catalog",
+        "product onboarding",
         "onboarding",
         "onboard",
-        "inventory onboarding",
-        "guided setup",
-        "initial setup",
-        "first-time setup",
-        "first time setup",
-        "get started",
-        "setup inventory",
-        "set up inventory",
-        "setup my inventory",
-        "set up my inventory",
-        "configure my inventory",
-        "setup stock locations",
-        "set up stock locations",
-        "product onboarding",
+        "select all products",
+        "barcode selection",
+        "brand selection",
+        "category selection",
     ),
     "product": (
         "product",
@@ -1843,8 +1966,8 @@ def _host_domain_area_follow_up_request(payload: dict[str, Any], response: dict[
 def _host_follow_up_request_for_agent(agent_name: str) -> str:
     if agent_name == "onboarding":
         return (
-            "Start a guided product import flow. Ask the user what catalog they want to import first, "
-            "then collect the required details step by step using structured interactions."
+            "Start a guided product import flow. Ask the user which product categories or brands they want to import first, "
+            "then browse global catalog products in pages, keep already-imported products filtered out, and collect selection step by step using structured interactions."
         )
     label = _friendly_agent_label(agent_name)
     return (
@@ -2252,7 +2375,7 @@ def _is_onboarding_payload(payload: dict[str, Any] | None, *, stage: str) -> boo
 
 def _onboarding_scope_picker_arguments(
     *,
-    description: str = "Choose the product import area you want to complete first. I will guide you step by step.",
+    description: str = "Choose the product import flow you want to start. I will guide you step by step.",
 ) -> dict[str, Any]:
     return {
         "title": "Start Product Import",
@@ -2383,7 +2506,8 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
             },
         ]
 
-    steps = [
+    # Any non-product import setup request now falls back to the same product-import workflow.
+    return [
         {
             "id": "categories",
             "title": "Choose Product Categories",
@@ -2467,7 +2591,6 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
             ],
         },
     ]
-    return steps
 
 
 def _onboarding_wizard_arguments(scope: str) -> dict[str, Any]:
@@ -2542,21 +2665,11 @@ def _infer_onboarding_scope_from_text(text: str) -> str | None:
     normalized = _normalize_user_text(text)
     if not normalized:
         return None
-    mentions_setup = "onboarding" in normalized or "set up" in normalized or "setup" in normalized
-    has_location = any(token in normalized for token in ("warehouse", "location", "store", "backroom", "fulfillment"))
-    has_category = "categor" in normalized
-    has_inventory = "inventory" in normalized or "stock ledger" in normalized
     has_product = "product" in normalized or "sku" in normalized
     has_import_intent = any(token in normalized for token in ("import", "catalog", "barcode", "variant", "variants", "select all", "global products"))
-    if has_import_intent or has_product:
-        return "product_onboarding"
-    if has_location:
-        return "stock_locations"
-    if has_category:
-        return "product_onboarding"
-    if has_inventory:
-        return "product_onboarding"
-    if mentions_setup:
+    mentions_product_import = "product import" in normalized or "catalog import" in normalized
+    mentions_onboarding = "onboarding" in normalized or "onboard" in normalized
+    if has_import_intent or has_product or mentions_product_import or mentions_onboarding:
         return "product_onboarding"
     return None
 
@@ -6309,7 +6422,10 @@ def _build_pos_top_sellers_insight(payload: dict[str, Any]) -> dict[str, Any]:
                 },
                 {
                     "title": "Volume tracked",
-                    "detail": f"{round(total_quantity, 2)} units contributed {round(total_sales, 2)} in sales across the ranked set.",
+                    "detail": (
+                        f"{_format_plain_number(total_quantity)} units contributed "
+                        f"{_format_plain_money(total_sales, payload)} in sales across the ranked set."
+                    ),
                 },
             ]
             if ranked_items
@@ -7089,34 +7205,12 @@ async def _enrich_top_seller_results_with_variant_context(
             if value and value not in ordered:
                 ordered.append(value)
 
-        def _text_variants(raw_value: str) -> list[str]:
-            normalized = re.sub(r"[^a-z0-9]+", " ", raw_value.lower()).strip()
-            normalized = re.sub(r"\b\d+(?:\.\d+)?\s*(?:ml|cl|l|g|kg|ct|pcs|pc|oz|lb|pack)\b", " ", normalized).strip()
-            normalized = re.sub(r"\s+", " ", normalized).strip()
-            if not normalized:
-                return []
-            tokens = normalized.split()
-            variants = [normalized]
-            if len(tokens) >= 2:
-                variants.append(" ".join(tokens[:2]))
-                variants.append(" ".join(tokens[-2:]))
-            if len(tokens) >= 3:
-                variants.append(" ".join(tokens[:3]))
-                variants.append(" ".join(tokens[-3:]))
-            if len(tokens) >= 4:
-                variants.append(" ".join(tokens[:4]))
-            return variants
+        identifier = str(item.get("barcode_snapshot") or "").strip() or str(item.get("sku_snapshot") or "").strip()
+        display_name = str(item.get("variant_name") or "").strip() or str(item.get("product_name") or "").strip()
 
-        _push(str(item.get("barcode_snapshot") or ""))
-        _push(str(item.get("sku_snapshot") or ""))
-        for seed in (
-            str(item.get("variant_name") or ""),
-            str(item.get("product_name") or ""),
-        ):
-            _push(seed)
-            for variant in _text_variants(seed):
-                _push(variant)
-        return ordered
+        _push(display_name)
+        _push(identifier)
+        return ordered[:2]
 
     async def _lookup_variant(query: str) -> dict[str, Any] | None:
         try:
@@ -7134,11 +7228,17 @@ async def _enrich_top_seller_results_with_variant_context(
     seed_items = [item for item in results[:limit] if isinstance(item, dict)]
     lookup_tasks: dict[str, asyncio.Task[dict[str, Any] | None]] = {}
 
+    def _lookup_cache_key(query: str) -> str:
+        return re.sub(r"\s+", " ", str(query or "").strip().lower())
+
     async def _lookup_cached(query: str) -> dict[str, Any] | None:
-        task = lookup_tasks.get(query)
+        cache_key = _lookup_cache_key(query)
+        if not cache_key:
+            return None
+        task = lookup_tasks.get(cache_key)
         if task is None:
             task = asyncio.create_task(_lookup_variant(query))
-            lookup_tasks[query] = task
+            lookup_tasks[cache_key] = task
         return await task
 
     async def _enrich_item(raw_item: dict[str, Any]) -> dict[str, Any]:
@@ -11938,24 +12038,34 @@ def _select_router_specialist_agent(
 
 
 def _select_router_handoff_agent(router_agent_name: str, query: str, agents: list[dict[str, Any]]) -> str | None:
-    available_names = _available_agent_names(agents)
-    selected_specialist = _select_router_specialist_agent(router_agent_name, query, agents)
+    # Router/domain agents are downstream of the host. They must never bounce a
+    # delegated task back to host, or a single request can recurse until timeout.
+    route_agents = [
+        agent
+        for agent in agents
+        if _canonical_host_domain_agent(str(agent.get("name") or "")) != "host"
+    ]
+    if agents and not route_agents:
+        return None
+
+    available_names = _available_agent_names(route_agents)
+    selected_specialist = _select_router_specialist_agent(router_agent_name, query, route_agents)
     if selected_specialist:
         return selected_specialist
     inferred_domain = _infer_domain_agent_name(query)
     if inferred_domain and inferred_domain != router_agent_name:
         handoff_preferences: dict[str, tuple[str, ...]] = {
-            "onboarding": ("onboarding", "inventory", "host"),
-            "product": ("product", "host"),
-            "inventory": ("inventory", "host"),
-            "pos": ("pos", "host"),
-            "users": ("users", "host"),
+            "onboarding": ("onboarding", "inventory"),
+            "product": ("product",),
+            "inventory": ("inventory",),
+            "pos": ("pos",),
+            "users": ("users",),
         }
-        for candidate in handoff_preferences.get(inferred_domain, ("host", inferred_domain)):
+        for candidate in handoff_preferences.get(inferred_domain, (inferred_domain,)):
             if not available_names or candidate in available_names:
                 return candidate
         return None
-    return _select_router_delegation_agent(query, agents)
+    return _select_router_delegation_agent(query, route_agents)
 
 
 def _coerce_delegated_response(
@@ -13194,12 +13304,13 @@ def make_langgraph_chat_processor_from_env(
             summary=existing.summary if existing else None,
             profile=existing.profile if existing else None,
             workflow_state=workflow_state if isinstance(workflow_state, dict) and workflow_state else None,
+            analysis=existing.analysis if existing and isinstance(existing.analysis, dict) else None,
             updated_at=existing.updated_at if existing else None,
         )
         await _save_memory(context_id=context_id, metadata=metadata, memory=memory)
 
     def _system_prompt_with_memory(*, base: str, memory: ContextMemory | None) -> str:
-        if memory is None or (not memory.summary and not memory.profile):
+        if memory is None or (not memory.summary and not memory.profile and not memory.analysis):
             return base
         blocks: list[str] = []
         if base:
@@ -13208,6 +13319,8 @@ def make_langgraph_chat_processor_from_env(
             blocks.append(f"Session summary:\n{memory.summary}".strip())
         if memory.profile:
             blocks.append("Session profile (JSON):\n" + json.dumps(memory.profile, ensure_ascii=False))
+        if memory.analysis:
+            blocks.append("Last structured analysis (JSON):\n" + json.dumps(memory.analysis, ensure_ascii=False))
         return "\n\n".join([b for b in blocks if b]).strip()
 
     async def _maybe_update_memory(
@@ -13219,6 +13332,7 @@ def make_langgraph_chat_processor_from_env(
         history: list[dict[str, Any]] | None,
         user_text: str,
         assistant_text: str,
+        response_parts: list[Any] | None = None,
     ) -> None:
         if memory_store is None:
             return
@@ -13292,10 +13406,22 @@ def make_langgraph_chat_processor_from_env(
 
         summary = obj.get("summary")
         profile = obj.get("profile")
+        analysis_payload = None
+        if response_parts:
+            try:
+                analysis_payload = _interaction_payload_from_parts(response_parts)
+            except Exception:
+                analysis_payload = None
+            if not (isinstance(analysis_payload, dict) and str(analysis_payload.get("kind") or "").strip() == "insight_response"):
+                analysis_payload = existing.analysis if existing and isinstance(existing.analysis, dict) else None
+        else:
+            analysis_payload = existing.analysis if existing and isinstance(existing.analysis, dict) else None
+
         new_memory = ContextMemory(
             summary=str(summary).strip() if isinstance(summary, str) and summary.strip() else None,
             profile=profile if isinstance(profile, dict) and profile else None,
             workflow_state=existing.workflow_state if existing and isinstance(existing.workflow_state, dict) else None,
+            analysis=analysis_payload if isinstance(analysis_payload, dict) else None,
         )
         await _save_memory(context_id=context_id, metadata=metadata, memory=new_memory)
 
@@ -13449,10 +13575,11 @@ def make_langgraph_chat_processor_from_env(
                     existing=mem,
                     user_text=user_text_for_memory,
                     assistant_text=_parts_to_text(response_parts),
+                    response_parts=response_parts,
                     history=history if isinstance(history, list) else None,
                 )
                 return
-            follow_up_answer = _latest_insight_follow_up_answer(user_text_for_memory, history)
+            follow_up_answer = _latest_insight_follow_up_answer(user_text_for_memory, history, memory=mem)
             if follow_up_answer:
                 response_parts = [TextPart(text=follow_up_answer)]
                 yield Artifact(name="result", parts=response_parts)
@@ -13472,6 +13599,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=follow_up_answer,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -13504,6 +13632,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -13545,6 +13674,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -13598,6 +13728,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -13633,6 +13764,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -13668,6 +13800,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -13709,6 +13842,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -13919,6 +14053,7 @@ def make_langgraph_chat_processor_from_env(
                 history=history if isinstance(history, list) else None,
                 user_text=user_text_for_memory,
                 assistant_text=response_text,
+                response_parts=response_parts,
             )
             return
 
@@ -13958,6 +14093,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14024,6 +14160,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14048,6 +14185,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14128,6 +14266,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14150,6 +14289,7 @@ def make_langgraph_chat_processor_from_env(
                 history=history if isinstance(history, list) else None,
                 user_text=user_text_for_memory,
                 assistant_text=response_text,
+                response_parts=response_parts,
             )
             return
 
@@ -14181,6 +14321,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14238,6 +14379,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14307,6 +14449,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14331,6 +14474,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14406,6 +14550,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14429,6 +14574,7 @@ def make_langgraph_chat_processor_from_env(
                 history=history if isinstance(history, list) else None,
                 user_text=user_text_for_memory,
                 assistant_text=response_text,
+                response_parts=response_parts,
             )
             return
 
@@ -14492,6 +14638,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14516,6 +14663,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14578,6 +14726,7 @@ def make_langgraph_chat_processor_from_env(
                 history=history if isinstance(history, list) else None,
                 user_text=user_text_for_memory,
                 assistant_text=response_text,
+                response_parts=response_parts,
             )
             return
 
@@ -14629,6 +14778,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -14653,6 +14803,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -14715,6 +14866,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14772,6 +14924,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14796,6 +14949,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -14858,6 +15012,7 @@ def make_langgraph_chat_processor_from_env(
                 history=history if isinstance(history, list) else None,
                 user_text=user_text_for_memory,
                 assistant_text=response_text,
+                response_parts=response_parts,
             )
             return
 
@@ -14917,6 +15072,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -14941,6 +15097,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -15019,6 +15176,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -15042,6 +15200,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -15131,6 +15290,7 @@ def make_langgraph_chat_processor_from_env(
                             history=history if isinstance(history, list) else None,
                             user_text=user_text_for_memory,
                             assistant_text=response_text,
+                            response_parts=response_parts,
                         )
                         return
 
@@ -15153,6 +15313,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -15175,6 +15336,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -15219,6 +15381,7 @@ def make_langgraph_chat_processor_from_env(
                             history=history if isinstance(history, list) else None,
                             user_text=user_text_for_memory,
                             assistant_text=response_text,
+                            response_parts=response_parts,
                         )
                         return
 
@@ -15241,6 +15404,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -15337,6 +15501,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -15440,6 +15605,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -15554,6 +15720,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -15673,6 +15840,7 @@ def make_langgraph_chat_processor_from_env(
                                 history=history if isinstance(history, list) else None,
                                 user_text=user_text_for_memory,
                                 assistant_text=response_text,
+                                response_parts=response_parts,
                             )
                             return
 
@@ -15758,6 +15926,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -15807,6 +15976,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -15834,6 +16004,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -15873,7 +16044,7 @@ def make_langgraph_chat_processor_from_env(
                     direct_scope or "product_onboarding",
                     user_text_for_memory or "",
                 )
-                if direct_scope and direct_prefill and "create_wizard_flow" in tool_names:
+                if direct_scope == "product_onboarding" and "create_wizard_flow" in tool_names:
                     company_context = await _maybe_active_company_context()
                     try:
                         interaction_output = await tool_executor.call_tool(
@@ -15891,18 +16062,19 @@ def make_langgraph_chat_processor_from_env(
                             tool_executor=tool_executor,
                             tool_ctx=tool_ctx,
                         )
-                        existing_responses = _build_onboarding_existing_responses(
-                            direct_scope,
-                            wizard_payload=interaction_output,
-                            prefill_data=direct_prefill,
-                        )
-                        existing_responses = _normalize_onboarding_existing_responses(
-                            direct_scope,
-                            wizard_payload=interaction_output,
-                            existing_responses=existing_responses,
-                        )
-                        if existing_responses:
-                            interaction_output["existing_responses"] = existing_responses
+                        if direct_prefill:
+                            existing_responses = _build_onboarding_existing_responses(
+                                direct_scope,
+                                wizard_payload=interaction_output,
+                                prefill_data=direct_prefill,
+                            )
+                            existing_responses = _normalize_onboarding_existing_responses(
+                                direct_scope,
+                                wizard_payload=interaction_output,
+                                existing_responses=existing_responses,
+                            )
+                            if existing_responses:
+                                interaction_output["existing_responses"] = existing_responses
                         interaction_output = _with_interaction_metadata(
                             interaction_output,
                             workflow="product_import",
@@ -15910,8 +16082,9 @@ def make_langgraph_chat_processor_from_env(
                             onboarding_scope=direct_scope,
                         )
                         interaction_output["description"] = (
-                            "I prefilled this setup from your message. Review it, correct anything that is off, "
-                            "and complete any remaining fields before I create anything."
+                            "I started the product import workflow. Choose categories and brands first, then review the catalog pages and import the products you want."
+                            if not direct_prefill
+                            else "I prefilled this product import flow from your message. Review it, correct anything that is off, and complete any remaining fields before I create anything."
                         )
                         workflow_state = {
                             "workflow": "product_import",
@@ -15942,15 +16115,15 @@ def make_langgraph_chat_processor_from_env(
                         return
 
                 company_context = await _maybe_active_company_context()
-                description = "Choose the import area you want to complete first. I will guide you step by step."
+                description = "Choose the import flow you want to start. I will guide you step by step."
                 if isinstance(company_context, dict):
                     company_name = str(company_context.get("name") or "").strip()
                     if company_name:
                         description = f"Current company: {company_name}\n\n{description}"
                 try:
                     interaction_output = await tool_executor.call_tool(
-                        name="create_multiple_choice",
-                        arguments=_onboarding_scope_picker_arguments(description=description),
+                        name="create_wizard_flow",
+                        arguments=_onboarding_wizard_arguments("product_onboarding"),
                         ctx=tool_ctx,
                     )
                 except Exception:
@@ -15960,12 +16133,15 @@ def make_langgraph_chat_processor_from_env(
                     interaction_output = _with_interaction_metadata(
                         interaction_output,
                         workflow="product_import",
-                        workflow_stage="scope_picker",
+                        workflow_stage="wizard",
+                        onboarding_scope="product_onboarding",
                     )
+                    interaction_output["description"] = description + "\n\nStart by choosing product categories and brands."
                     workflow_state = {
                         "workflow": "product_import",
-                        "status": "awaiting_scope",
-                        "stage": "scope_picker",
+                        "status": "collecting",
+                        "stage": "wizard",
+                        "scope": "product_onboarding",
                         "pending_interaction": interaction_output,
                     }
                     if company_context:
@@ -16115,6 +16291,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -16153,6 +16330,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -16227,6 +16405,7 @@ def make_langgraph_chat_processor_from_env(
                                         history=history if isinstance(history, list) else None,
                                         user_text=user_text_for_memory,
                                         assistant_text=response_text,
+                                        response_parts=response_parts,
                                     )
                                     return
 
@@ -16273,6 +16452,7 @@ def make_langgraph_chat_processor_from_env(
                                 history=history if isinstance(history, list) else None,
                                 user_text=user_text_for_memory,
                                 assistant_text=response_text,
+                                response_parts=response_parts,
                             )
                             return
                     action = None
@@ -16313,6 +16493,7 @@ def make_langgraph_chat_processor_from_env(
                                 history=history if isinstance(history, list) else None,
                                 user_text=user_text_for_memory,
                                 assistant_text=response_text,
+                                response_parts=response_parts,
                             )
                             return
                     action = _pos_admin_action_from_text(user_text_for_memory)
@@ -16396,6 +16577,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
                 if action:
@@ -16556,6 +16738,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -16580,6 +16763,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -16647,6 +16831,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -16670,6 +16855,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -16710,6 +16896,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -16765,6 +16952,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -16799,6 +16987,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -16849,6 +17038,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -16873,6 +17063,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -16940,6 +17131,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
 
@@ -16963,6 +17155,7 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
                 )
                 return
 
@@ -17057,6 +17250,7 @@ def make_langgraph_chat_processor_from_env(
                         history=history if isinstance(history, list) else None,
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
+                        response_parts=response_parts,
                     )
                     return
                 delegated_output = next(
@@ -17206,6 +17400,7 @@ def make_langgraph_chat_processor_from_env(
             history=history if isinstance(history, list) else None,
             user_text=user_text_for_memory,
             assistant_text=response_text,
+            response_parts=response_parts,
         )
 
     return _proc

@@ -106,6 +106,17 @@ def create_gateway_app(config: GatewayConfig):
         settings=app_settings,
     )
     agent_control_plane.ensure_seeded()
+    warm_ai_setup_profile_ids = _parse_csv_env("KA2A_WARM_WORKSPACE_AI_SETUP_PROFILE_IDS")
+    if warm_ai_setup_profile_ids:
+        warm_result = agent_control_plane.warm_workspace_ai_runtime_setup_cache(profile_ids=warm_ai_setup_profile_ids)
+        _LOGGER.info(
+            "warmed workspace AI runtime setup cache",
+            extra={
+                "profile_count": len(warm_ai_setup_profile_ids),
+                "warmed": warm_result.get("warmed", 0),
+                "failed": warm_result.get("failed", 0),
+            },
+        )
     chat_store = build_conversation_store(app_settings)
 
     @asynccontextmanager
