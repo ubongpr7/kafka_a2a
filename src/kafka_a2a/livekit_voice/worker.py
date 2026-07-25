@@ -829,6 +829,28 @@ _VOICE_REPEAT_PHRASES = (
     "i didn't catch",
 )
 
+_VOICE_STATUS_REQUEST_PHRASES = (
+    "any update",
+    "are you done",
+    "are you still checking",
+    "give me an update",
+    "how far",
+    "how is it going",
+    "is it done",
+    "status of the job",
+    "status of the task",
+    "still checking",
+    "still working",
+    "what happened to the task",
+    "what is going on",
+    "what is happening",
+    "what is the status",
+    "what's going on",
+    "what's happening",
+    "what's the status",
+    "where are we on that",
+)
+
 
 def _normalize_voice_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
@@ -866,6 +888,13 @@ def _voice_repeat_requested(transcript: str) -> bool:
     if not normalized:
         return False
     return any(phrase in normalized for phrase in _VOICE_REPEAT_PHRASES)
+
+
+def _voice_status_requested(transcript: str) -> bool:
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return False
+    return any(phrase in normalized for phrase in _VOICE_STATUS_REQUEST_PHRASES)
 
 
 _VOICE_TIME_RANGE_HINTS = (
@@ -1309,6 +1338,9 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 ),
             )
             self._client_started = False
+            self._last_progress_update = ""
+            self._last_progress_spoken_at = 0.0
+            self._last_completed_result = ""
             super().__init__(instructions=_build_workspace_instruction(ai_setup))
 
         def _begin_shutdown(self) -> None:
@@ -1380,6 +1412,42 @@ async def _voice_entrypoint(ctx: Any) -> None:
 
         def _transcript_key(self, transcript: str) -> str:
             return _transcript_comparison_key(transcript)
+
+        def _remember_progress_update(self, text: str) -> str:
+            cleaned = _sanitize_voice_text(text, reject_generic=False)
+            if cleaned:
+                self._last_progress_update = cleaned
+            return cleaned
+
+        async def _speak_progress_update(self, text: str) -> None:
+            cleaned = self._remember_progress_update(text)
+            if not cleaned or self._closing:
+                return
+            now = time.monotonic()
+            min_interval_s = max(2.0, _env_float("KA2A_VOICE_PROGRESS_SPEAK_MIN_INTERVAL_S", 4.5))
+            if cleaned == self._last_spoken_response and now - self._last_progress_spoken_at < min_interval_s:
+                return
+            if now - self._last_progress_spoken_at < min_interval_s:
+                return
+            self._last_progress_spoken_at = now
+            self._last_spoken_response = cleaned
+            await self._say(cleaned, allow_interruptions=True)
+
+        def _status_reply(self) -> str:
+            active_delegation_task = self._active_delegation_task
+            if active_delegation_task is not None and not active_delegation_task.done():
+                if self._last_progress_update:
+                    return self._last_progress_update
+                return "I’m still checking that with the workspace agent now."
+            if self._pending_clarification is not None:
+                pending_question = str(self._pending_clarification.get("question") or "").strip()
+                if pending_question:
+                    return pending_question
+            if self._last_completed_result:
+                return "The last task is complete. The result is already in your workspace chat."
+            if self._last_spoken_response:
+                return self._last_spoken_response
+            return "I’m ready for your next request."
 
         def _mark_transcript_for_processing(self, transcript: str, *, source: str) -> bool:
             key = self._transcript_key(transcript)
@@ -1536,6 +1604,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 "I’m checking that with the workspace agent now.",
                 payload={"syncChat": True, "turnId": turn_id},
             )
+            self._remember_progress_update("I’m checking that with the workspace agent now.")
             user_message = Message(
                 role=Role.user,
                 parts=[TextPart(text=transcript)],
@@ -1565,7 +1634,9 @@ async def _voice_entrypoint(ctx: Any) -> None:
                         if isinstance(event, TaskStatusUpdateEvent):
                             interim_status_text = _sanitize_voice_text(_assistant_message_text(event.status.message))
                             if interim_status_text and not event.final:
+                                self._remember_progress_update(interim_status_text)
                                 await self._publish_voice_event("status", interim_status_text, payload={"turnId": turn_id})
+                                await self._speak_progress_update(interim_status_text)
                             status_text = _artifact_speakable_text(event)
                             if event.final and status_text:
                                 response_candidates.append(status_text)
@@ -1638,6 +1709,8 @@ async def _voice_entrypoint(ctx: Any) -> None:
                     "final_text_length": len(final_text),
                 },
             )
+            self._last_completed_result = final_text.strip()
+            self._last_progress_update = ""
             await self._publish_voice_event("result", final_text, payload={"syncChat": True, "turnId": turn_id})
             return final_text.strip()
 
@@ -1647,6 +1720,15 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 return None
             if not self._mark_transcript_for_processing(transcript, source=source):
                 return None
+            if _voice_status_requested(transcript):
+                await self._publish_visible_user_transcript(transcript)
+                status_reply = self._status_reply()
+                self._last_spoken_response = status_reply
+                if turn_ctx is not None:
+                    turn_ctx.add_message(role="assistant", content=status_reply)
+                await self._publish_voice_event("result", status_reply)
+                await self._say(status_reply, allow_interruptions=True)
+                return status_reply
             if _voice_repeat_requested(transcript):
                 await self._publish_visible_user_transcript(transcript)
                 repeat_text = self._last_spoken_response or "I do not have anything to repeat yet."
@@ -1719,6 +1801,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 acknowledgement = (
                     "I heard that. I’m sending it through the workspace chat so the full result appears there."
                 )
+                self._remember_progress_update(acknowledgement)
                 self._last_spoken_response = acknowledgement
                 if turn_ctx is not None:
                     turn_ctx.add_message(role="assistant", content=acknowledgement)
@@ -1740,6 +1823,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 return None
             if self._closing:
                 return None
+            self._last_progress_update = ""
             self._last_spoken_response = final_text
             if turn_ctx is not None:
                 turn_ctx.add_message(role="assistant", content=final_text)
