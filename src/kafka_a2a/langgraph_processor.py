@@ -2622,6 +2622,33 @@ def _onboarding_catalog_scope_picker_arguments(
     }
 
 
+def _searchable_selection_selected_ids(response: dict[str, Any] | None) -> list[str]:
+    if not isinstance(response, dict):
+        return []
+    selected_items = response.get("selected_items")
+    if not isinstance(selected_items, list):
+        return []
+    return [str(item).strip() for item in selected_items if isinstance(item, str) and str(item).strip()]
+
+
+def _searchable_selection_labels(payload: dict[str, Any] | None, response: dict[str, Any] | None) -> list[str]:
+    selected_ids = set(_searchable_selection_selected_ids(response))
+    if not selected_ids or not isinstance(payload, dict):
+        return []
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return []
+    labels: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "").strip()
+        label = str(item.get("name") or "").strip()
+        if item_id and label and item_id in selected_ids:
+            labels.append(label)
+    return labels
+
+
 def _select_options(options: list[tuple[str, str]]) -> list[dict[str, str]]:
     return [{"value": value, "label": label} for value, label in options]
 
@@ -4151,10 +4178,30 @@ async def _product_catalog_admin_dynamic_form_payload(
         tool_executor=tool_executor,
         tool_ctx=tool_ctx,
     )
+    if category_options:
+        category_field = {
+            "name": "category_ref_id",
+            "type": "select",
+            "label": "Product Category",
+            "required": False,
+            "options": category_options,
+            "placeholder": "Select a category",
+        }
+        current_category_value = _inventory_setup_prefill_option_value(category_options, prefill.get("category_name"))
+    else:
+        category_field = {
+            "name": "category_name_note",
+            "type": "text",
+            "label": "Product Category",
+            "required": False,
+            "placeholder": "No categories are available right now",
+            "description": "Category options could not be loaded. You can still continue without assigning one.",
+        }
+        current_category_value = str(prefill.get("category_name") or "").strip() or None
     common_fields = [
         {"name": "name", "type": "text", "label": "Product Name", "required": True, "placeholder": "Men's Oxford Shirt"},
         {"name": "description", "type": "textarea", "label": "Description", "required": False, "placeholder": "Short product description"},
-        {"name": "category_ref_id", "type": "select", "label": "Product Category", "required": False, "options": category_options, "placeholder": "Select a category"},
+        category_field,
         {"name": "base_price", "type": "text", "label": "Base Price", "required": False, "placeholder": "25000"},
         {"name": "quick_sale", "type": "boolean", "label": "Quick Sale", "required": False},
         {"name": "pos_category", "type": "text", "label": "POS Category", "required": False, "placeholder": "Clothing"},
@@ -4162,10 +4209,13 @@ async def _product_catalog_admin_dynamic_form_payload(
     current_values = {
         "name": prefill.get("name"),
         "description": prefill.get("description"),
-        "category_ref_id": _inventory_setup_prefill_option_value(category_options, prefill.get("category_name")),
         "base_price": prefill.get("base_price"),
         "quick_sale": prefill.get("quick_sale"),
     }
+    if category_options:
+        current_values["category_ref_id"] = current_category_value
+    else:
+        current_values["category_name_note"] = current_category_value
     if action == "update_product":
         product_options, matched_product_id = await _ensure_lookup_option_for_name(
             "product.search_products",
@@ -15678,6 +15728,312 @@ def make_langgraph_chat_processor_from_env(
                 active_company_context = _extract_company_context(output)
                 return active_company_context
 
+            async def _build_product_import_catalog_step(
+                *,
+                catalog_scope: str,
+                selected_category_names: list[str] | None = None,
+                selected_brand_names: list[str] | None = None,
+                page: int = 1,
+                imported_count: int = 0,
+            ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+                company_context = await _maybe_active_company_context()
+                normalized_categories = [
+                    str(value).strip()
+                    for value in (selected_category_names or [])
+                    if str(value or "").strip()
+                ]
+                normalized_brands = [
+                    str(value).strip()
+                    for value in (selected_brand_names or [])
+                    if str(value or "").strip()
+                ]
+
+                base_state: dict[str, Any] = {
+                    "workflow": "product_import",
+                    "status": "collecting",
+                    "scope": "product_onboarding",
+                    "catalog_scope": catalog_scope,
+                    "selected_category_names": normalized_categories,
+                    "selected_brand_names": normalized_brands,
+                    "page": max(1, int(page)),
+                    "imported_count": max(0, int(imported_count)),
+                }
+                if company_context:
+                    base_state["company_context"] = company_context
+
+                if catalog_scope in {"category", "both"} and not normalized_categories:
+                    if "product.list_global_catalog_categories" not in tool_names:
+                        return None, None, "Global catalog categories are not available right now."
+                    try:
+                        output = await tool_executor.call_tool(
+                            name="product.list_global_catalog_categories",
+                            arguments={"limit": 100},
+                            ctx=tool_ctx,
+                        )
+                    except Exception as exc:
+                        return None, None, str(exc).strip() or "I couldn't load global catalog categories right now."
+                    rows = output if isinstance(output, list) else []
+                    if not rows:
+                        return None, None, "I couldn't find any global catalog categories to browse right now."
+                    items = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        name = str(row.get("name") or "").strip()
+                        if not name:
+                            continue
+                        description_parts = []
+                        product_count = row.get("product_count")
+                        imported_row_count = row.get("imported_count")
+                        if product_count not in (None, ""):
+                            description_parts.append(f"{product_count} products")
+                        if imported_row_count not in (None, ""):
+                            description_parts.append(f"{imported_row_count} already imported")
+                        items.append(
+                            {
+                                "id": name,
+                                "name": name,
+                                "description": " | ".join(description_parts),
+                                "category": "Global Category",
+                            }
+                        )
+                    if not items:
+                        return None, None, "I couldn't find any global catalog categories to browse right now."
+                    payload = _with_interaction_metadata(
+                        {
+                            "interaction_type": "searchable_selection",
+                            "title": "Choose Product Categories",
+                            "description": "Select one or more global catalog categories to browse first.",
+                            "items": items,
+                            "search_fields": ["name", "description", "category"],
+                            "multiple": True,
+                            "max_selections": 30,
+                            "allow_additional_input": False,
+                        },
+                        workflow="product_import",
+                        workflow_stage="category_selection",
+                        onboarding_scope="product_onboarding",
+                        catalog_scope=catalog_scope,
+                        selected_category_names=normalized_categories,
+                        selected_brand_names=normalized_brands,
+                        page=1,
+                    )
+                    workflow_state = dict(base_state)
+                    workflow_state["stage"] = "category_selection"
+                    workflow_state["pending_interaction"] = payload
+                    return payload, workflow_state, None
+
+                if catalog_scope in {"brand", "both"} and not normalized_brands:
+                    if "product.list_global_catalog_brands" not in tool_names:
+                        if catalog_scope == "both" and normalized_categories:
+                            return await _build_product_import_catalog_step(
+                                catalog_scope="category",
+                                selected_category_names=normalized_categories,
+                                selected_brand_names=[],
+                                page=page,
+                                imported_count=imported_count,
+                            )
+                        return None, None, "Global catalog brands are not available right now."
+                    try:
+                        output = await tool_executor.call_tool(
+                            name="product.list_global_catalog_brands",
+                            arguments={"limit": 100},
+                            ctx=tool_ctx,
+                        )
+                    except Exception as exc:
+                        return None, None, str(exc).strip() or "I couldn't load global catalog brands right now."
+                    rows = output if isinstance(output, list) else []
+                    if not rows:
+                        return None, None, "I couldn't find any global catalog brands to browse right now."
+                    items = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        name = str(row.get("name") or "").strip()
+                        if not name:
+                            continue
+                        description_parts = []
+                        product_count = row.get("product_count")
+                        imported_row_count = row.get("imported_count")
+                        if product_count not in (None, ""):
+                            description_parts.append(f"{product_count} products")
+                        if imported_row_count not in (None, ""):
+                            description_parts.append(f"{imported_row_count} already imported")
+                        items.append(
+                            {
+                                "id": name,
+                                "name": name,
+                                "description": " | ".join(description_parts),
+                                "category": "Global Brand",
+                            }
+                        )
+                    if not items:
+                        return None, None, "I couldn't find any global catalog brands to browse right now."
+                    payload = _with_interaction_metadata(
+                        {
+                            "interaction_type": "searchable_selection",
+                            "title": "Choose Brands",
+                            "description": (
+                                "Select one or more brands to narrow the global catalog."
+                                if catalog_scope == "both"
+                                else "Select one or more brands to browse from the global catalog."
+                            ),
+                            "items": items,
+                            "search_fields": ["name", "description", "category"],
+                            "multiple": True,
+                            "max_selections": 30,
+                            "allow_additional_input": False,
+                        },
+                        workflow="product_import",
+                        workflow_stage="brand_selection",
+                        onboarding_scope="product_onboarding",
+                        catalog_scope=catalog_scope,
+                        selected_category_names=normalized_categories,
+                        selected_brand_names=normalized_brands,
+                        page=1,
+                    )
+                    workflow_state = dict(base_state)
+                    workflow_state["stage"] = "brand_selection"
+                    workflow_state["pending_interaction"] = payload
+                    return payload, workflow_state, None
+
+                if "product.list_global_catalog_products" not in tool_names:
+                    return None, None, "Global catalog product browsing is not available right now."
+                try:
+                    output = await tool_executor.call_tool(
+                        name="product.list_global_catalog_products",
+                        arguments={
+                            "categories": normalized_categories or None,
+                            "brands": normalized_brands or None,
+                            "page": max(1, int(page)),
+                            "page_size": 30,
+                            "exclude_imported": True,
+                        },
+                        ctx=tool_ctx,
+                    )
+                except Exception as exc:
+                    return None, None, str(exc).strip() or "I couldn't load global catalog products right now."
+                if not isinstance(output, dict):
+                    return None, None, "I couldn't load global catalog products right now."
+                rows = output.get("results")
+                if not isinstance(rows, list) or not rows:
+                    return None, None, "I couldn't find any importable global catalog products that match those filters."
+                total_pages = max(0, int(output.get("total_pages") or 0))
+                total_count = max(0, int(output.get("count") or 0))
+                items = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    product_id = str(row.get("id") or "").strip()
+                    name = str(row.get("name") or "").strip()
+                    if not product_id or not name:
+                        continue
+                    description_parts = []
+                    brand = str(row.get("brand") or "").strip()
+                    primary_barcode = str(row.get("primary_barcode") or "").strip()
+                    variant_count = row.get("variant_count")
+                    short_description = str(row.get("short_description") or "").strip()
+                    if brand:
+                        description_parts.append(f"Brand: {brand}")
+                    if primary_barcode:
+                        description_parts.append(f"Barcode: {primary_barcode}")
+                    if variant_count not in (None, ""):
+                        description_parts.append(f"{variant_count} variants")
+                    if short_description:
+                        description_parts.append(short_description)
+                    items.append(
+                        {
+                            "id": product_id,
+                            "name": name,
+                            "description": " | ".join(description_parts[:4]),
+                            "category": str(row.get("category_name") or "").strip() or "Global Catalog",
+                            "image": row.get("display_image"),
+                            "price": (
+                                f"Base {float(row.get('base_price') or 0):,.2f}"
+                                if row.get("base_price") not in (None, "")
+                                else None
+                            ),
+                        }
+                    )
+                if not items:
+                    return None, None, "I couldn't find any importable global catalog products that match those filters."
+                filter_summary_parts = []
+                if normalized_categories:
+                    filter_summary_parts.append("categories: " + ", ".join(normalized_categories[:5]))
+                if normalized_brands:
+                    filter_summary_parts.append("brands: " + ", ".join(normalized_brands[:5]))
+                filter_summary = "; ".join(filter_summary_parts) if filter_summary_parts else "all published catalog products"
+                payload = _with_interaction_metadata(
+                    {
+                        "interaction_type": "searchable_selection",
+                        "title": "Choose Products to Import",
+                        "description": (
+                            f"Page {max(1, int(output.get('page') or page))} of {total_pages or 1}. "
+                            f"Select the products you want to import from {filter_summary}."
+                        ),
+                        "items": items,
+                        "search_fields": ["name", "description", "category"],
+                        "multiple": True,
+                        "max_selections": 30,
+                        "allow_additional_input": False,
+                    },
+                    workflow="product_import",
+                    workflow_stage="product_selection",
+                    onboarding_scope="product_onboarding",
+                    catalog_scope=catalog_scope,
+                    selected_category_names=normalized_categories,
+                    selected_brand_names=normalized_brands,
+                    page=max(1, int(output.get("page") or page)),
+                    total_pages=total_pages,
+                    total_count=total_count,
+                    imported_count=max(0, int(imported_count)),
+                )
+                workflow_state = dict(base_state)
+                workflow_state.update(
+                    {
+                        "stage": "product_selection",
+                        "pending_interaction": payload,
+                        "total_pages": total_pages,
+                        "total_count": total_count,
+                    }
+                )
+                return payload, workflow_state, None
+
+            def _build_product_import_continue_payload(
+                *,
+                catalog_scope: str,
+                selected_category_names: list[str],
+                selected_brand_names: list[str],
+                page: int,
+                total_pages: int,
+                imported_count: int,
+            ) -> dict[str, Any]:
+                return _with_interaction_metadata(
+                    {
+                        "interaction_type": "multiple_choice",
+                        "title": "Continue Import",
+                        "description": (
+                            f"I imported {imported_count} product{'s' if imported_count != 1 else ''} so far. "
+                            f"You just finished page {page} of {total_pages}. Do you want to browse the next page or stop here?"
+                        ),
+                        "options": [
+                            {"value": "continue_next_page", "label": "Show Next Page"},
+                            {"value": "finish_import", "label": "Finish Import"},
+                        ],
+                        "multiple": False,
+                        "allow_input": False,
+                    },
+                    workflow="product_import",
+                    workflow_stage="page_continue",
+                    onboarding_scope="product_onboarding",
+                    catalog_scope=catalog_scope,
+                    selected_category_names=selected_category_names,
+                    selected_brand_names=selected_brand_names,
+                    page=page,
+                    total_pages=total_pages,
+                    imported_count=imported_count,
+                )
+
             async def _build_product_import_wizard(
                 *,
                 prefill_data: dict[str, Any] | None = None,
@@ -15821,16 +16177,10 @@ def make_langgraph_chat_processor_from_env(
                     return
 
                 direct_prefill["catalog_scope"] = selected_catalog_scope
-                wizard_bundle = None
-                if "create_wizard_flow" in tool_names:
-                    wizard_bundle = await _build_product_import_wizard(
-                        prefill_data=direct_prefill,
-                        description=(
-                            "I started the product import workflow. Review the selected catalog filter first, then choose categories, brands, and the products you want to import."
-                        ),
-                    )
-                if wizard_bundle is not None:
-                    interaction_output, workflow_state = wizard_bundle
+                interaction_output, workflow_state, failure_text = await _build_product_import_catalog_step(
+                    catalog_scope=selected_catalog_scope,
+                )
+                if isinstance(interaction_output, dict) and isinstance(workflow_state, dict):
                     await _save_workflow_state(
                         context_id=task.context_id,
                         metadata=metadata,
@@ -15841,6 +16191,19 @@ def make_langgraph_chat_processor_from_env(
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
                         state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
+                if failure_text:
+                    response_text = failure_text
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
                         message=Message(
                             role=Role.agent,
                             parts=response_parts,
@@ -15852,48 +16215,83 @@ def make_langgraph_chat_processor_from_env(
             if (
                 interaction_response is not None
                 and _is_onboarding_payload(last_interaction_payload, stage="scope_picker")
-                and "create_wizard_flow" in tool_names
+                and "create_multiple_choice" in tool_names
             ):
                 selected_scope = _selected_interaction_value(interaction_response) or "product_onboarding"
-                try:
-                    interaction_output = await tool_executor.call_tool(
-                        name="create_wizard_flow",
-                        arguments=_onboarding_wizard_arguments(selected_scope),
-                        ctx=tool_ctx,
-                    )
-                except Exception:
-                    interaction_output = None
-
-                if isinstance(interaction_output, dict):
-                    interaction_output = await _rewrite_relation_interaction_dict(
-                        interaction_output,
-                        tool_specs=tool_specs,
-                        tool_executor=tool_executor,
-                        tool_ctx=tool_ctx,
-                    )
-                    interaction_output = _with_interaction_metadata(
-                        interaction_output,
-                        workflow="product_import",
-                        workflow_stage="wizard",
-                        onboarding_scope=selected_scope,
-                    )
+                if selected_scope == "product_onboarding":
+                    description = "I can start the product import flow. Do you want to browse products by category, by brand, or by both?"
+                    try:
+                        interaction_output = await tool_executor.call_tool(
+                            name="create_multiple_choice",
+                            arguments=_onboarding_catalog_scope_picker_arguments(description=description),
+                            ctx=tool_ctx,
+                        )
+                    except Exception:
+                        interaction_output = None
+                    if isinstance(interaction_output, dict):
+                        interaction_output = _with_interaction_metadata(
+                            interaction_output,
+                            workflow="product_import",
+                            workflow_stage="catalog_scope_prompt",
+                            onboarding_scope="product_onboarding",
+                        )
+                        workflow_state = {
+                            "workflow": "product_import",
+                            "status": "awaiting_catalog_scope",
+                            "stage": "catalog_scope_prompt",
+                            "scope": "product_onboarding",
+                            "pending_interaction": interaction_output,
+                        }
+                        company_context = await _maybe_active_company_context()
+                        if company_context:
+                            workflow_state["company_context"] = company_context
+                        await _save_workflow_state(
+                            context_id=task.context_id,
+                            metadata=metadata,
+                            workflow_state=workflow_state,
+                        )
+                        response_text = json.dumps(interaction_output, ensure_ascii=False)
+                        response_parts = [DataPart(data=interaction_output)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
+                else:
                     workflow_state = {
                         "workflow": "product_import",
                         "status": "collecting",
                         "stage": "wizard",
                         "scope": selected_scope,
-                        "pending_interaction": interaction_output,
+                        "pending_interaction": None,
                     }
-                    company_context = await _maybe_active_company_context()
-                    if company_context:
-                        workflow_state["company_context"] = company_context
-                    await _save_workflow_state(
-                        context_id=task.context_id,
-                        metadata=metadata,
-                        workflow_state=workflow_state,
+                    response_text = "Only product import is available in this onboarding flow right now."
+                    response_parts = [TextPart(text=response_text)]
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=workflow_state)
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
                     )
-                    response_text = json.dumps(interaction_output, ensure_ascii=False)
-                    response_parts = [DataPart(data=interaction_output)]
+                    return
+
+            if (
+                interaction_response is not None
+                and _is_onboarding_payload(last_interaction_payload, stage="category_selection")
+            ):
+                selected_category_names = _searchable_selection_labels(last_interaction_payload, interaction_response)
+                if not selected_category_names:
+                    response_text = "Select at least one product category so I can browse the global catalog for you."
+                    response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
                         state=TaskState.input_required,
@@ -15904,6 +16302,269 @@ def make_langgraph_chat_processor_from_env(
                         ),
                     )
                     return
+                catalog_scope = str(last_interaction_payload.get("catalog_scope") or "category").strip() or "category"
+                selected_brand_names = (
+                    last_interaction_payload.get("selected_brand_names")
+                    if isinstance(last_interaction_payload.get("selected_brand_names"), list)
+                    else []
+                )
+                interaction_output, workflow_state, failure_text = await _build_product_import_catalog_step(
+                    catalog_scope=catalog_scope,
+                    selected_category_names=selected_category_names,
+                    selected_brand_names=selected_brand_names,
+                    page=1,
+                    imported_count=0,
+                )
+                if isinstance(interaction_output, dict) and isinstance(workflow_state, dict):
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=workflow_state)
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [DataPart(data=interaction_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                    )
+                    return
+                response_text = failure_text or "I couldn't continue the product import flow from that category selection."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                )
+                return
+
+            if (
+                interaction_response is not None
+                and _is_onboarding_payload(last_interaction_payload, stage="brand_selection")
+            ):
+                selected_brand_names = _searchable_selection_labels(last_interaction_payload, interaction_response)
+                if not selected_brand_names:
+                    response_text = "Select at least one brand so I can browse the matching global catalog products for you."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
+                catalog_scope = str(last_interaction_payload.get("catalog_scope") or "brand").strip() or "brand"
+                selected_category_names = (
+                    last_interaction_payload.get("selected_category_names")
+                    if isinstance(last_interaction_payload.get("selected_category_names"), list)
+                    else []
+                )
+                interaction_output, workflow_state, failure_text = await _build_product_import_catalog_step(
+                    catalog_scope=catalog_scope,
+                    selected_category_names=selected_category_names,
+                    selected_brand_names=selected_brand_names,
+                    page=1,
+                    imported_count=0,
+                )
+                if isinstance(interaction_output, dict) and isinstance(workflow_state, dict):
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=workflow_state)
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [DataPart(data=interaction_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                    )
+                    return
+                response_text = failure_text or "I couldn't continue the product import flow from that brand selection."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                )
+                return
+
+            if (
+                interaction_response is not None
+                and _is_onboarding_payload(last_interaction_payload, stage="product_selection")
+            ):
+                selected_product_ids = _searchable_selection_selected_ids(interaction_response)
+                if not selected_product_ids:
+                    response_text = "Select at least one product to import from this page."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                    )
+                    return
+                if "product.import_global_catalog_products" not in tool_names:
+                    response_text = "Global catalog import is not available right now."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                    )
+                    return
+                yield TaskStatus(
+                    state=TaskState.working,
+                    message=Message(
+                        role=Role.agent,
+                        parts=[TextPart(text="Importing the selected products from the global catalog now.")],
+                        context_id=task.context_id,
+                    ),
+                )
+                try:
+                    import_output = await tool_executor.call_tool(
+                        name="product.import_global_catalog_products",
+                        arguments={"global_product_ids": selected_product_ids},
+                        ctx=tool_ctx,
+                    )
+                except Exception as exc:
+                    response_text = str(exc).strip() or "I couldn't import the selected global catalog products."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                    )
+                    return
+                imported_now = len(import_output) if isinstance(import_output, list) else len(selected_product_ids)
+                imported_total = max(0, int(last_interaction_payload.get("imported_count") or 0)) + imported_now
+                catalog_scope = str(last_interaction_payload.get("catalog_scope") or "category").strip() or "category"
+                selected_category_names = (
+                    last_interaction_payload.get("selected_category_names")
+                    if isinstance(last_interaction_payload.get("selected_category_names"), list)
+                    else []
+                )
+                selected_brand_names = (
+                    last_interaction_payload.get("selected_brand_names")
+                    if isinstance(last_interaction_payload.get("selected_brand_names"), list)
+                    else []
+                )
+                page = max(1, int(last_interaction_payload.get("page") or 1))
+                total_pages = max(0, int(last_interaction_payload.get("total_pages") or 0))
+                if page < total_pages and "create_multiple_choice" in tool_names:
+                    interaction_output = _build_product_import_continue_payload(
+                        catalog_scope=catalog_scope,
+                        selected_category_names=selected_category_names,
+                        selected_brand_names=selected_brand_names,
+                        page=page,
+                        total_pages=total_pages,
+                        imported_count=imported_total,
+                    )
+                    workflow_state = {
+                        "workflow": "product_import",
+                        "status": "awaiting_page_continue",
+                        "stage": "page_continue",
+                        "scope": "product_onboarding",
+                        "catalog_scope": catalog_scope,
+                        "selected_category_names": selected_category_names,
+                        "selected_brand_names": selected_brand_names,
+                        "page": page,
+                        "total_pages": total_pages,
+                        "imported_count": imported_total,
+                        "pending_interaction": interaction_output,
+                    }
+                    company_context = await _maybe_active_company_context()
+                    if company_context:
+                        workflow_state["company_context"] = company_context
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=workflow_state)
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [DataPart(data=interaction_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                    )
+                    return
+                await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+                response_text = (
+                    f"Imported {imported_total} product{'s' if imported_total != 1 else ''} from the global catalog."
+                )
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.completed,
+                    message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                    response_parts=response_parts,
+                )
+                return
+
+            if (
+                interaction_response is not None
+                and _is_onboarding_payload(last_interaction_payload, stage="page_continue")
+            ):
+                selected_action = _selected_interaction_value(interaction_response) or "finish_import"
+                catalog_scope = str(last_interaction_payload.get("catalog_scope") or "category").strip() or "category"
+                selected_category_names = (
+                    last_interaction_payload.get("selected_category_names")
+                    if isinstance(last_interaction_payload.get("selected_category_names"), list)
+                    else []
+                )
+                selected_brand_names = (
+                    last_interaction_payload.get("selected_brand_names")
+                    if isinstance(last_interaction_payload.get("selected_brand_names"), list)
+                    else []
+                )
+                imported_total = max(0, int(last_interaction_payload.get("imported_count") or 0))
+                if selected_action != "continue_next_page":
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+                    response_text = (
+                        f"Finished product import. Imported {imported_total} product{'s' if imported_total != 1 else ''} from the global catalog."
+                    )
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                        response_parts=response_parts,
+                    )
+                    return
+                interaction_output, workflow_state, failure_text = await _build_product_import_catalog_step(
+                    catalog_scope=catalog_scope,
+                    selected_category_names=selected_category_names,
+                    selected_brand_names=selected_brand_names,
+                    page=max(1, int(last_interaction_payload.get("page") or 1)) + 1,
+                    imported_count=imported_total,
+                )
+                if isinstance(interaction_output, dict) and isinstance(workflow_state, dict):
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=workflow_state)
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [DataPart(data=interaction_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                    )
+                    return
+                response_text = failure_text or "I couldn't load the next global catalog page right now."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                )
+                return
 
             if (
                 interaction_response is not None

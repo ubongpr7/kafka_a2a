@@ -81,6 +81,7 @@
           "ref": "products",
           "tools": [
             "list_global_catalog_categories",
+            "list_global_catalog_brands",
             "list_global_catalog_products",
             "import_global_catalog_products"
           ]
