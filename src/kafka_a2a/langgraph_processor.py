@@ -1862,6 +1862,28 @@ def _is_domain_action_request(value: str) -> bool:
     return any(term in text for term in action_terms) and any(term in text for term in domain_terms)
 
 
+def _should_offer_host_unavailable_domain_picker(value: str) -> bool:
+    text = _normalize_user_text(value)
+    if not text:
+        return False
+    if "multiple_choice_response" in text or '"selected"' in text or "'selected'" in text:
+        return True
+    if _is_host_introspection_query(text) or _is_host_capability_picker_query(text) or _is_host_availability_query(text):
+        return True
+    if _is_domain_action_request(text):
+        return True
+    generic_help_phrases = (
+        "help me with",
+        "i need help with",
+        "i want help with",
+        "which area",
+        "what area",
+        "pick an area",
+        "choose an area",
+    )
+    return any(phrase in text for phrase in generic_help_phrases)
+
+
 def _is_host_capability_picker_payload(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -14328,7 +14350,7 @@ def make_langgraph_chat_processor_from_env(
             agent_summaries = (await _load_host_agent_listing()).get("agents")
             available_names = _available_agent_names(agent_summaries)
             if available_names and selected_value not in available_names:
-                if "create_multiple_choice" in tool_names:
+                if _should_offer_host_unavailable_domain_picker(user_text_for_memory) and "create_multiple_choice" in tool_names:
                     try:
                         interaction_output = await tool_executor.call_tool(
                             name="create_multiple_choice",
@@ -16900,7 +16922,7 @@ def make_langgraph_chat_processor_from_env(
                     )
                     return
 
-                if "create_multiple_choice" in tool_names:
+                if _should_offer_host_unavailable_domain_picker(user_text_for_memory) and "create_multiple_choice" in tool_names:
                     try:
                         interaction_output = await tool_executor.call_tool(
                             name="create_multiple_choice",

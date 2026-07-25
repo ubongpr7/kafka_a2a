@@ -3583,6 +3583,38 @@ async def test_host_unavailable_selected_agent_reprompts_instead_of_misrouting(
 
 
 @pytest.mark.asyncio
+async def test_host_direct_sales_analysis_request_does_not_fall_back_to_capability_picker_when_pos_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_TOOL_EXECUTOR", "tests.fake_langgraph_components:build_fake_tool_executor_without_pos")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-pos-unavailable-sales-analysis",
+        context_id="ctx-pos-unavailable-sales-analysis",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text="Analyse my sales data for the past one year")],
+            ),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="Analyse my sales data for the past one year")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert not any(name == "create_multiple_choice" for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS)
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    result_text = _text_from_parts(result_artifact.parts)
+    assert "Choose one of the areas that is available right now." not in result_text
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state != TaskState.input_required
+
+
+@pytest.mark.asyncio
 async def test_host_free_text_onboarding_reply_after_picker_reprompts_when_onboarding_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

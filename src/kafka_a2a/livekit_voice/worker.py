@@ -868,6 +868,161 @@ def _voice_repeat_requested(transcript: str) -> bool:
     return any(phrase in normalized for phrase in _VOICE_REPEAT_PHRASES)
 
 
+_VOICE_TIME_RANGE_HINTS = (
+    "today",
+    "yesterday",
+    "this week",
+    "last week",
+    "this month",
+    "last month",
+    "this quarter",
+    "last quarter",
+    "this year",
+    "last year",
+    "past week",
+    "past month",
+    "past quarter",
+    "past year",
+    "past 7 days",
+    "past 30 days",
+    "past 90 days",
+    "past 12 months",
+    "for the last",
+    "for last",
+    "for the past",
+    "for past",
+    "in the last",
+    "in the past",
+    "over the last",
+    "over the past",
+    "between ",
+    "from ",
+    "since ",
+)
+
+_VOICE_TIME_RANGE_REQUIRED_HINTS = (
+    "sales data",
+    "sales report",
+    "sales analysis",
+    "inventory history",
+    "inventory analysis",
+    "analyze my sales",
+    "analyse my sales",
+    "analyze my inventory",
+    "analyse my inventory",
+    "best performing",
+    "top performing",
+    "top sellers",
+    "best sellers",
+    "trend",
+    "history",
+    "performance",
+    "breakdown",
+    "summary",
+    "report",
+)
+
+_VOICE_FRAGMENT_ENDINGS = (
+    "for",
+    "from",
+    "between",
+    "during",
+    "about",
+    "with",
+    "into",
+    "over",
+    "across",
+    "compare",
+    "compare it",
+    "give me",
+    "show me",
+    "tell me",
+    "analyze",
+    "analyse",
+    "check",
+    "look at",
+)
+
+
+def _voice_has_time_range(transcript: str) -> bool:
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return False
+    if any(hint in normalized for hint in _VOICE_TIME_RANGE_HINTS):
+        return True
+    if re.search(r"\b\d+\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)\b", normalized):
+        return True
+    if re.search(r"\b20\d{2}\b", normalized):
+        return True
+    if re.search(r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\b", normalized):
+        return True
+    return False
+
+
+def _voice_needs_time_range(transcript: str) -> bool:
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return False
+    if _voice_has_time_range(normalized):
+        return False
+    return any(hint in normalized for hint in _VOICE_TIME_RANGE_REQUIRED_HINTS)
+
+
+def _voice_is_likely_incomplete_fragment(transcript: str) -> bool:
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return True
+    if normalized.endswith("?"):
+        return False
+    if any(normalized.endswith(ending) for ending in _VOICE_FRAGMENT_ENDINGS):
+        return True
+    tokens = [token for token in re.split(r"[^a-z0-9']+", normalized) if token]
+    if len(tokens) <= 2 and not any(token in {"hi", "hello", "hey", "thanks", "thank", "okay", "ok"} for token in tokens):
+        return True
+    return False
+
+
+def _voice_clarification_requirement(transcript: str) -> dict[str, str] | None:
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return {
+            "kind": "continuation",
+            "question": "I did not catch the full request. Please say the full question.",
+        }
+    if _voice_needs_time_range(normalized):
+        return {
+            "kind": "time_range",
+            "question": "What time range should I use for that analysis?",
+        }
+    if _voice_is_likely_incomplete_fragment(normalized):
+        return {
+            "kind": "continuation",
+            "question": "That request sounds incomplete. Please finish the question and I will send it through.",
+        }
+    return None
+
+
+def _voice_response_satisfies_clarification(transcript: str, pending: dict[str, Any]) -> bool:
+    kind = str(pending.get("kind") or "").strip()
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return False
+    if kind == "time_range":
+        return _voice_has_time_range(normalized)
+    if kind == "continuation":
+        return len([token for token in re.split(r"[^a-z0-9']+", normalized) if token]) >= 2 or _voice_has_time_range(normalized)
+    return False
+
+
+def _voice_merge_clarification_answer(original: str, answer: str, pending: dict[str, Any]) -> str:
+    kind = str(pending.get("kind") or "").strip()
+    if kind == "time_range":
+        return _collapse_repeated_phrase(f"{original.strip()} {answer.strip()}")
+    if kind == "continuation":
+        return _collapse_repeated_phrase(f"{original.strip()} {answer.strip()}")
+    return _collapse_repeated_phrase(answer.strip())
+
+
 def _should_delegate_voice_transcript(transcript: str) -> bool:
     normalized = _normalize_voice_text(transcript)
     if not normalized:
@@ -1145,6 +1300,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
             self._transcript_buffer: list[str] = []
             self._transcript_flush_task: asyncio.Task[None] | None = None
             self._recent_transcript_keys: dict[str, float] = {}
+            self._pending_clarification: dict[str, Any] | None = None
             self._client = Ka2aClient(
                 transport=KafkaTransport(KafkaConfig.from_env()),
                 config=Ka2aClientConfig(
@@ -1206,6 +1362,21 @@ async def _voice_entrypoint(ctx: Any) -> None:
                     extra={"profile_id": self._runtime.profile_id, "event_type": event_type},
                     exc_info=True,
                 )
+
+        async def _publish_visible_user_transcript(self, transcript: str) -> None:
+            await self._publish_voice_event("transcript", transcript, role="user")
+
+        async def _publish_host_synced_transcript(self, transcript: str, *, turn_id: str) -> None:
+            await self._publish_voice_event(
+                "transcript",
+                transcript,
+                role="user",
+                payload={
+                    "syncChat": True,
+                    "turnId": turn_id,
+                    "displayInTranscript": False,
+                },
+            )
 
         def _transcript_key(self, transcript: str) -> str:
             return _transcript_comparison_key(transcript)
@@ -1392,6 +1563,9 @@ async def _voice_entrypoint(ctx: Any) -> None:
                                 payload={"syncChat": True, "turnId": turn_id, "event": stream_payload},
                             )
                         if isinstance(event, TaskStatusUpdateEvent):
+                            interim_status_text = _sanitize_voice_text(_assistant_message_text(event.status.message))
+                            if interim_status_text and not event.final:
+                                await self._publish_voice_event("status", interim_status_text, payload={"turnId": turn_id})
                             status_text = _artifact_speakable_text(event)
                             if event.final and status_text:
                                 response_candidates.append(status_text)
@@ -1474,7 +1648,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
             if not self._mark_transcript_for_processing(transcript, source=source):
                 return None
             if _voice_repeat_requested(transcript):
-                await self._publish_voice_event("transcript", transcript, role="user")
+                await self._publish_visible_user_transcript(transcript)
                 repeat_text = self._last_spoken_response or "I do not have anything to repeat yet."
                 if turn_ctx is not None:
                     turn_ctx.add_message(role="assistant", content=repeat_text)
@@ -1482,9 +1656,46 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 await self._publish_voice_event("result", repeat_text)
                 await self._say(repeat_text, allow_interruptions=True)
                 return repeat_text
+
+            pending_clarification = self._pending_clarification
+            if pending_clarification is not None:
+                await self._publish_visible_user_transcript(transcript)
+                if _voice_response_satisfies_clarification(transcript, pending_clarification):
+                    transcript = _voice_merge_clarification_answer(
+                        str(pending_clarification.get("original") or ""),
+                        transcript,
+                        pending_clarification,
+                    )
+                    self._pending_clarification = None
+                elif _should_delegate_voice_transcript(transcript) and not _voice_is_likely_incomplete_fragment(transcript):
+                    self._pending_clarification = None
+                else:
+                    follow_up_prompt = str(pending_clarification.get("question") or "Please give me the missing detail.")
+                    self._last_spoken_response = follow_up_prompt
+                    if turn_ctx is not None:
+                        turn_ctx.add_message(role="assistant", content=follow_up_prompt)
+                    await self._publish_voice_event("result", follow_up_prompt)
+                    await self._say(follow_up_prompt, allow_interruptions=True)
+                    return follow_up_prompt
+
+            clarification = _voice_clarification_requirement(transcript)
+            if clarification:
+                await self._publish_visible_user_transcript(transcript)
+                question = clarification["question"]
+                self._pending_clarification = {
+                    "kind": clarification["kind"],
+                    "question": question,
+                    "original": transcript,
+                }
+                self._last_spoken_response = question
+                if turn_ctx is not None:
+                    turn_ctx.add_message(role="assistant", content=question)
+                await self._publish_voice_event("result", question)
+                await self._say(question, allow_interruptions=True)
+                return question
             direct_reply = _voice_direct_reply(transcript)
             if direct_reply:
-                await self._publish_voice_event("transcript", transcript, role="user")
+                await self._publish_visible_user_transcript(transcript)
                 self._last_spoken_response = direct_reply
                 if turn_ctx is not None:
                     turn_ctx.add_message(role="assistant", content=direct_reply)
@@ -1502,12 +1713,8 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 )
                 return None
             turn_id = _voice_turn_id(transcript)
-            await self._publish_voice_event(
-                "transcript",
-                transcript,
-                role="user",
-                payload={"syncChat": True, "turnId": turn_id},
-            )
+            await self._publish_visible_user_transcript(transcript)
+            await self._publish_host_synced_transcript(transcript, turn_id=turn_id)
             if not _voice_backend_delegation_enabled():
                 acknowledgement = (
                     "I heard that. I’m sending it through the workspace chat so the full result appears there."

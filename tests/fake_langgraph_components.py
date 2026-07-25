@@ -1557,6 +1557,11 @@ class FakeToolExecutorWithoutUsers(FakeToolExecutor):
         super().__init__(agent_name=agent_name, hidden_agents={"users"})
 
 
+class FakeToolExecutorWithoutPos(FakeToolExecutor):
+    def __init__(self, *, agent_name: str | None = None) -> None:
+        super().__init__(agent_name=agent_name, hidden_agents={"pos"})
+
+
 class FakeToolExecutorWithUuidFailure(FakeToolExecutor):
     async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
         if name == "inventory.create_inventory_item":
@@ -1636,6 +1641,10 @@ def build_fake_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:
 
 def build_fake_tool_executor_without_users(*, agent_name: str | None = None) -> ToolExecutor:
     return FakeToolExecutorWithoutUsers(agent_name=agent_name)
+
+
+def build_fake_tool_executor_without_pos(*, agent_name: str | None = None) -> ToolExecutor:
+    return FakeToolExecutorWithoutPos(agent_name=agent_name)
 
 
 def build_fake_tool_executor_without_users_or_onboarding(*, agent_name: str | None = None) -> ToolExecutor:
