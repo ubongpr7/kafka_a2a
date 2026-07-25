@@ -631,10 +631,26 @@ def _strong_domain_agent_override(query: str) -> str | None:
         return None
     if (
         any(token in text for token in ("import", "onboard", "onboarding"))
-        and any(token in text for token in ("product", "products", "catalog", "brand", "brands", "category", "categories"))
+        and any(
+            token in text
+            for token in (
+                "product",
+                "products",
+                "catalog",
+                "brand",
+                "brands",
+                "category",
+                "categories",
+                "inventory",
+                "global products",
+                "global catalog",
+            )
+        )
     ):
         return "onboarding"
-    if any(token in text for token in ("sales", "revenue", "order count", "orders made", "gross sales", "avg basket")):
+    if (
+        any(token in text for token in ("sales", "revenue", "order count", "orders made", "gross sales", "avg basket"))
+    ):
         return "pos"
     if _text_matches_all_terms(text, r"\bsales?\b", r"\blocation\b"):
         return "pos"
@@ -12181,6 +12197,25 @@ def _select_router_specialist_agent(
 
     if router_agent_name == "product":
         if (
+            any(token in text for token in ("import", "onboard", "onboarding"))
+            and any(
+                token in text
+                for token in (
+                    "product",
+                    "products",
+                    "catalog",
+                    "global catalog",
+                    "global products",
+                    "brand",
+                    "brands",
+                    "category",
+                    "categories",
+                    "inventory",
+                )
+            )
+        ):
+            return _pick("onboarding")
+        if (
             any(
                 token in text
                 for token in (
@@ -17112,34 +17147,57 @@ def make_langgraph_chat_processor_from_env(
                         return
 
                     direct_prefill["catalog_scope"] = selected_catalog_scope
-                    if "create_wizard_flow" in tool_names:
-                        wizard_bundle = await _build_product_import_wizard(
-                            prefill_data=direct_prefill,
-                            description=(
-                                "I started the product import workflow. Review the selected catalog filter first, then choose categories, brands, and the products you want to import."
-                                if direct_prefill
-                                else "I started the product import workflow. Choose a catalog filter first, then review categories, brands, and the products you want to import."
+                    selected_category_names = _dedupe_preserving_order(
+                        _split_inline_list_values(str(direct_prefill.get("product_category_name") or ""))
+                        + (
+                            list(direct_prefill.get("selected_category_names"))
+                            if isinstance(direct_prefill.get("selected_category_names"), list)
+                            else []
+                        )
+                    )
+                    selected_brand_names = _dedupe_preserving_order(
+                        _split_inline_list_values(str(direct_prefill.get("brand_names") or ""))
+                        + (
+                            list(direct_prefill.get("selected_brand_names"))
+                            if isinstance(direct_prefill.get("selected_brand_names"), list)
+                            else []
+                        )
+                    )
+                    interaction_output, workflow_state, failure_text = await _build_product_import_catalog_step(
+                        catalog_scope=selected_catalog_scope,
+                        selected_category_names=selected_category_names,
+                        selected_brand_names=selected_brand_names,
+                    )
+                    if isinstance(interaction_output, dict) and isinstance(workflow_state, dict):
+                        await _save_workflow_state(
+                            context_id=task.context_id,
+                            metadata=metadata,
+                            workflow_state=workflow_state,
+                        )
+                        response_text = json.dumps(interaction_output, ensure_ascii=False)
+                        response_parts = [DataPart(data=interaction_output)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
                             ),
                         )
-                        if wizard_bundle is not None:
-                            interaction_output, workflow_state = wizard_bundle
-                            await _save_workflow_state(
-                                context_id=task.context_id,
-                                metadata=metadata,
-                                workflow_state=workflow_state,
-                            )
-                            response_text = json.dumps(interaction_output, ensure_ascii=False)
-                            response_parts = [DataPart(data=interaction_output)]
-                            yield Artifact(name="result", parts=response_parts)
-                            yield TaskStatus(
-                                state=TaskState.input_required,
-                                message=Message(
-                                    role=Role.agent,
-                                    parts=response_parts,
-                                    context_id=task.context_id,
-                                ),
-                            )
-                            return
+                        return
+                    response_text = failure_text or "I couldn't load the global catalog import flow right now."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
 
                 company_context = await _maybe_active_company_context()
                 description = "I can start the product import flow. Do you want to browse products by category, by brand, or by both?"
