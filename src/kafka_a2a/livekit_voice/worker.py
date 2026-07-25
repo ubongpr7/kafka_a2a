@@ -471,6 +471,63 @@ def _sanitize_voice_text(text: str, *, reject_generic: bool = False) -> str:
     return cleaned
 
 
+def _humanize_voice_agent_label(value: str) -> str:
+    normalized = re.sub(r"[_-]+", " ", value.strip())
+    normalized = re.sub(r"\bwa p\d+\b", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\b[0-9a-f]{8,}\b", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .,-")
+    return normalized or "workspace"
+
+
+def _humanize_voice_progress_text(text: str) -> str:
+    cleaned = _sanitize_voice_text(text)
+    if not cleaned:
+        return ""
+
+    lowered = cleaned.lower()
+    delegating_match = re.match(r"delegating this request to the (.+?) specialist agent\.?$", lowered, flags=re.IGNORECASE)
+    if delegating_match:
+        agent_label = _humanize_voice_agent_label(delegating_match.group(1))
+        return f"I’ve handed this to the {agent_label} specialist."
+
+    accepted_match = re.match(r"(.+?) agent accepted the delegated task\.?$", cleaned, flags=re.IGNORECASE)
+    if accepted_match:
+        agent_label = _humanize_voice_agent_label(accepted_match.group(1))
+        return f"The {agent_label} specialist has accepted the task."
+
+    processing_match = re.match(r"(.+?) agent is processing the delegated task\.?$", cleaned, flags=re.IGNORECASE)
+    if processing_match:
+        agent_label = _humanize_voice_agent_label(processing_match.group(1))
+        return f"The {agent_label} specialist is working on it now."
+
+    working_match = re.match(r"delegating this request to the appropriate specialist agent\.?$", lowered, flags=re.IGNORECASE)
+    if working_match:
+        return "I’ve handed this to the right specialist."
+
+    if "task state: failed" in lowered or "current task state: failed" in lowered:
+        return "That task ran into a problem. I’m checking what detail is missing."
+
+    return cleaned
+
+
+def _voice_user_facing_failure_follow_up(text: str) -> str | None:
+    cleaned = _sanitize_voice_text(text)
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    if "time range" in lowered:
+        return "I still need the time range for that. For example, you can say last month, past 90 days, or last year."
+    if "not currently available" in lowered and "pos" in lowered:
+        return "The sales and POS specialist is unavailable right now. I can help with inventory, products, or workspace tasks, or you can retry sales analysis later."
+    if "not currently available" in lowered and "inventory" in lowered:
+        return "The inventory specialist is unavailable right now. I can help with products, users, or workspace tasks, or you can retry inventory analysis later."
+    if "not currently available" in lowered and "product" in lowered:
+        return "The product specialist is unavailable right now. I can help with inventory, users, or workspace tasks, or you can retry the product request later."
+    if "could not complete that answer" in lowered or "delegation failed" in lowered:
+        return "I could not finish that request as asked. Please tell me what result you want, and include any missing detail like the time range, product, barcode, or location."
+    return None
+
+
 def _select_voice_response_candidate(candidates: list[str]) -> str:
     selected = ""
     seen: set[str] = set()
@@ -1414,7 +1471,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
             return _transcript_comparison_key(transcript)
 
         def _remember_progress_update(self, text: str) -> str:
-            cleaned = _sanitize_voice_text(text, reject_generic=False)
+            cleaned = _humanize_voice_progress_text(text)
             if cleaned:
                 self._last_progress_update = cleaned
             return cleaned
@@ -1599,12 +1656,13 @@ async def _voice_entrypoint(ctx: Any) -> None:
                     "host_agent_name": self._host_agent_name,
                 },
             )
+            initial_status = "I’m checking that with the workspace agent now."
             await self._publish_voice_event(
                 "status",
-                "I’m checking that with the workspace agent now.",
+                initial_status,
                 payload={"syncChat": True, "turnId": turn_id},
             )
-            self._remember_progress_update("I’m checking that with the workspace agent now.")
+            self._remember_progress_update(initial_status)
             user_message = Message(
                 role=Role.user,
                 parts=[TextPart(text=transcript)],
@@ -1634,9 +1692,10 @@ async def _voice_entrypoint(ctx: Any) -> None:
                         if isinstance(event, TaskStatusUpdateEvent):
                             interim_status_text = _sanitize_voice_text(_assistant_message_text(event.status.message))
                             if interim_status_text and not event.final:
-                                self._remember_progress_update(interim_status_text)
-                                await self._publish_voice_event("status", interim_status_text, payload={"turnId": turn_id})
-                                await self._speak_progress_update(interim_status_text)
+                                spoken_status_text = self._remember_progress_update(interim_status_text)
+                                if spoken_status_text:
+                                    await self._publish_voice_event("status", spoken_status_text, payload={"turnId": turn_id})
+                                    await self._speak_progress_update(spoken_status_text)
                             status_text = _artifact_speakable_text(event)
                             if event.final and status_text:
                                 response_candidates.append(status_text)
@@ -1701,6 +1760,9 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 final_text = (
                     "I could not complete that answer from the agent service. Please try again, or ask me to regenerate the analysis if you need fresh data."
                 )
+            follow_up_text = _voice_user_facing_failure_follow_up(final_text)
+            if follow_up_text:
+                final_text = follow_up_text
 
             logger.info(
                 "voice transcript resolved",

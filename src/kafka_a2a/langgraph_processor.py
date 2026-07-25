@@ -629,6 +629,11 @@ def _strong_domain_agent_override(query: str) -> str | None:
     text = _normalize_user_text(query)
     if not text:
         return None
+    if (
+        any(token in text for token in ("import", "onboard", "onboarding"))
+        and any(token in text for token in ("product", "products", "catalog", "brand", "brands", "category", "categories"))
+    ):
+        return "onboarding"
     if any(token in text for token in ("sales", "revenue", "order count", "orders made", "gross sales", "avg basket")):
         return "pos"
     if _text_matches_all_terms(text, r"\bsales?\b", r"\blocation\b"):
@@ -1898,6 +1903,26 @@ def _friendly_agent_label(name: str) -> str:
     return HOST_AGENT_LABELS.get(name, name.replace("_", " ").title())
 
 
+def _host_unavailable_follow_up_text(agent_name: str) -> str:
+    label = _friendly_agent_label(agent_name)
+    if agent_name == "pos":
+        return (
+            f"{label} is not currently available. If you still want sales analysis, retry shortly. "
+            "Otherwise I can still help with inventory, products, users, or a general workspace question."
+        )
+    if agent_name == "inventory":
+        return (
+            f"{label} is not currently available. I can still help with products, users, or a general workspace question."
+        )
+    if agent_name == "product":
+        return (
+            f"{label} is not currently available. I can still help with inventory, users, or a general workspace question."
+        )
+    return (
+        f"{label} is not currently available right now. Ask another question, or tell me the next best area you want help with."
+    )
+
+
 def _available_agent_names(agent_summaries: list[dict[str, Any]] | None) -> set[str]:
     return {
         str(summary.get("name") or "").strip()
@@ -1997,6 +2022,176 @@ def _host_follow_up_request_for_agent(agent_name: str) -> str:
         "Briefly explain what kinds of tasks you can help with in this domain, "
         "using a concise user-facing summary."
     )
+
+
+def _is_generic_agent_failure_text(value: str) -> bool:
+    text = _normalize_user_text(value)
+    if not text:
+        return False
+    generic_patterns = (
+        "i could not complete that answer from the agent service",
+        "delegation failed",
+        "delegation did not return a usable result",
+        "please try again",
+        "ask me to regenerate",
+        "timed out waiting for delegated response",
+        "could not complete that answer",
+    )
+    return any(pattern in text for pattern in generic_patterns)
+
+
+def _request_explicitly_mentions_time_range(value: str) -> bool:
+    text = _normalize_user_text(value)
+    if not text:
+        return False
+    time_tokens = (
+        "today",
+        "yesterday",
+        "this week",
+        "last week",
+        "past week",
+        "this month",
+        "last month",
+        "past month",
+        "this quarter",
+        "last quarter",
+        "past quarter",
+        "this year",
+        "last year",
+        "past year",
+        "date range",
+        "between ",
+        "from ",
+        "for the past ",
+        "for the last ",
+    )
+    return any(token in text for token in time_tokens) or bool(
+        re.search(r"\b\d+\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)\b", text)
+    )
+
+
+def _fresh_host_request_clarification(query: str, agent_name: str | None = None) -> str | None:
+    text = _normalize_user_text(query)
+    target = _canonical_host_domain_agent(agent_name or _infer_domain_agent_name(query) or "")
+    if not text:
+        return None
+
+    if target == "onboarding" or _infer_onboarding_scope_from_text(text) == "product_onboarding":
+        return (
+            "I can start the product import flow. Do you want to browse products by category, by brand, or by both?"
+        )
+
+    if target == "pos":
+        mentions_analysis = any(token in text for token in ("analyse", "analyze", "analysis", "review", "report", "sales", "revenue", "orders"))
+        if mentions_analysis and not _request_explicitly_mentions_time_range(text):
+            return "What time range should I use for the sales analysis?"
+        if any(token in text for token in ("compare", "comparison")) and "location" not in text:
+            return "Do you want me to compare sales by location, by product, or by period?"
+        return "What part of sales would you like me to analyze: revenue, orders, top sellers, locations, or trends?"
+
+    if target == "inventory":
+        if any(token in text for token in ("analyse", "analyze", "analysis", "review", "report")) and not _request_explicitly_mentions_time_range(text):
+            return "What time range should I use for the inventory analysis?"
+        if "inventory" in text and not any(
+            token in text
+            for token in ("stock", "out of stock", "low stock", "expiry", "purchase order", "receiving", "value", "location", "movement")
+        ):
+            return "Which part of inventory do you want: stock posture, low stock, expiry risk, stock value, purchase orders, or receiving?"
+        return None
+
+    if target == "product":
+        if any(token in text for token in ("compare", "comparison")):
+            return "Which products or barcodes should I compare?"
+        if any(token in text for token in ("best product", "top product", "top seller", "best seller")) and not _request_explicitly_mentions_time_range(text):
+            return "What time range should I use for the product analysis?"
+        return None
+
+    if target == "users":
+        if any(token in text for token in ("audit", "activity", "access")) and not _request_explicitly_mentions_time_range(text):
+            return "What time range should I use for that audit or activity check?"
+        return None
+
+    return None
+
+
+def _normalize_catalog_scope_selection(value: str) -> str | None:
+    normalized = _normalize_user_text(value)
+    if not normalized:
+        return None
+    if "both" in normalized:
+        return "both"
+    if "brand" in normalized and "category" not in normalized:
+        return "brand"
+    if "categor" in normalized and "brand" not in normalized:
+        return "category"
+    if "brand" in normalized and "categor" in normalized:
+        return "both"
+    return None
+
+
+def _coerce_host_failure_into_follow_up(
+    *,
+    query: str,
+    inferred_agent: str | None,
+    failure_text: str,
+) -> tuple[str, TaskState] | None:
+    if not _is_generic_agent_failure_text(failure_text):
+        return None
+    follow_up = _fresh_host_request_clarification(query, inferred_agent)
+    if not follow_up:
+        return None
+    return follow_up, TaskState.input_required
+
+
+def _looks_like_fresh_freeform_request(value: str) -> bool:
+    text = _normalize_user_text(value)
+    if not text:
+        return False
+    if _interaction_response_from_text(value) is not None:
+        return False
+    if text in {
+        "yes",
+        "no",
+        "continue",
+        "continue next",
+        "stop here",
+        "cancel",
+        "retry",
+        "resume",
+        "resume saved",
+        "start over",
+        "submit",
+    }:
+        return False
+    if _strong_domain_agent_override(text) or _infer_domain_agent_name(text) or _infer_onboarding_scope_from_text(text):
+        return True
+    if any(
+        token in text
+        for token in (
+            "analyse",
+            "analyze",
+            "analysis",
+            "report",
+            "review",
+            "compare",
+            "import",
+            "create",
+            "add",
+            "show",
+            "list",
+            "find",
+            "search",
+            "how many",
+            "what is",
+            "which",
+            "today",
+            "yesterday",
+            "last ",
+            "past ",
+        )
+    ):
+        return True
+    return len(text.split()) >= 5
 
 
 def _is_host_orchestration_payload(payload: dict[str, Any] | None, *, stage: str) -> bool:
@@ -2404,6 +2599,23 @@ def _onboarding_scope_picker_arguments(
         "description": description,
         "options": [
             {"value": "product_onboarding", "label": "Product Import"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+    }
+
+
+def _onboarding_catalog_scope_picker_arguments(
+    *,
+    description: str = "How do you want to browse the global catalog first?",
+) -> dict[str, Any]:
+    return {
+        "title": "Choose Catalog Filters",
+        "description": description,
+        "options": [
+            {"value": "category", "label": "Product Category"},
+            {"value": "brand", "label": "Brand"},
+            {"value": "both", "label": "Both Category and Brand"},
         ],
         "multiple": False,
         "allow_input": True,
@@ -13572,6 +13784,30 @@ def make_langgraph_chat_processor_from_env(
         interaction_response = _interaction_response_from_text(user_text_for_memory)
         saved_workflow_state = await _load_workflow_state(context_id=task.context_id, metadata=metadata)
 
+        if (
+            interaction_response is None
+            and user_text_for_memory
+            and _looks_like_fresh_freeform_request(user_text_for_memory)
+        ):
+            active_workflow = str(saved_workflow_state.get("workflow") or "").strip().lower() if isinstance(saved_workflow_state, dict) else ""
+            should_reset_host_prompt = (
+                _canonical_host_domain_agent(agent_name) == "host"
+                and (
+                    _is_host_capability_picker_payload(last_interaction_payload)
+                    or _is_host_domain_area_picker_payload(last_interaction_payload)
+                    or active_workflow == "host_orchestration"
+                )
+            )
+            should_reset_onboarding_prompt = (
+                _canonical_host_domain_agent(agent_name) == "onboarding"
+                and active_workflow == "product_import"
+                and _infer_onboarding_scope_from_text(user_text_for_memory) != "product_onboarding"
+            )
+            if should_reset_host_prompt or should_reset_onboarding_prompt:
+                last_interaction_payload = None
+                saved_workflow_state = None
+                await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+
         if _canonical_host_domain_agent(agent_name) == "host" and interaction_response is None and user_text_for_memory:
             logger.info(
                 "host conversation history probe count=%s has_insight=%s",
@@ -14350,39 +14586,7 @@ def make_langgraph_chat_processor_from_env(
             agent_summaries = (await _load_host_agent_listing()).get("agents")
             available_names = _available_agent_names(agent_summaries)
             if available_names and selected_value not in available_names:
-                if _should_offer_host_unavailable_domain_picker(user_text_for_memory) and "create_multiple_choice" in tool_names:
-                    try:
-                        interaction_output = await tool_executor.call_tool(
-                            name="create_multiple_choice",
-                            arguments=_host_capability_picker_arguments(
-                                agent_summaries,
-                                description=(
-                                    f"{_friendly_agent_label(selected_value)} is not currently available. "
-                                    "Choose one of the areas that is available right now."
-                                ),
-                            ),
-                            ctx=tool_ctx,
-                        )
-                    except Exception:
-                        interaction_output = None
-                    if isinstance(interaction_output, dict):
-                        response_text = json.dumps(interaction_output, ensure_ascii=False)
-                        response_parts = [DataPart(data=interaction_output)]
-                        yield Artifact(name="result", parts=response_parts)
-                        yield TaskStatus(
-                            state=TaskState.input_required,
-                            message=Message(
-                                role=Role.agent,
-                                parts=response_parts,
-                                context_id=task.context_id,
-                            ),
-                        )
-                        return
-
-                response_text = (
-                    f"{_friendly_agent_label(selected_value)} is not currently available. "
-                    "Ask another question or choose a different available area."
-                )
+                response_text = _host_unavailable_follow_up_text(selected_value)
                 response_parts = [TextPart(text=response_text)]
                 yield Artifact(name="result", parts=response_parts)
                 yield TaskStatus(
@@ -15232,6 +15436,9 @@ def make_langgraph_chat_processor_from_env(
             and "create_multiple_choice" in tool_names
             and user_text_for_memory
             and _is_host_capability_picker_query(user_text_for_memory)
+            and _strong_domain_agent_override(user_text_for_memory) is None
+            and _infer_onboarding_scope_from_text(user_text_for_memory) is None
+            and _infer_domain_agent_name(user_text_for_memory) is None
         ):
             agent_summaries = (await _load_host_agent_listing()).get("agents")
             try:
@@ -15471,6 +15678,63 @@ def make_langgraph_chat_processor_from_env(
                 active_company_context = _extract_company_context(output)
                 return active_company_context
 
+            async def _build_product_import_wizard(
+                *,
+                prefill_data: dict[str, Any] | None = None,
+                description: str,
+            ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+                company_context = await _maybe_active_company_context()
+                try:
+                    interaction_output = await tool_executor.call_tool(
+                        name="create_wizard_flow",
+                        arguments=_onboarding_wizard_arguments("product_onboarding"),
+                        ctx=tool_ctx,
+                    )
+                except Exception:
+                    interaction_output = None
+
+                if not isinstance(interaction_output, dict):
+                    return None
+
+                interaction_output = await _rewrite_relation_interaction_dict(
+                    interaction_output,
+                    tool_specs=tool_specs,
+                    tool_executor=tool_executor,
+                    tool_ctx=tool_ctx,
+                )
+                existing_responses: dict[str, Any] = {}
+                if prefill_data:
+                    existing_responses = _build_onboarding_existing_responses(
+                        "product_onboarding",
+                        wizard_payload=interaction_output,
+                        prefill_data=prefill_data,
+                    )
+                    existing_responses = _normalize_onboarding_existing_responses(
+                        "product_onboarding",
+                        wizard_payload=interaction_output,
+                        existing_responses=existing_responses,
+                    )
+                    if existing_responses:
+                        interaction_output["existing_responses"] = existing_responses
+                interaction_output = _with_interaction_metadata(
+                    interaction_output,
+                    workflow="product_import",
+                    workflow_stage="wizard",
+                    onboarding_scope="product_onboarding",
+                )
+                interaction_output["description"] = description
+                workflow_state = {
+                    "workflow": "product_import",
+                    "status": "collecting",
+                    "stage": "wizard",
+                    "scope": "product_onboarding",
+                    "pending_interaction": interaction_output,
+                    "existing_responses": existing_responses,
+                }
+                if company_context:
+                    workflow_state["company_context"] = company_context
+                return interaction_output, workflow_state
+
             if _is_legacy_product_import_state(saved_workflow_state):
                 saved_workflow_state = None
                 await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
@@ -15524,6 +15788,64 @@ def make_langgraph_chat_processor_from_env(
                         user_text=user_text_for_memory,
                         assistant_text=response_text,
                         response_parts=response_parts,
+                    )
+                    return
+
+            catalog_scope_prompt_active = (
+                _is_onboarding_payload(last_interaction_payload, stage="catalog_scope_prompt")
+                or (
+                    isinstance(saved_workflow_state, dict)
+                    and str(saved_workflow_state.get("workflow") or "").strip().lower() == "product_import"
+                    and str(saved_workflow_state.get("stage") or "").strip().lower() == "catalog_scope_prompt"
+                )
+            )
+            if catalog_scope_prompt_active and user_text_for_memory:
+                selected_catalog_scope = _normalize_catalog_scope_selection(
+                    _selected_interaction_value(interaction_response) or _interaction_additional_input(interaction_response) or ""
+                )
+                direct_prefill = _parse_onboarding_prefill_from_text("product_onboarding", user_text_for_memory)
+                if selected_catalog_scope is None:
+                    selected_catalog_scope = _normalize_catalog_scope_selection(user_text_for_memory)
+                if selected_catalog_scope is None:
+                    response_text = "Do you want to browse products by category, by brand, or by both?"
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
+
+                direct_prefill["catalog_scope"] = selected_catalog_scope
+                wizard_bundle = None
+                if "create_wizard_flow" in tool_names:
+                    wizard_bundle = await _build_product_import_wizard(
+                        prefill_data=direct_prefill,
+                        description=(
+                            "I started the product import workflow. Review the selected catalog filter first, then choose categories, brands, and the products you want to import."
+                        ),
+                    )
+                if wizard_bundle is not None:
+                    interaction_output, workflow_state = wizard_bundle
+                    await _save_workflow_state(
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        workflow_state=workflow_state,
+                    )
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [DataPart(data=interaction_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
                     )
                     return
 
@@ -16066,65 +16388,57 @@ def make_langgraph_chat_processor_from_env(
                     direct_scope or "product_onboarding",
                     user_text_for_memory or "",
                 )
-                if direct_scope == "product_onboarding" and "create_wizard_flow" in tool_names:
-                    company_context = await _maybe_active_company_context()
-                    try:
-                        interaction_output = await tool_executor.call_tool(
-                            name="create_wizard_flow",
-                            arguments=_onboarding_wizard_arguments(direct_scope),
-                            ctx=tool_ctx,
-                        )
-                    except Exception:
-                        interaction_output = None
+                if direct_scope == "product_onboarding":
+                    selected_catalog_scope = _normalize_catalog_scope_selection(str(direct_prefill.get("catalog_scope") or ""))
+                    if selected_catalog_scope is None:
+                        description = "I can start the product import flow. Do you want to browse products by category, by brand, or by both?"
+                        if "create_multiple_choice" in tool_names:
+                            try:
+                                interaction_output = await tool_executor.call_tool(
+                                    name="create_multiple_choice",
+                                    arguments=_onboarding_catalog_scope_picker_arguments(description=description),
+                                    ctx=tool_ctx,
+                                )
+                            except Exception:
+                                interaction_output = None
 
-                    if isinstance(interaction_output, dict):
-                        interaction_output = await _rewrite_relation_interaction_dict(
-                            interaction_output,
-                            tool_specs=tool_specs,
-                            tool_executor=tool_executor,
-                            tool_ctx=tool_ctx,
-                        )
-                        if direct_prefill:
-                            existing_responses = _build_onboarding_existing_responses(
-                                direct_scope,
-                                wizard_payload=interaction_output,
-                                prefill_data=direct_prefill,
-                            )
-                            existing_responses = _normalize_onboarding_existing_responses(
-                                direct_scope,
-                                wizard_payload=interaction_output,
-                                existing_responses=existing_responses,
-                            )
-                            if existing_responses:
-                                interaction_output["existing_responses"] = existing_responses
-                        interaction_output = _with_interaction_metadata(
-                            interaction_output,
-                            workflow="product_import",
-                            workflow_stage="wizard",
-                            onboarding_scope=direct_scope,
-                        )
-                        interaction_output["description"] = (
-                            "I started the product import workflow. Choose categories and brands first, then review the catalog pages and import the products you want."
-                            if not direct_prefill
-                            else "I prefilled this product import flow from your message. Review it, correct anything that is off, and complete any remaining fields before I create anything."
-                        )
-                        workflow_state = {
-                            "workflow": "product_import",
-                            "status": "collecting",
-                            "stage": "wizard",
-                            "scope": direct_scope,
-                            "pending_interaction": interaction_output,
-                            "existing_responses": existing_responses,
-                        }
-                        if company_context:
-                            workflow_state["company_context"] = company_context
-                        await _save_workflow_state(
-                            context_id=task.context_id,
-                            metadata=metadata,
-                            workflow_state=workflow_state,
-                        )
-                        response_text = json.dumps(interaction_output, ensure_ascii=False)
-                        response_parts = [DataPart(data=interaction_output)]
+                            if isinstance(interaction_output, dict):
+                                interaction_output = _with_interaction_metadata(
+                                    interaction_output,
+                                    workflow="product_import",
+                                    workflow_stage="catalog_scope_prompt",
+                                    onboarding_scope="product_onboarding",
+                                )
+                                workflow_state = {
+                                    "workflow": "product_import",
+                                    "status": "awaiting_catalog_scope",
+                                    "stage": "catalog_scope_prompt",
+                                    "scope": "product_onboarding",
+                                    "pending_interaction": interaction_output,
+                                }
+                                company_context = await _maybe_active_company_context()
+                                if company_context:
+                                    workflow_state["company_context"] = company_context
+                                await _save_workflow_state(
+                                    context_id=task.context_id,
+                                    metadata=metadata,
+                                    workflow_state=workflow_state,
+                                )
+                                response_text = json.dumps(interaction_output, ensure_ascii=False)
+                                response_parts = [DataPart(data=interaction_output)]
+                                yield Artifact(name="result", parts=response_parts)
+                                yield TaskStatus(
+                                    state=TaskState.input_required,
+                                    message=Message(
+                                        role=Role.agent,
+                                        parts=response_parts,
+                                        context_id=task.context_id,
+                                    ),
+                                )
+                                return
+
+                        response_text = description
+                        response_parts = [TextPart(text=response_text)]
                         yield Artifact(name="result", parts=response_parts)
                         yield TaskStatus(
                             state=TaskState.input_required,
@@ -16136,16 +16450,46 @@ def make_langgraph_chat_processor_from_env(
                         )
                         return
 
+                    direct_prefill["catalog_scope"] = selected_catalog_scope
+                    if "create_wizard_flow" in tool_names:
+                        wizard_bundle = await _build_product_import_wizard(
+                            prefill_data=direct_prefill,
+                            description=(
+                                "I started the product import workflow. Review the selected catalog filter first, then choose categories, brands, and the products you want to import."
+                                if direct_prefill
+                                else "I started the product import workflow. Choose a catalog filter first, then review categories, brands, and the products you want to import."
+                            ),
+                        )
+                        if wizard_bundle is not None:
+                            interaction_output, workflow_state = wizard_bundle
+                            await _save_workflow_state(
+                                context_id=task.context_id,
+                                metadata=metadata,
+                                workflow_state=workflow_state,
+                            )
+                            response_text = json.dumps(interaction_output, ensure_ascii=False)
+                            response_parts = [DataPart(data=interaction_output)]
+                            yield Artifact(name="result", parts=response_parts)
+                            yield TaskStatus(
+                                state=TaskState.input_required,
+                                message=Message(
+                                    role=Role.agent,
+                                    parts=response_parts,
+                                    context_id=task.context_id,
+                                ),
+                            )
+                            return
+
                 company_context = await _maybe_active_company_context()
-                description = "Choose the import flow you want to start. I will guide you step by step."
+                description = "I can start the product import flow. Do you want to browse products by category, by brand, or by both?"
                 if isinstance(company_context, dict):
                     company_name = str(company_context.get("name") or "").strip()
                     if company_name:
                         description = f"Current company: {company_name}\n\n{description}"
                 try:
                     interaction_output = await tool_executor.call_tool(
-                        name="create_wizard_flow",
-                        arguments=_onboarding_wizard_arguments("product_onboarding"),
+                        name="create_multiple_choice",
+                        arguments=_onboarding_catalog_scope_picker_arguments(description=description),
                         ctx=tool_ctx,
                     )
                 except Exception:
@@ -16155,14 +16499,13 @@ def make_langgraph_chat_processor_from_env(
                     interaction_output = _with_interaction_metadata(
                         interaction_output,
                         workflow="product_import",
-                        workflow_stage="wizard",
+                        workflow_stage="catalog_scope_prompt",
                         onboarding_scope="product_onboarding",
                     )
-                    interaction_output["description"] = description + "\n\nStart by choosing product categories and brands."
                     workflow_state = {
                         "workflow": "product_import",
-                        "status": "collecting",
-                        "stage": "wizard",
+                        "status": "awaiting_catalog_scope",
+                        "stage": "catalog_scope_prompt",
                         "scope": "product_onboarding",
                         "pending_interaction": interaction_output,
                     }
@@ -16957,44 +17300,11 @@ def make_langgraph_chat_processor_from_env(
                     )
                     return
 
-                if _should_offer_host_unavailable_domain_picker(user_text_for_memory) and "create_multiple_choice" in tool_names:
-                    try:
-                        interaction_output = await tool_executor.call_tool(
-                            name="create_multiple_choice",
-                            arguments=_host_capability_picker_arguments(
-                                agent_summaries,
-                                description=(
-                                    f"{_friendly_agent_label(inferred_agent)} is not currently available. "
-                                    "Choose one of the areas that is available right now."
-                                ),
-                            ),
-                            ctx=tool_ctx,
-                        )
-                    except Exception:
-                        interaction_output = None
-
-                    if isinstance(interaction_output, dict):
-                        response_text = json.dumps(interaction_output, ensure_ascii=False)
-                        response_parts = [DataPart(data=interaction_output)]
-                        yield Artifact(name="result", parts=response_parts)
-                        yield TaskStatus(
-                            state=TaskState.input_required,
-                            message=Message(
-                                role=Role.agent,
-                                parts=response_parts,
-                                context_id=task.context_id,
-                            ),
-                        )
-                        return
-
-                response_text = (
-                    f"{_friendly_agent_label(inferred_agent)} is not currently available. "
-                    "Ask another question or choose a different available area."
-                )
+                response_text = _fresh_host_request_clarification(user_text_for_memory, inferred_agent) or _host_unavailable_follow_up_text(inferred_agent)
                 response_parts = [TextPart(text=response_text)]
                 yield Artifact(name="result", parts=response_parts)
                 yield TaskStatus(
-                    state=TaskState.completed,
+                    state=TaskState.input_required if _fresh_host_request_clarification(user_text_for_memory, inferred_agent) else TaskState.completed,
                     message=Message(
                         role=Role.agent,
                         parts=response_parts,
@@ -17042,10 +17352,19 @@ def make_langgraph_chat_processor_from_env(
                     )
                 except Exception as exc:
                     response_text = str(exc).strip() or "Delegation failed."
+                    coerced_follow_up = _coerce_host_failure_into_follow_up(
+                        query=user_text_for_memory,
+                        inferred_agent=selected_agent or inferred_agent,
+                        failure_text=response_text,
+                    )
+                    if coerced_follow_up is not None:
+                        response_text, response_state = coerced_follow_up
+                    else:
+                        response_state = TaskState.failed
                     response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
-                        state=TaskState.failed,
+                        state=response_state,
                         message=Message(
                             role=Role.agent,
                             parts=response_parts,
@@ -17067,10 +17386,19 @@ def make_langgraph_chat_processor_from_env(
                 delegated_response = _coerce_delegated_response(delegated, fallback_agent_name=selected_agent)
                 if delegated_response is None:
                     response_text = "Delegation did not return a usable result."
+                    coerced_follow_up = _coerce_host_failure_into_follow_up(
+                        query=user_text_for_memory,
+                        inferred_agent=selected_agent or inferred_agent,
+                        failure_text=response_text,
+                    )
+                    if coerced_follow_up is not None:
+                        response_text, response_state = coerced_follow_up
+                    else:
+                        response_state = TaskState.failed
                     response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
-                        state=TaskState.failed,
+                        state=response_state,
                         message=Message(
                             role=Role.agent,
                             parts=response_parts,
@@ -17088,6 +17416,14 @@ def make_langgraph_chat_processor_from_env(
                         response_parts=response_parts,
                     )
                     return
+
+                coerced_follow_up = None
+                if delegated_response["delegated_final_state"] == TaskState.failed:
+                    coerced_follow_up = _coerce_host_failure_into_follow_up(
+                        query=user_text_for_memory,
+                        inferred_agent=delegated_response["delegated_agent"] or selected_agent or inferred_agent,
+                        failure_text=delegated_response["response_text"],
+                    )
 
                 yield Artifact(
                     name="delegation",
@@ -17157,11 +17493,16 @@ def make_langgraph_chat_processor_from_env(
                     )
                     return
 
-                response_parts = delegated_response["response_parts"]
-                response_text = delegated_response["response_text"]
+                if coerced_follow_up is not None:
+                    response_text, response_state_override = coerced_follow_up
+                    response_parts = [TextPart(text=response_text)]
+                else:
+                    response_parts = delegated_response["response_parts"]
+                    response_text = delegated_response["response_text"]
+                    response_state_override = delegated_response["delegated_final_state"]
                 yield Artifact(name="result", parts=response_parts)
                 yield TaskStatus(
-                    state=delegated_response["delegated_final_state"],
+                    state=response_state_override,
                     message=Message(
                         role=Role.agent,
                         parts=response_parts,
@@ -17177,6 +17518,30 @@ def make_langgraph_chat_processor_from_env(
                     history=history if isinstance(history, list) else None,
                     user_text=user_text_for_memory,
                     assistant_text=response_text,
+                    response_parts=response_parts,
+                )
+                return
+
+            clarification_text = _fresh_host_request_clarification(user_text_for_memory, inferred_agent)
+            if clarification_text:
+                response_parts = [TextPart(text=clarification_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.input_required,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=clarification_text,
                     response_parts=response_parts,
                 )
                 return
