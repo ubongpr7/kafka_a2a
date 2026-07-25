@@ -19,6 +19,7 @@ from typing import Any
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.control_plane import ControlPlaneClient, ControlPlaneError
 from kafka_a2a.core.config import A2AAppSettings
+from kafka_a2a.credentials import KA2A_JWT_CLAIM_KEY
 from kafka_a2a.mainapps.common.auth import build_agent_auth_context, require_permission
 from kafka_a2a.models import Artifact, DataPart, Message, Role, Task, TaskArtifactUpdateEvent, TaskState, TaskStatusUpdateEvent, TextPart
 from kafka_a2a.server.auth import JwtBearerConfig
@@ -908,12 +909,66 @@ class VoiceRuntimeContext:
 
 
 def _voice_request_metadata(runtime: VoiceRuntimeContext) -> dict[str, Any]:
-    return with_principal({
-        "profileId": runtime.profile_id,
-        "workspaceName": runtime.workspace_name,
-        "participantName": runtime.participant_name,
-        "userEmail": runtime.user_email,
-    }, runtime.principal)
+    return with_principal(
+        {
+            "profileId": runtime.profile_id,
+            "workspaceName": runtime.workspace_name,
+            "participantName": runtime.participant_name,
+            "userEmail": runtime.user_email,
+        },
+        runtime.principal,
+    )
+
+
+def _merge_voice_workspace_claims(*, principal: Principal, ai_setup: dict[str, Any]) -> Principal:
+    from kafka_a2a.mainapps.agents.services import _secret_for_claim
+
+    claims = dict(principal.claims or {})
+    existing_ka2a = claims.get(KA2A_JWT_CLAIM_KEY)
+    ka2a_claim = dict(existing_ka2a) if isinstance(existing_ka2a, dict) else {}
+    agent_payload = ai_setup.get("agent") if isinstance(ai_setup.get("agent"), dict) else {}
+
+    llm_claim: dict[str, Any] = dict(ka2a_claim.get("llm") or {}) if isinstance(ka2a_claim.get("llm"), dict) else {}
+    provider = str(
+        agent_payload.get("provider")
+        or agent_payload.get("provider_slug")
+        or agent_payload.get("provider_label")
+        or llm_claim.get("provider")
+        or ""
+    ).strip()
+    model_name = str(agent_payload.get("model_name") or llm_claim.get("model") or "").strip()
+    base_url = str(
+        agent_payload.get("effective_base_url")
+        or agent_payload.get("provider_base_url")
+        or llm_claim.get("baseUrl")
+        or ""
+    ).strip()
+    api_key = str(agent_payload.get("api_key") or "").strip()
+
+    if provider:
+        llm_claim["provider"] = provider
+    if model_name:
+        llm_claim["model"] = model_name
+    if base_url:
+        llm_claim["baseUrl"] = base_url
+    if api_key:
+        llm_claim["apiKey"] = _secret_for_claim(api_key)
+    if llm_claim:
+        ka2a_claim["llm"] = llm_claim
+
+    tavily_api_key = str(agent_payload.get("tavily_api_key") or "").strip()
+    if tavily_api_key:
+        ka2a_claim["tavily"] = {
+            "apiKey": _secret_for_claim(tavily_api_key),
+        }
+
+    if ka2a_claim:
+        ka2a_claim["v"] = int(ka2a_claim.get("v") or 1)
+        claims[KA2A_JWT_CLAIM_KEY] = ka2a_claim
+
+    merged_principal = principal.model_copy(deep=True)
+    merged_principal.claims = claims
+    return merged_principal
 
 
 def _room_participant_identities(room: Any) -> set[str]:
@@ -1571,6 +1626,8 @@ async def _voice_entrypoint(ctx: Any) -> None:
 
     if not ai_setup.get("configured"):
         raise RuntimeError("Workspace AI settings are not configured for voice.")
+
+    principal = _merge_voice_workspace_claims(principal=principal, ai_setup=ai_setup)
 
     agent_payload = ai_setup.get("agent") or {}
     resolved_host_agent_name = host_agent_name
