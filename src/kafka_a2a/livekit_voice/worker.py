@@ -8,6 +8,7 @@ import os
 import pathlib
 import logging
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -1736,4 +1737,9 @@ def run_voice_server() -> None:
         raise SystemExit("Install kafka-a2a[voice] to run the LiveKit voice worker.") from exc
 
     server = build_voice_server()
-    cli.run_app(server)
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = [original_argv[0] if original_argv else "ka2a-voice", "start"]
+        cli.run_app(server)
+    finally:
+        sys.argv = original_argv
