@@ -16890,6 +16890,41 @@ def make_langgraph_chat_processor_from_env(
         ):
             agent_listing = await _load_host_agent_listing()
             agent_summaries = agent_listing.get("agents")
+            named_insight = _host_named_insight_from_text(user_text_for_memory)
+            if named_insight:
+                try:
+                    insight_output = await _host_named_insight_payload(
+                        insight_key=named_insight,
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                        user_text=user_text_for_memory,
+                    )
+                except Exception:
+                    insight_output = None
+                if isinstance(insight_output, dict):
+                    response_text = str(insight_output.get("summary") or "").strip() or "Workspace insight ready."
+                    response_parts = [DataPart(data=insight_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                        response_parts=response_parts,
+                    )
+                    return
+
             inferred_agent = _infer_domain_agent_name(user_text_for_memory)
             available_names = _available_agent_names(agent_summaries)
             registered_names = _agent_listing_names(agent_listing, "registered_agents")
@@ -16977,41 +17012,6 @@ def make_langgraph_chat_processor_from_env(
                     response_parts=response_parts,
                 )
                 return
-
-            named_insight = _host_named_insight_from_text(user_text_for_memory)
-            if named_insight:
-                try:
-                    insight_output = await _host_named_insight_payload(
-                        insight_key=named_insight,
-                        tool_executor=tool_executor,
-                        tool_ctx=tool_ctx,
-                        user_text=user_text_for_memory,
-                    )
-                except Exception:
-                    insight_output = None
-                if isinstance(insight_output, dict):
-                    response_text = str(insight_output.get("summary") or "").strip() or "Workspace insight ready."
-                    response_parts = [DataPart(data=insight_output)]
-                    yield Artifact(name="result", parts=response_parts)
-                    yield TaskStatus(
-                        state=TaskState.completed,
-                        message=Message(
-                            role=Role.agent,
-                            parts=response_parts,
-                            context_id=task.context_id,
-                        ),
-                    )
-                    await _maybe_update_memory(
-                        llm=llm,
-                        context_id=task.context_id,
-                        metadata=metadata,
-                        existing=mem,
-                        history=history if isinstance(history, list) else None,
-                        user_text=user_text_for_memory,
-                        assistant_text=response_text,
-                        response_parts=response_parts,
-                    )
-                    return
 
             selected_agent = _select_host_delegation_agent(user_text_for_memory, agent_summaries)
             if selected_agent or len(agent_summaries) == 1 or not agent_summaries:
