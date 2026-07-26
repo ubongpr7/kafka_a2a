@@ -13875,8 +13875,15 @@ def make_langgraph_chat_processor_from_env(
             and _looks_like_fresh_freeform_request(user_text_for_memory)
         ):
             active_workflow = str(saved_workflow_state.get("workflow") or "").strip().lower() if isinstance(saved_workflow_state, dict) else ""
+            current_domain_agent = _canonical_host_domain_agent(agent_name)
+            inferred_domain_agent = _canonical_host_domain_agent(
+                _strong_domain_agent_override(user_text_for_memory)
+                or _infer_domain_agent_name(user_text_for_memory)
+                or ""
+            )
+            inferred_onboarding_scope = _infer_onboarding_scope_from_text(user_text_for_memory)
             should_reset_host_prompt = (
-                _canonical_host_domain_agent(agent_name) == "host"
+                current_domain_agent == "host"
                 and (
                     _is_host_capability_picker_payload(last_interaction_payload)
                     or _is_host_domain_area_picker_payload(last_interaction_payload)
@@ -13884,11 +13891,22 @@ def make_langgraph_chat_processor_from_env(
                 )
             )
             should_reset_onboarding_prompt = (
-                _canonical_host_domain_agent(agent_name) == "onboarding"
+                current_domain_agent == "onboarding"
                 and active_workflow == "product_import"
-                and _infer_onboarding_scope_from_text(user_text_for_memory) != "product_onboarding"
+                and inferred_onboarding_scope != "product_onboarding"
             )
-            if should_reset_host_prompt or should_reset_onboarding_prompt:
+            should_reset_stale_router_workflow = (
+                current_domain_agent in ROUTER_AGENT_NAMES
+                and active_workflow in {"host_orchestration", "product_import"}
+                and (
+                    inferred_onboarding_scope == "product_onboarding"
+                    or (
+                        inferred_domain_agent
+                        and inferred_domain_agent != current_domain_agent
+                    )
+                )
+            )
+            if should_reset_host_prompt or should_reset_onboarding_prompt or should_reset_stale_router_workflow:
                 last_interaction_payload = None
                 saved_workflow_state = None
                 await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
