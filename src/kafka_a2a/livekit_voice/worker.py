@@ -253,6 +253,8 @@ def _jwt_from_env(prefix: str = "KA2A_JWT_") -> JwtBearerConfig | None:
     secret = key
     if not secret and key_path:
         secret = pathlib.Path(key_path).read_text(encoding="utf-8").strip().replace("\\n", "\n")
+    elif secret:
+        secret = secret.replace("\\n", "\n")
     if not (secret or jwks_url):
         raise RuntimeError(f"{prefix}KEY/{prefix}KEY_PATH or {prefix}JWKS_URL is required when JWT auth is enabled.")
 
