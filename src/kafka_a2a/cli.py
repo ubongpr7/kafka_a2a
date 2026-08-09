@@ -540,6 +540,7 @@ def _sync_mcp_tool_servers(args: argparse.Namespace) -> None:
     desired_by_server_id = {
         str(item.get("id") or "").strip(): {
             "server_url": str(item.get("serverUrl") or "").strip(),
+            "timeout_s": item.get("timeoutS") or item.get("timeout_s"),
             "tool_name_prefix": str(item.get("toolNamePrefix") or "").strip(),
             "metadata": item,
         }
@@ -573,13 +574,16 @@ def _sync_mcp_tool_servers(args: argparse.Namespace) -> None:
             old_url = str(row["server_url"] or "").strip()
             new_url = desired["server_url"]
             old_payload = dict(row["payload"] or {})
+            old_timeout = old_payload.get("timeout_s")
+            new_timeout = desired["timeout_s"]
             old_prefix = str(old_payload.get("tool_name_prefix") or "").strip()
             new_prefix = desired["tool_name_prefix"]
             payload = dict(old_payload)
             payload["server_url"] = new_url
+            payload["timeout_s"] = new_timeout
             payload["tool_name_prefix"] = new_prefix
             payload["metadata"] = desired["metadata"]
-            if old_url != new_url or old_prefix != new_prefix or payload != old_payload:
+            if old_url != new_url or old_timeout != new_timeout or old_prefix != new_prefix or payload != old_payload:
                 conn.execute(
                     sa.update(tool_servers)
                     .where(tool_servers.c.id == row["id"])
@@ -593,6 +597,8 @@ def _sync_mcp_tool_servers(args: argparse.Namespace) -> None:
                         "server_id": server_id,
                         "old_url": old_url,
                         "new_url": new_url,
+                        "old_timeout_s": str(old_timeout),
+                        "new_timeout_s": str(new_timeout),
                         "action": "updated-db",
                     }
                 )
@@ -612,21 +618,28 @@ def _sync_mcp_tool_servers(args: argparse.Namespace) -> None:
                     continue
                 old_url = str(item.get("server_url") or "").strip()
                 new_url = desired["server_url"]
+                old_timeout = item.get("timeout_s")
+                new_timeout = desired["timeout_s"]
                 old_prefix = str(item.get("tool_name_prefix") or "").strip()
                 new_prefix = desired["tool_name_prefix"]
                 metadata_payload = item.get("metadata")
                 if not isinstance(metadata_payload, dict):
                     metadata_payload = {}
                 metadata_payload["serverUrl"] = new_url
+                if new_timeout is not None:
+                    metadata_payload["timeoutS"] = new_timeout
                 item["metadata"] = metadata_payload
                 item["server_url"] = new_url
+                item["timeout_s"] = new_timeout
                 item["tool_name_prefix"] = new_prefix
-                if old_url != new_url or old_prefix != new_prefix:
+                if old_url != new_url or old_timeout != new_timeout or old_prefix != new_prefix:
                     changes.append(
                         {
                             "server_id": server_id,
                             "old_url": old_url,
                             "new_url": new_url,
+                            "old_timeout_s": str(old_timeout),
+                            "new_timeout_s": str(new_timeout),
                             "action": "updated-json",
                         }
                     )
@@ -645,7 +658,8 @@ def _sync_mcp_tool_servers(args: argparse.Namespace) -> None:
     for item in result["changes"]:
         print(
             f" - {item['server_id']}: {item['action']} "
-            f"{item['old_url'] or '<none>'} -> {item['new_url']}"
+            f"{item['old_url'] or '<none>'} -> {item['new_url']} "
+            f"(timeout {item.get('old_timeout_s') or '<none>'} -> {item.get('new_timeout_s') or '<none>'})"
         )
 
 

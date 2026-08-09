@@ -510,6 +510,27 @@ def _humanize_voice_progress_text(text: str) -> str:
     return cleaned
 
 
+def _is_priority_voice_progress_update(text: str) -> bool:
+    cleaned = _humanize_voice_progress_text(text)
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "i’m checking that with the workspace agent now",
+            "i've handed this to the",
+            "i’ve handed this to the",
+            "has accepted the task",
+            "is working on it now",
+            "ran into a problem",
+            "needs more information",
+            "requires authentication",
+            "completed the delegated task",
+        )
+    )
+
+
 def _voice_user_facing_failure_follow_up(text: str) -> str | None:
     cleaned = _sanitize_voice_text(text)
     if not cleaned:
@@ -1482,9 +1503,10 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 return
             now = time.monotonic()
             min_interval_s = max(2.0, _env_float("KA2A_VOICE_PROGRESS_SPEAK_MIN_INTERVAL_S", 4.5))
+            is_priority_update = _is_priority_voice_progress_update(cleaned)
             if cleaned == self._last_spoken_response and now - self._last_progress_spoken_at < min_interval_s:
                 return
-            if now - self._last_progress_spoken_at < min_interval_s:
+            if not is_priority_update and now - self._last_progress_spoken_at < min_interval_s:
                 return
             self._last_progress_spoken_at = now
             self._last_spoken_response = cleaned
@@ -1663,6 +1685,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 payload={"syncChat": True, "turnId": turn_id},
             )
             self._remember_progress_update(initial_status)
+            await self._speak_progress_update(initial_status)
             user_message = Message(
                 role=Role.user,
                 parts=[TextPart(text=transcript)],

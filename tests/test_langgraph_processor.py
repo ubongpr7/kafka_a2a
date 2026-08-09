@@ -1999,6 +1999,29 @@ def test_select_host_delegation_agent_prefers_best_matching_specialist() -> None
     assert _select_host_delegation_agent("show my open cashier session", agents) == "pos"
 
 
+def test_select_host_delegation_agent_forces_onboarding_for_explicit_product_import() -> None:
+    agents = [
+        {
+            "name": "product",
+            "description": "Product catalog specialist.",
+            "skills": [{"name": "Product Search", "description": "Search products", "tags": ["product"]}],
+        },
+        {
+            "name": "inventory",
+            "description": "Inventory stock specialist.",
+            "skills": [{"name": "Inventory Lookup", "description": "Check stock", "tags": ["inventory"]}],
+        },
+    ]
+
+    assert (
+        _select_host_delegation_agent(
+            "I need to import products into my inventory from the global catalog",
+            agents,
+        )
+        == "onboarding"
+    )
+
+
 @pytest.mark.asyncio
 async def test_host_auto_delegates_and_waits_for_specialist_result() -> None:
     processor = make_langgraph_chat_processor_from_env(agent_name="host")
@@ -2334,8 +2357,9 @@ async def test_host_capability_selection_routes_onboarding_to_guided_flow_reques
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
-    assert result_artifact.parts[0].data["workflow_stage"] == "scope_picker"
+    assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
     assert result_artifact.parts[0].data["delegated_agent"] == "onboarding"
+    assert result_artifact.parts[0].data["workflow"] == "product_import"
     assert result_artifact.parts[0].data["delegated_task_id"] == "delegated-onboarding-scope"
 
 
@@ -2579,9 +2603,44 @@ async def test_host_direct_setup_query_routes_to_onboarding() -> None:
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
-    assert result_artifact.parts[0].data["workflow_stage"] == "scope_picker"
+    assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
     assert result_artifact.parts[0].data["delegated_agent"] == "onboarding"
+    assert result_artifact.parts[0].data["workflow"] == "product_import"
     assert result_artifact.parts[0].data["delegated_task_id"] == "delegated-onboarding-scope"
+
+
+@pytest.mark.asyncio
+async def test_host_explicit_product_import_routes_directly_to_onboarding_without_listing() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-host-product-import",
+        context_id="ctx-host-product-import",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "delegate_to_agent",
+            {"request": "I need to import products into my inventory", "agent_name": "onboarding"},
+        ),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "onboarding"
+    assert delegation_artifact.parts[0].data["finalState"] == "input-required"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
+    assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
+    assert result_artifact.parts[0].data["delegated_agent"] == "onboarding"
+    assert result_artifact.parts[0].data["workflow"] == "product_import"
 
 
 @pytest.mark.asyncio
@@ -3369,7 +3428,7 @@ async def test_onboarding_agent_review_confirmation_creates_inventory_setup_dire
     assert len(created_artifact.parts[0].data["operations"]) == 7
 
 @pytest.mark.asyncio
-async def test_onboarding_agent_resume_prompt_appears_for_saved_workflow(
+async def test_onboarding_agent_saved_workflow_repeats_catalog_scope_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
@@ -3402,31 +3461,453 @@ async def test_onboarding_agent_resume_prompt_appears_for_saved_workflow(
     events = [event async for event in processor(second_task, second_message, None, None)]
 
     assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == []
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == "Do you want to browse products by category, by brand, or by both?"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_onboarding_agent_explicit_product_import_skips_saved_resume_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="onboarding")
+    first_task = Task(
+        id="task-onboarding-save-import",
+        context_id="ctx-onboarding-save-import",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="help me get started with onboarding")]),
+        ),
+    )
+    first_message = Message(role=Role.user, parts=[TextPart(text="help me get started with onboarding")])
+
+    _ = [event async for event in processor(first_task, first_message, None, None)]
+
+    fake_langgraph_components.reset_fake_components()
+
+    second_task = Task(
+        id="task-onboarding-import-fresh",
+        context_id="ctx-onboarding-save-import",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")]),
+        ),
+    )
+    second_message = Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")])
+
+    events = [event async for event in processor(second_task, second_message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
     assert fake_langgraph_components.FAKE_TOOL_CALLS == [
         (
             "create_multiple_choice",
             {
-                "title": "Resume Product Import",
-                "description": (
-                    "You have an unfinished Product Import workflow.\n\n"
-                    "Choose whether to resume it or start a new onboarding flow."
-                ),
+                "title": "Choose Catalog Filters",
+                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
                 "options": [
-                    {"value": "resume_saved", "label": "Resume Saved Onboarding"},
-                    {"value": "start_over", "label": "Start Over"},
-                    {"value": "cancel_saved", "label": "Cancel Saved Onboarding"},
+                    {"value": "category", "label": "Product Category"},
+                    {"value": "brand", "label": "Brand"},
+                    {"value": "both", "label": "Both Category and Brand"},
                 ],
                 "multiple": False,
                 "allow_input": True,
             },
-        )
+        ),
+        ("users.get_active_company_profile", {}),
     ]
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
-    assert result_artifact.parts[0].data["workflow_stage"] == "resume_prompt"
+    assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_product_router_explicit_product_import_reuses_structured_onboarding_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="product")
+    task = Task(
+        id="task-product-router-import",
+        context_id="ctx-product-router-import",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "create_multiple_choice",
+            {
+                "title": "Choose Catalog Filters",
+                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "options": [
+                    {"value": "category", "label": "Product Category"},
+                    {"value": "brand", "label": "Brand"},
+                    {"value": "both", "label": "Both Category and Brand"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
+    assert result_artifact.parts[0].data["workflow"] == "product_import"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_namespaced_product_agent_explicit_product_import_reuses_structured_onboarding_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="wa-p4-product-d4a6fa2ad877")
+    task = Task(
+        id="task-namespaced-product-router-import",
+        context_id="ctx-namespaced-product-router-import",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "create_multiple_choice",
+            {
+                "title": "Choose Catalog Filters",
+                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "options": [
+                    {"value": "category", "label": "Product Category"},
+                    {"value": "brand", "label": "Brand"},
+                    {"value": "both", "label": "Both Category and Brand"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
+    assert result_artifact.parts[0].data["workflow"] == "product_import"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_namespaced_inventory_agent_explicit_product_import_reuses_structured_onboarding_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="wa-p4-inventory-d4a6fa2ad877")
+    task = Task(
+        id="task-namespaced-inventory-router-import",
+        context_id="ctx-namespaced-inventory-router-import",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "create_multiple_choice",
+            {
+                "title": "Choose Catalog Filters",
+                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "options": [
+                    {"value": "category", "label": "Product Category"},
+                    {"value": "brand", "label": "Brand"},
+                    {"value": "both", "label": "Both Category and Brand"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
+    assert result_artifact.parts[0].data["workflow"] == "product_import"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_product_catalog_admin_explicit_product_import_reuses_structured_onboarding_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="product_catalog_admin")
+    task = Task(
+        id="task-product-catalog-admin-import",
+        context_id="ctx-product-catalog-admin-import",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "create_multiple_choice",
+            {
+                "title": "Choose Catalog Filters",
+                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "options": [
+                    {"value": "category", "label": "Product Category"},
+                    {"value": "brand", "label": "Brand"},
+                    {"value": "both", "label": "Both Category and Brand"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
+    assert result_artifact.parts[0].data["workflow"] == "product_import"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_inventory_setup_explicit_product_import_reuses_structured_onboarding_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory_setup")
+    task = Task(
+        id="task-inventory-setup-import",
+        context_id="ctx-inventory-setup-import",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "create_multiple_choice",
+            {
+                "title": "Choose Catalog Filters",
+                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "options": [
+                    {"value": "category", "label": "Product Category"},
+                    {"value": "brand", "label": "Brand"},
+                    {"value": "both", "label": "Both Category and Brand"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
+    assert result_artifact.parts[0].data["workflow"] == "product_import"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_namespaced_product_agent_catalog_scope_both_returns_category_widget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="wa-p4-product-d4a6fa2ad877")
+    catalog_scope_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Choose Catalog Filters",
+        "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+        "options": [
+            {"value": "category", "label": "Product Category"},
+            {"value": "brand", "label": "Brand"},
+            {"value": "both", "label": "Both Category and Brand"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+        "workflow": "product_import",
+        "workflow_stage": "catalog_scope_prompt",
+        "onboarding_scope": "product_onboarding",
+    }
+    task = Task(
+        id="task-namespaced-product-router-both",
+        context_id="ctx-namespaced-product-router-both",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"both","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")]),
+            Message(role=Role.agent, parts=[DataPart(data=catalog_scope_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"both","additional_input":null}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("product.list_global_catalog_categories", {"limit": 100}),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    payload = result_artifact.parts[0].data
+    assert payload["workflow_stage"] == "category_selection"
+    assert payload["interaction_type"] == "searchable_selection"
+    assert payload["title"] == "Choose Product Categories"
+    assert [item["name"] for item in payload["items"]] == ["Beverages", "Groceries"]
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_namespaced_product_agent_category_selection_resumes_from_saved_workflow_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="wa-p4-product-d4a6fa2ad877")
+    scope_payload = {
+        "interaction_type": "multiple_choice",
+        "title": "Choose Catalog Filters",
+        "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+        "options": [
+            {"value": "category", "label": "Product Category"},
+            {"value": "brand", "label": "Brand"},
+            {"value": "both", "label": "Both Category and Brand"},
+        ],
+        "multiple": False,
+        "allow_input": True,
+        "workflow": "product_import",
+        "workflow_stage": "catalog_scope_prompt",
+        "onboarding_scope": "product_onboarding",
+    }
+    first_task = Task(
+        id="task-namespaced-product-router-category",
+        context_id="ctx-namespaced-product-router-category",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"category","additional_input":null}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="I need to import products into my inventory")]),
+            Message(role=Role.agent, parts=[DataPart(data=scope_payload)]),
+        ],
+    )
+    first_message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"category","additional_input":null}')],
+    )
+
+    first_events = [event async for event in processor(first_task, first_message, None, None)]
+
+    first_result = next(event for event in first_events if isinstance(event, Artifact) and event.name == "result")
+    first_payload = first_result.parts[0].data
+    assert first_payload["workflow_stage"] == "category_selection"
+
+    fake_langgraph_components.reset_fake_components()
+
+    second_task = Task(
+        id="task-namespaced-product-router-category-continue",
+        context_id="ctx-namespaced-product-router-category",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"searchable_selection_response","selected_items":["Beverages"]}')],
+            ),
+        ),
+    )
+    second_message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"searchable_selection_response","selected_items":["Beverages"]}')],
+    )
+
+    second_events = [event async for event in processor(second_task, second_message, None, None)]
+
+    assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "product.list_global_catalog_products",
+            {
+                "categories": ["Beverages"],
+                "brands": None,
+                "page": 1,
+                "page_size": 30,
+                "exclude_imported": True,
+            },
+        ),
+    ]
+
+    second_result = next(event for event in second_events if isinstance(event, Artifact) and event.name == "result")
+    second_payload = second_result.parts[0].data
+    assert second_payload["workflow_stage"] == "product_selection"
+    assert second_payload["interaction_type"] == "searchable_selection"
+    assert second_payload["title"] == "Choose Products to Import"
+    assert [item["name"] for item in second_payload["items"]] == [
+        "Eva Premium Water 75cl",
+        "Coca-Cola Original Taste 50cl",
+    ]
+
+    second_status_events = [event for event in second_events if isinstance(event, TaskStatus)]
+    assert second_status_events[-1].state == TaskState.input_required
 
 
 @pytest.mark.asyncio

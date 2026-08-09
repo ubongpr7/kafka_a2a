@@ -83,6 +83,10 @@ class Ka2aSettings:
     # - "jwt": request metadata -> Principal.claims -> `ka2a` claim (SaaS)
     # - "auto": try JWT first, then env
     llm_credentials_source: CredentialsSource = "env"
+    email_system_from_email: str = "Intera IMS <noreply@interaims.com>"
+    email_agent_from_email: str = "Intera Agent <intera-agent@interaims.com>"
+    email_default_reply_to: str = "support@interaims.com"
+    email_support_email: str = "support@interaims.com"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Ka2aSettings:
@@ -110,6 +114,21 @@ class Ka2aSettings:
             load_dotenv=load_dotenv_flag,
             dotenv_path=str(dotenv_path),
             llm_credentials_source=cast(CredentialsSource, source),
+            email_system_from_email=(
+                env_map.get("EMAIL_SYSTEM_FROM_EMAIL")
+                or env_map.get("DEFAULT_FROM_EMAIL")
+                or "Intera IMS <noreply@interaims.com>"
+            ).strip(),
+            email_agent_from_email=(
+                env_map.get("EMAIL_AGENT_FROM_EMAIL")
+                or "Intera Agent <intera-agent@interaims.com>"
+            ).strip(),
+            email_default_reply_to=(
+                env_map.get("EMAIL_DEFAULT_REPLY_TO")
+                or env_map.get("EMAIL_SUPPORT_EMAIL")
+                or "support@interaims.com"
+            ).strip(),
+            email_support_email=(env_map.get("EMAIL_SUPPORT_EMAIL") or "support@interaims.com").strip(),
         )
 
     def resolve_llm_credentials(

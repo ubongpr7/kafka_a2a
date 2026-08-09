@@ -12,6 +12,7 @@
     {
       "id": "products",
       "serverUrl": "https://product.mcp.interaims.com/mcp/",
+      "timeoutS": 180,
       "toolNamePrefix": "product.",
       "auth": {
         "mode": "forward_bearer"
@@ -79,6 +80,7 @@
         },
         {
           "ref": "products",
+          "timeoutS": 180,
           "tools": [
             "list_global_catalog_categories",
             "list_global_catalog_brands",

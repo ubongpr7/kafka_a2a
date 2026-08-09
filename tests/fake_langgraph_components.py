@@ -872,6 +872,50 @@ class FakeToolExecutor(ToolExecutor):
             agent_name = str(arguments.get("agent_name") or "product")
             delegated_task_id = str(arguments.get("delegated_task_id") or "")
             if agent_name == "onboarding":
+                normalized_request = request.lower()
+                if (
+                    "import" in normalized_request
+                    and "product" in normalized_request
+                    and ("inventory" in normalized_request or "catalog" in normalized_request)
+                ):
+                    return {
+                        "selected_agent": "onboarding",
+                        "delegated_task_id": "delegated-onboarding-product-import",
+                        "response_text": "",
+                        "result_parts": [
+                            {
+                                "kind": "data",
+                                "data": {
+                                    "interaction_type": "multiple_choice",
+                                    "title": "Choose Catalog Filters",
+                                    "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                                    "options": [
+                                        {"value": "category", "label": "Product Category"},
+                                        {"value": "brand", "label": "Brand"},
+                                        {"value": "both", "label": "Both Category and Brand"},
+                                    ],
+                                    "multiple": False,
+                                    "allow_input": True,
+                                    "workflow": "product_import",
+                                    "workflow_stage": "catalog_scope_prompt",
+                                    "onboarding_scope": "product_onboarding",
+                                },
+                            }
+                        ],
+                        "artifacts": {},
+                        "status_updates": [
+                            {
+                                "state": "submitted",
+                                "message": "delegated task submitted",
+                                "final": False,
+                            },
+                            {
+                                "state": "input-required",
+                                "message": "Do you want to browse products by category, by brand, or by both?",
+                                "final": True,
+                            },
+                        ],
+                    }
                 if "Collected onboarding data JSON" in request:
                     return {
                         "selected_agent": "onboarding",
@@ -1378,6 +1422,50 @@ class FakeToolExecutor(ToolExecutor):
                     {"id": "prod-cat-2", "name": "Footwear"},
                 ],
             }
+        if name == "product.list_global_catalog_categories":
+            return [
+                {"name": "Beverages", "product_count": 4, "imported_count": 1},
+                {"name": "Groceries", "product_count": 3, "imported_count": 0},
+            ]
+        if name == "product.list_global_catalog_brands":
+            return [
+                {"name": "Coca-Cola", "product_count": 2, "imported_count": 1},
+                {"name": "Eva", "product_count": 3, "imported_count": 0},
+            ]
+        if name == "product.list_global_catalog_products":
+            return {
+                "page": arguments.get("page", 1),
+                "total_pages": 1,
+                "count": 2,
+                "results": [
+                    {
+                        "id": "global-prod-1",
+                        "name": "Eva Premium Water 75cl",
+                        "brand": "Eva",
+                        "primary_barcode": "8800000001001",
+                        "variant_count": 1,
+                        "short_description": "Premium bottled water",
+                        "category_name": "Beverages",
+                        "display_image": "https://example.com/eva.png",
+                        "base_price": 350.0,
+                    },
+                    {
+                        "id": "global-prod-2",
+                        "name": "Coca-Cola Original Taste 50cl",
+                        "brand": "Coca-Cola",
+                        "primary_barcode": "8800000001002",
+                        "variant_count": 1,
+                        "short_description": "Sparkling soft drink",
+                        "category_name": "Beverages",
+                        "display_image": "https://example.com/coke.png",
+                        "base_price": 450.0,
+                    },
+                ],
+            }
+        if name == "product.import_global_catalog_products":
+            product_ids = list(arguments.get("global_product_ids") or [])
+            results = [{"id": product_id, "status": "imported"} for product_id in product_ids]
+            return {"count": len(results), "results": results}
         if name == "product.search_products":
             return {
                 "count": 2,

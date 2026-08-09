@@ -273,6 +273,7 @@ class AgentControlPlaneService:
             server.description,
             server.transport,
             server.server_url,
+            server.timeout_s,
             server.tool_name_prefix,
             server.auth_mode,
             deepcopy(server.auth_config),
@@ -303,6 +304,7 @@ class AgentControlPlaneService:
                     replacement.description = seeded_server.description
                     replacement.transport = seeded_server.transport
                     replacement.server_url = seeded_server.server_url
+                    replacement.timeout_s = seeded_server.timeout_s
                     replacement.tool_name_prefix = seeded_server.tool_name_prefix
                     replacement.auth_mode = seeded_server.auth_mode
                     replacement.auth_config = deepcopy(seeded_server.auth_config)
@@ -356,6 +358,7 @@ class AgentControlPlaneService:
             replacement.description = seeded_server.description
             replacement.transport = seeded_server.transport
             replacement.server_url = seeded_server.server_url
+            replacement.timeout_s = seeded_server.timeout_s
             replacement.tool_name_prefix = seeded_server.tool_name_prefix
             replacement.auth_mode = seeded_server.auth_mode
             replacement.auth_config = deepcopy(seeded_server.auth_config)

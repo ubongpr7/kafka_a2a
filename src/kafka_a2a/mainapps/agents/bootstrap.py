@@ -295,6 +295,7 @@ def build_seed_state(settings: A2AAppSettings) -> AgentControlPlaneState:
             description=str(server_data.get("description") or f"MCP server for {server_data['id']} tools."),
             transport="mcp",
             server_url=server_data.get("serverUrl", ""),
+            timeout_s=server_data.get("timeoutS") or server_data.get("timeout_s"),
             tool_name_prefix=server_data.get("toolNamePrefix", ""),
             auth_mode=((server_data.get("auth") or {}).get("mode") or "none").strip().lower() or "none",
             auth_config=server_data.get("auth") or {},

@@ -51,6 +51,7 @@ class ToolServer(TimestampedRecord):
     description: str = ""
     transport: ToolTransport = "mcp"
     server_url: str = ""
+    timeout_s: float | None = None
     tool_name_prefix: str = ""
     auth_mode: ToolAuthMode = "none"
     auth_config: dict[str, Any] = Field(default_factory=dict)

@@ -137,6 +137,23 @@ def _tool_auth_from_server(server_payload: dict[str, Any]) -> McpServerAuthConfi
     )
 
 
+def _server_timeout_from_payload(server_payload: dict[str, Any]) -> float | None:
+    raw_value = (
+        server_payload.get("timeout_s")
+        or server_payload.get("timeoutS")
+        or server_payload.get("timeout")
+    )
+    if raw_value in (None, ""):
+        return None
+    try:
+        timeout_s = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    if timeout_s <= 0:
+        return None
+    return timeout_s
+
+
 def _build_mcp_servers(agent_payload: dict[str, Any]) -> list[McpServerConfig]:
     grouped: dict[str, dict[str, Any]] = {}
     for binding in agent_payload.get("tool_bindings") or []:
@@ -161,9 +178,12 @@ def _build_mcp_servers(agent_payload: dict[str, Any]) -> list[McpServerConfig]:
                 "headers": None,
                 "auth": _tool_auth_from_server(server_payload),
                 "runtime_connections": deepcopy(server_payload.get("runtime_connections") or []),
+                "timeout_s": _server_timeout_from_payload(server_payload),
                 "tools": [],
             },
         )
+        if entry.get("timeout_s") is None:
+            entry["timeout_s"] = _server_timeout_from_payload(server_payload)
         entry["tools"].append(remote_tool_name)
 
     servers: list[McpServerConfig] = []
@@ -178,6 +198,7 @@ def _build_mcp_servers(agent_payload: dict[str, Any]) -> list[McpServerConfig]:
                 auth=payload["auth"],
                 runtime_connections=payload["runtime_connections"],
                 enabled=True,
+                timeout_s=payload.get("timeout_s"),
             )
         )
     return servers

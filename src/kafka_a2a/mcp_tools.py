@@ -252,6 +252,7 @@ class McpServerConfig(_McpToolsModel):
     auth: McpServerAuthConfig = Field(default_factory=McpServerAuthConfig)
     runtime_connections: list[McpRuntimeConnectionConfig] = Field(default_factory=list)
     enabled: bool = True
+    timeout_s: float | None = None
 
     @field_validator("id", "server_url", "tool_name_prefix")
     @classmethod
@@ -298,6 +299,7 @@ class McpAgentServerConfig(_McpToolsModel):
     auth: McpServerAuthConfig | None = None
     runtime_connections: list[McpRuntimeConnectionConfig] | None = None
     enabled: bool | None = None
+    timeout_s: float | None = None
 
     @field_validator("ref", "id", "server_url", "tool_name_prefix")
     @classmethod
@@ -343,6 +345,7 @@ class McpAgentServerConfig(_McpToolsModel):
                 else (deepcopy(base.runtime_connections) if base is not None else [])
             ),
             enabled=self.enabled if self.enabled is not None else (base.enabled if base is not None else True),
+            timeout_s=self.timeout_s if self.timeout_s is not None else (base.timeout_s if base is not None else None),
         )
 
 
@@ -381,6 +384,7 @@ class McpAgentConfigFile(_McpToolsModel):
                     auth=server.auth.model_copy(deep=True),
                     runtime_connections=deepcopy(server.runtime_connections),
                     enabled=server.enabled,
+                    timeout_s=server.timeout_s,
                 )
                 for server in self.servers
             ]
@@ -1446,6 +1450,11 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
         server_url = _strip(connection.server_url_override if connection is not None else None) or self._cfg.server_url
         return server_url, headers, connection
 
+    def _timeout_seconds(self) -> float:
+        if self._cfg.timeout_s is not None:
+            return float(self._cfg.timeout_s)
+        return self._timeout_s
+
     def _resolve_auth_token(self, *, ctx: ToolContext) -> str | None:
         auth = self._cfg.auth
         if auth.mode == "none":
@@ -1526,7 +1535,7 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             remote_tools = await _list_remote_tools(
                 server_url=server_url,
                 headers=headers,
-                timeout_s=self._timeout_s,
+                timeout_s=self._timeout_seconds(),
             )
         except Exception as exc:
             _log_mcp_operation(
@@ -1634,7 +1643,7 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             result = await _call_remote_tool(
                 server_url=server_url,
                 headers=headers,
-                timeout_s=self._timeout_s,
+                timeout_s=self._timeout_seconds(),
                 name=route.remote_name,
                 arguments=compact_arguments,
             )

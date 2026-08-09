@@ -191,6 +191,44 @@ def test_multi_mcp_config_supports_shared_server_references(tmp_path: Path) -> N
     assert cfg.servers[1].tools == ["create_product"]
 
 
+def test_multi_mcp_config_supports_server_timeout_overrides(tmp_path: Path) -> None:
+    config_path = tmp_path / "mcp-tools.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "sharedServers": [
+                    {
+                        "id": "products",
+                        "serverUrl": "http://products-mcp:8000/mcp",
+                        "toolNamePrefix": "product.",
+                    }
+                ],
+                "agents": {
+                    "onboarding": {
+                        "servers": [
+                            {
+                                "ref": "products",
+                                "timeoutS": 180,
+                                "tools": ["import_global_catalog_products"],
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = MultiMcpToolExecutorConfig.from_env(
+        {"KA2A_MCP_CONFIG_PATH": str(config_path), "KA2A_AGENT_NAME": "onboarding"}
+    )
+
+    assert len(cfg.servers) == 1
+    assert cfg.servers[0].id == "products"
+    assert cfg.servers[0].timeout_s == 180
+
+
 def test_multi_mcp_config_does_not_apply_shared_servers_as_host_fallback(tmp_path: Path) -> None:
     config_path = tmp_path / "mcp-tools.json"
     config_path.write_text(
@@ -369,6 +407,64 @@ async def test_multi_mcp_executor_routes_tools_and_forwards_bearer(monkeypatch: 
     assert inventory_call["op"] == "call_tool"
     assert inventory_call["tool_name"] == "reserve_stock"
     assert inventory_call["headers"]["authorization"] == "Bearer jwt-abc"
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_uses_server_timeout_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    from kafka_a2a import mcp_tools
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = headers, operation, remote_tool, argument_keys
+        calls.append({"server_url": server_url, "timeout_s": timeout_s})
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {"tools": [{"name": "import_global_catalog_products", "description": "Import products"}]}
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                return {"tool": name, "arguments": dict(arguments or {})}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            timeout_s=30.0,
+            servers=[
+                McpServerConfig(
+                    id="products",
+                    server_url="http://products-mcp:8000/mcp",
+                    tool_name_prefix="product.",
+                    tools=["import_global_catalog_products"],
+                    auth=McpServerAuthConfig(mode="none"),
+                    timeout_s=180.0,
+                )
+            ],
+        )
+    )
+
+    ctx = ToolContext()
+    await executor.call_tool(
+        name="product.import_global_catalog_products",
+        arguments={"global_product_ids": ["abc"]},
+        ctx=ctx,
+    )
+
+    assert calls
+    assert calls[-1]["server_url"] == "http://products-mcp:8000/mcp"
+    assert calls[-1]["timeout_s"] == 180.0
 
 
 @pytest.mark.asyncio
