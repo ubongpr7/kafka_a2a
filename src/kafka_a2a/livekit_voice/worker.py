@@ -960,6 +960,21 @@ def _voice_direct_reply(transcript: str) -> str | None:
         return "You’re welcome."
     if len(tokens) <= 12 and any(phrase in joined for phrase in ("who are you", "what is your name", "your name")):
         return "I’m your Intera voice assistant, connected to your workspace agent."
+    if len(tokens) <= 8 and "how are you" in joined:
+        return "I’m doing well and I’m ready to help with your inventory, sales, products, and workspace questions."
+    if len(tokens) <= 16 and any(
+        phrase in joined
+        for phrase in (
+            "what can you do",
+            "what can you do for me",
+            "how can you help",
+            "what do you do",
+        )
+    ):
+        return (
+            "I can help you check sales, inventory, products, stock levels, imports, purchase orders, "
+            "locations, and other workspace questions. Tell me what you want me to check."
+        )
     return None
 
 

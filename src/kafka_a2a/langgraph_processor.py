@@ -2094,7 +2094,7 @@ def _fresh_host_request_clarification(query: str, agent_name: str | None = None)
 
     if target == "onboarding" or _infer_onboarding_scope_from_text(text) == "product_onboarding":
         return (
-            "I can start the product import flow. Do you want to browse products by category, by brand, or by both?"
+            "I can start the product import flow. Do you want to browse products by category or by brand?"
         )
 
     if target == "pos":
@@ -2134,14 +2134,10 @@ def _normalize_catalog_scope_selection(value: str) -> str | None:
     normalized = _normalize_user_text(value)
     if not normalized:
         return None
-    if "both" in normalized:
-        return "both"
     if "brand" in normalized and "category" not in normalized:
         return "brand"
     if "categor" in normalized and "brand" not in normalized:
         return "category"
-    if "brand" in normalized and "categor" in normalized:
-        return "both"
     return None
 
 
@@ -2631,7 +2627,6 @@ def _onboarding_catalog_scope_picker_arguments(
         "options": [
             {"value": "category", "label": "Product Category"},
             {"value": "brand", "label": "Brand"},
-            {"value": "both", "label": "Both Category and Brand"},
         ],
         "multiple": False,
         "allow_input": True,
@@ -2675,7 +2670,7 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
             {
                 "id": "filters",
                 "title": "Choose Catalog Filters",
-                "description": "First choose whether you want to browse by category, brand, or both. Then list the categories and brands you want.",
+                "description": "First choose whether you want to browse by category or by brand. Then list the names you want.",
                 "fields": [
                     {
                         "name": "catalog_scope",
@@ -2686,7 +2681,6 @@ def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
                             [
                                 ("category", "Product Category"),
                                 ("brand", "Brand"),
-                                ("both", "Both Category and Brand"),
                             ]
                         ),
                         "placeholder": "Choose how you want to filter products",
@@ -3112,9 +3106,7 @@ def _parse_onboarding_prefill_from_text(scope: str, text: str) -> dict[str, Any]
     if brand_names:
         parsed["brand_names"] = "\n".join(_dedupe_preserving_order(brand_names))
 
-    if "both" in normalized and ("brand" in normalized or "category" in normalized):
-        parsed["catalog_scope"] = "both"
-    elif "brand" in normalized and "category" not in normalized:
+    if "brand" in normalized and "category" not in normalized:
         parsed["catalog_scope"] = "brand"
     elif "category" in normalized and "brand" not in normalized:
         parsed["catalog_scope"] = "category"
@@ -16386,7 +16378,7 @@ def make_langgraph_chat_processor_from_env(
                 if selected_catalog_scope is None:
                     selected_catalog_scope = _normalize_catalog_scope_selection(user_text_for_memory)
                 if selected_catalog_scope is None:
-                    response_text = "Do you want to browse products by category, by brand, or by both?"
+                    response_text = "Do you want to browse products by category or by brand?"
                     response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
@@ -16442,7 +16434,7 @@ def make_langgraph_chat_processor_from_env(
             ):
                 selected_scope = _selected_interaction_value(interaction_response) or "product_onboarding"
                 if selected_scope == "product_onboarding":
-                    description = "I can start the product import flow. Do you want to browse products by category, by brand, or by both?"
+                    description = "I can start the product import flow. Do you want to browse products by category or by brand?"
                     try:
                         interaction_output = await tool_executor.call_tool(
                             name="create_multiple_choice",
@@ -16790,7 +16782,7 @@ def make_langgraph_chat_processor_from_env(
                     str(direct_prefill.get("catalog_scope") or "")
                 )
                 if selected_catalog_scope is None:
-                    description = "I can import products from the global catalog. Do you want to browse by category, by brand, or by both?"
+                    description = "I can import products from the global catalog. Do you want to browse by category or by brand?"
                     company_context = await _maybe_active_company_context()
                     if isinstance(company_context, dict):
                         company_name = str(company_context.get("name") or "").strip()
@@ -17391,7 +17383,7 @@ def make_langgraph_chat_processor_from_env(
                 if direct_scope == "product_onboarding":
                     selected_catalog_scope = _normalize_catalog_scope_selection(str(direct_prefill.get("catalog_scope") or ""))
                     if selected_catalog_scope is None:
-                        description = "I can start the product import flow. Do you want to browse products by category, by brand, or by both?"
+                        description = "I can start the product import flow. Do you want to browse products by category or by brand?"
                         if "create_multiple_choice" in tool_names:
                             try:
                                 interaction_output = await tool_executor.call_tool(
@@ -17504,7 +17496,7 @@ def make_langgraph_chat_processor_from_env(
                     return
 
                 company_context = await _maybe_active_company_context()
-                description = "I can start the product import flow. Do you want to browse products by category, by brand, or by both?"
+                description = "I can start the product import flow. Do you want to browse products by category or by brand?"
                 if isinstance(company_context, dict):
                     company_name = str(company_context.get("name") or "").strip()
                     if company_name:
