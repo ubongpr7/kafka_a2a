@@ -936,6 +936,13 @@ def _normalize_voice_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
+def _voice_log_preview(text: str, *, max_chars: int = 160) -> str:
+    preview = re.sub(r"\s+", " ", text.strip())
+    if len(preview) <= max_chars:
+        return preview
+    return f"{preview[: max_chars - 1].rstrip()}…"
+
+
 def _voice_direct_reply(transcript: str) -> str | None:
     normalized = _normalize_voice_text(transcript)
     compact = re.sub(r"[^a-z0-9\s']", " ", normalized)
@@ -1172,7 +1179,12 @@ def _should_delegate_voice_transcript(transcript: str) -> bool:
         "what was",
         "give me",
     )
-    return any(normalized.startswith(prefix) for prefix in contextual_followup)
+    if any(normalized.startswith(prefix) for prefix in contextual_followup):
+        return True
+    tokens = [token for token in re.split(r"[^a-z0-9-]+", normalized) if token]
+    if len(tokens) >= 3:
+        return True
+    return False
 
 
 @dataclass(slots=True)
@@ -1457,8 +1469,20 @@ async def _voice_entrypoint(ctx: Any) -> None:
                     raise asyncio.CancelledError()
                 if self._client_started:
                     return
-                await self._client.start()
+                client_start_timeout_s = max(3.0, _env_float("KA2A_VOICE_CLIENT_START_TIMEOUT_S", 12.0))
+                logger.info(
+                    "voice ka2a client starting",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "timeout_s": client_start_timeout_s,
+                    },
+                )
+                await asyncio.wait_for(self._client.start(), timeout=client_start_timeout_s)
                 self._client_started = True
+                logger.info(
+                    "voice ka2a client started",
+                    extra={"profile_id": self._runtime.profile_id},
+                )
 
         async def _say(self, text: str, *, allow_interruptions: bool = False) -> None:
             if self._closing:
@@ -1684,17 +1708,6 @@ async def _voice_entrypoint(ctx: Any) -> None:
         async def _delegate_to_host(self, transcript: str, *, turn_id: str) -> str:
             if self._closing:
                 raise asyncio.CancelledError()
-            await self._ensure_client()
-            if self._closing:
-                raise asyncio.CancelledError()
-            logger.info(
-                "delegating voice transcript to host",
-                extra={
-                    "profile_id": self._runtime.profile_id,
-                    "transcript_length": len(transcript),
-                    "host_agent_name": self._host_agent_name,
-                },
-            )
             initial_status = "I’m checking that with the workspace agent now."
             await self._publish_voice_event(
                 "status",
@@ -1703,6 +1716,45 @@ async def _voice_entrypoint(ctx: Any) -> None:
             )
             self._remember_progress_update(initial_status)
             await self._speak_progress_update(initial_status)
+            try:
+                await self._ensure_client()
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "voice ka2a client start timed out",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "host_agent_name": self._host_agent_name,
+                    },
+                )
+                final_text = "I could not connect to the workspace agent right now. Please try again in a moment."
+                self._last_completed_result = final_text
+                await self._publish_voice_event("result", final_text, payload={"syncChat": True, "turnId": turn_id})
+                return final_text
+            except Exception:
+                logger.exception(
+                    "voice ka2a client start failed",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "host_agent_name": self._host_agent_name,
+                    },
+                )
+                final_text = "I could not connect to the workspace agent right now. Please try again in a moment."
+                self._last_completed_result = final_text
+                await self._publish_voice_event("result", final_text, payload={"syncChat": True, "turnId": turn_id})
+                return final_text
+            if self._closing:
+                raise asyncio.CancelledError()
+            logger.info(
+                "delegating voice transcript to host",
+                extra={
+                    "profile_id": self._runtime.profile_id,
+                    "transcript_length": len(transcript),
+                    "transcript_preview": _voice_log_preview(transcript),
+                    "host_agent_name": self._host_agent_name,
+                },
+            )
             user_message = Message(
                 role=Role.user,
                 parts=[TextPart(text=transcript)],
@@ -1823,6 +1875,14 @@ async def _voice_entrypoint(ctx: Any) -> None:
             if not self._mark_transcript_for_processing(transcript, source=source):
                 return None
             if _voice_status_requested(transcript):
+                logger.info(
+                    "voice transcript handled as status request",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "source": source,
+                        "transcript_preview": _voice_log_preview(transcript),
+                    },
+                )
                 await self._publish_visible_user_transcript(transcript)
                 status_reply = self._status_reply()
                 self._last_spoken_response = status_reply
@@ -1832,6 +1892,14 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 await self._say(status_reply, allow_interruptions=True)
                 return status_reply
             if _voice_repeat_requested(transcript):
+                logger.info(
+                    "voice transcript handled as repeat request",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "source": source,
+                        "transcript_preview": _voice_log_preview(transcript),
+                    },
+                )
                 await self._publish_visible_user_transcript(transcript)
                 repeat_text = self._last_spoken_response or "I do not have anything to repeat yet."
                 if turn_ctx is not None:
@@ -1854,6 +1922,15 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 elif _should_delegate_voice_transcript(transcript) and not _voice_is_likely_incomplete_fragment(transcript):
                     self._pending_clarification = None
                 else:
+                    logger.info(
+                        "voice transcript still waiting on clarification",
+                        extra={
+                            "profile_id": self._runtime.profile_id,
+                            "source": source,
+                            "transcript_preview": _voice_log_preview(transcript),
+                            "clarification_kind": str(pending_clarification.get("kind") or ""),
+                        },
+                    )
                     follow_up_prompt = str(pending_clarification.get("question") or "Please give me the missing detail.")
                     self._last_spoken_response = follow_up_prompt
                     if turn_ctx is not None:
@@ -1864,6 +1941,15 @@ async def _voice_entrypoint(ctx: Any) -> None:
 
             clarification = _voice_clarification_requirement(transcript)
             if clarification:
+                logger.info(
+                    "voice transcript needs clarification",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "source": source,
+                        "transcript_preview": _voice_log_preview(transcript),
+                        "clarification_kind": clarification["kind"],
+                    },
+                )
                 await self._publish_visible_user_transcript(transcript)
                 question = clarification["question"]
                 self._pending_clarification = {
@@ -1879,6 +1965,14 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 return question
             direct_reply = _voice_direct_reply(transcript)
             if direct_reply:
+                logger.info(
+                    "voice transcript handled as direct reply",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "source": source,
+                        "transcript_preview": _voice_log_preview(transcript),
+                    },
+                )
                 await self._publish_visible_user_transcript(transcript)
                 self._last_spoken_response = direct_reply
                 if turn_ctx is not None:
@@ -1893,9 +1987,19 @@ async def _voice_entrypoint(ctx: Any) -> None:
                         "profile_id": self._runtime.profile_id,
                         "source": source,
                         "word_count": len(transcript.split()),
+                        "transcript_preview": _voice_log_preview(transcript),
                     },
                 )
                 return None
+            logger.info(
+                "voice transcript accepted for host delegation",
+                extra={
+                    "profile_id": self._runtime.profile_id,
+                    "source": source,
+                    "word_count": len(transcript.split()),
+                    "transcript_preview": _voice_log_preview(transcript),
+                },
+            )
             turn_id = _voice_turn_id(transcript)
             await self._publish_visible_user_transcript(transcript)
             await self._publish_host_synced_transcript(transcript, turn_id=turn_id)
