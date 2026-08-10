@@ -372,7 +372,7 @@ services:
       KA2A_VOICE_TTS_MODEL: gpt-4o-mini-tts
       KA2A_VOICE_LLM_MODEL: gpt-4.1-mini
       KA2A_VOICE_HOST_TIMEOUT_S: "240"
-      KA2A_VOICE_BACKEND_DELEGATION_ENABLED: "false"
+      KA2A_VOICE_BACKEND_DELEGATION_ENABLED: "true"
     command: ["voice"]
     restart: unless-stopped
 

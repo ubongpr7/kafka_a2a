@@ -1730,7 +1730,11 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 )
                 final_text = "I could not connect to the workspace agent right now. Please try again in a moment."
                 self._last_completed_result = final_text
-                await self._publish_voice_event("result", final_text, payload={"syncChat": True, "turnId": turn_id})
+                await self._publish_voice_event(
+                    "result",
+                    final_text,
+                    payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
+                )
                 return final_text
             except Exception:
                 logger.exception(
@@ -1742,7 +1746,11 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 )
                 final_text = "I could not connect to the workspace agent right now. Please try again in a moment."
                 self._last_completed_result = final_text
-                await self._publish_voice_event("result", final_text, payload={"syncChat": True, "turnId": turn_id})
+                await self._publish_voice_event(
+                    "result",
+                    final_text,
+                    payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
+                )
                 return final_text
             if self._closing:
                 raise asyncio.CancelledError()
@@ -1763,6 +1771,9 @@ async def _voice_entrypoint(ctx: Any) -> None:
             request_metadata = _voice_request_metadata(self._runtime)
             response_candidates: list[str] = []
             host_timeout_s = float(os.getenv("KA2A_VOICE_HOST_TIMEOUT_S") or "120")
+            first_event_timeout_s = float(os.getenv("KA2A_VOICE_HOST_FIRST_EVENT_TIMEOUT_S") or "20")
+            next_event_timeout_s = float(os.getenv("KA2A_VOICE_HOST_NEXT_EVENT_TIMEOUT_S") or "45")
+            event_count = 0
             try:
                 async with asyncio.timeout(host_timeout_s):
                     stream = await self._client.stream_message(
@@ -1771,7 +1782,44 @@ async def _voice_entrypoint(ctx: Any) -> None:
                         metadata=request_metadata,
                         timeout_s=host_timeout_s,
                     )
-                    async for event in stream:
+                    stream_iter = stream.__aiter__()
+                    while True:
+                        per_event_timeout_s = first_event_timeout_s if event_count == 0 else next_event_timeout_s
+                        try:
+                            event = await asyncio.wait_for(anext(stream_iter), timeout=per_event_timeout_s)
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "voice delegation stalled waiting for host stream event",
+                                extra={
+                                    "profile_id": self._runtime.profile_id,
+                                    "host_agent_name": self._host_agent_name,
+                                    "turn_id": turn_id,
+                                    "event_count": event_count,
+                                    "per_event_timeout_s": per_event_timeout_s,
+                                    "transcript_preview": _voice_log_preview(transcript),
+                                },
+                            )
+                            await self._publish_voice_event(
+                                "error",
+                                "The workspace agent is taking too long to respond.",
+                                payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
+                            )
+                            return (
+                                "The workspace agent is taking too long to respond. Please try again, or ask me to run it again."
+                            )
+                        event_count += 1
+                        logger.info(
+                            "voice delegation received host stream event",
+                            extra={
+                                "profile_id": self._runtime.profile_id,
+                                "host_agent_name": self._host_agent_name,
+                                "turn_id": turn_id,
+                                "event_count": event_count,
+                                "event_type": type(event).__name__,
+                            },
+                        )
                         if self._closing:
                             raise asyncio.CancelledError()
                         stream_payload = _stream_payload_from_event(event)
@@ -1823,7 +1871,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 await self._publish_voice_event(
                     "error",
                     "The analysis service is taking longer than expected.",
-                    payload={"syncChat": True, "turnId": turn_id},
+                    payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
                 )
                 return (
                     "The analysis service is taking longer than expected. Please try again, or ask me to regenerate the analysis."
@@ -1841,7 +1889,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 await self._publish_voice_event(
                     "error",
                     "I could not reach the analysis service right now.",
-                    payload={"syncChat": True, "turnId": turn_id},
+                    payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
                 )
                 return (
                     "I could not reach the analysis service right now. Please try again in a moment."
@@ -1861,6 +1909,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 extra={
                     "profile_id": self._runtime.profile_id,
                     "final_text_length": len(final_text),
+                    "host_event_count": event_count,
                 },
             )
             self._last_completed_result = final_text.strip()
@@ -2012,6 +2061,11 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 if turn_ctx is not None:
                     turn_ctx.add_message(role="assistant", content=acknowledgement)
                 await self._publish_voice_event("status", acknowledgement)
+                await self._publish_voice_event(
+                    "result",
+                    acknowledgement,
+                    payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
+                )
                 await self._say(acknowledgement, allow_interruptions=True)
                 return acknowledgement
             try:
