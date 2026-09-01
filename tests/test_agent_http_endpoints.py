@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from kafka_a2a.secrets import clear_fernet_cache  # noqa: E402
 from kafka_a2a.errors import A2AError, A2AErrorCode  # noqa: E402
+from kafka_a2a.models import AgentCard  # noqa: E402
 from kafka_a2a.server.auth import JwtBearerConfig  # noqa: E402
 from kafka_a2a.server.gateway import GatewayConfig, create_gateway_app  # noqa: E402
 
@@ -34,8 +35,10 @@ def _make_token(
 ) -> str:
     claims = {
         "sub": user_id,
+        "user_id": user_id,
         "profile_id": profile_id,
         "permissions": permissions or [],
+        "token_type": "intera_websocket_ticket",
     }
     if owner_id is not None:
         claims["owner_id"] = owner_id
@@ -447,7 +450,7 @@ def test_conversation_websocket_stream_bootstraps_snapshot_and_supports_ping(
         conversation_id = created.json()["conversation"]["id"]
 
         with client.websocket_connect(
-            f"/ws/conversations/{conversation_id}?token={manager_token}"
+            f"/ws/conversations/{conversation_id}?ws_ticket={manager_token}"
         ) as websocket:
             snapshot = websocket.receive_json()
             assert snapshot["type"] == "conversation.snapshot"
@@ -566,7 +569,7 @@ def test_conversation_activities_persist_delegation_and_final_status(
         )
         conversation_id = created.json()["conversation"]["id"]
 
-        with client.websocket_connect(f"/ws/conversations/{conversation_id}?token={manager_token}") as websocket:
+        with client.websocket_connect(f"/ws/conversations/{conversation_id}?ws_ticket={manager_token}") as websocket:
             snapshot = websocket.receive_json()
             assert snapshot["type"] == "conversation.snapshot"
             websocket.send_json({"type": "message.send", "text": "Please continue"})
@@ -679,7 +682,7 @@ def test_conversation_websocket_completed_response_spends_one_coin(
         assert created.status_code == 200
         conversation_id = created.json()["conversation"]["id"]
 
-        with client.websocket_connect(f"/ws/conversations/{conversation_id}?token={manager_token}") as websocket:
+        with client.websocket_connect(f"/ws/conversations/{conversation_id}?ws_ticket={manager_token}") as websocket:
             assert websocket.receive_json()["type"] == "conversation.snapshot"
             websocket.send_json({"type": "message.send", "text": "Show sales by location for last month."})
             for _ in range(20):
@@ -810,7 +813,7 @@ def test_conversation_websocket_input_required_does_not_spend_until_completion(
         assert created.status_code == 200
         conversation_id = created.json()["conversation"]["id"]
 
-        with client.websocket_connect(f"/ws/conversations/{conversation_id}?token={manager_token}") as websocket:
+        with client.websocket_connect(f"/ws/conversations/{conversation_id}?ws_ticket={manager_token}") as websocket:
             assert websocket.receive_json()["type"] == "conversation.snapshot"
             websocket.send_json({"type": "message.send", "text": "Start the PO receiving review for last month."})
             for _ in range(20):
@@ -977,7 +980,7 @@ def test_conversation_websocket_rebuilds_structured_history_for_follow_up(
         assert created.status_code == 200
         conversation_id = created.json()["conversation"]["id"]
 
-        with client.websocket_connect(f"/ws/conversations/{conversation_id}?token={manager_token}") as websocket:
+        with client.websocket_connect(f"/ws/conversations/{conversation_id}?ws_ticket={manager_token}") as websocket:
             snapshot = websocket.receive_json()
             assert snapshot["type"] == "conversation.snapshot"
 
@@ -1149,7 +1152,7 @@ def test_conversation_plain_text_breaks_out_of_closed_interaction_prompt(
         assert created.status_code == 200
         conversation_id = created.json()["conversation"]["id"]
 
-        with client.websocket_connect(f"/ws/conversations/{conversation_id}?token={manager_token}") as websocket:
+        with client.websocket_connect(f"/ws/conversations/{conversation_id}?ws_ticket={manager_token}") as websocket:
             snapshot = websocket.receive_json()
             assert snapshot["type"] == "conversation.snapshot"
 
@@ -1324,6 +1327,113 @@ def test_gateway_stream_requires_authentication(
     assert response.status_code == 401
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
     assert response.json() == {"detail": "Authentication required"}
+
+
+def test_gateway_stream_falls_back_to_registry_runtime_name_when_control_plane_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    token = _make_token(user_id="17", profile_id="1", owner_id="17")
+    captured: dict[str, object] = {}
+
+    def _raise_runtime_lookup(self, *, access, slug):
+        raise RuntimeError("control plane unavailable")
+
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.agents.services.AgentControlPlaneService.runtime_agent_config",
+        _raise_runtime_lookup,
+    )
+    monkeypatch.setattr(
+        "kafka_a2a.registry.directory.KafkaAgentDirectory.list",
+        lambda self: [
+            AgentCard.model_validate(
+                {
+                    "name": "wa-p1-host-registry",
+                    "description": "Registry host",
+                    "url": "kafka://wa-p1-host-registry",
+                    "version": "0.1.0",
+                    "capabilities": {"streaming": True},
+                    "metadata": {
+                        "ka2aRuntime": {
+                            "publicSlug": "host",
+                            "profileId": "1",
+                        }
+                    },
+                }
+            )
+        ],
+    )
+
+    async def _fake_stream_message(self, **kwargs: object):
+        captured.update(kwargs)
+
+        async def _stream():
+            yield _FakeEvent(
+                {
+                    "kind": "status-update",
+                    "status": {"state": "completed"},
+                },
+                kind="status-update",
+                status=SimpleNamespace(state="completed"),
+            )
+
+        return _stream()
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        response = client.post(
+            "/stream",
+            headers={"Origin": "http://localhost:3000", **_auth_headers(token)},
+            json={"text": "hello", "agentName": "host", "historyLength": 6},
+        )
+
+    assert response.status_code == 200
+    assert captured["agent_name"] == "wa-p1-host-registry"
+
+
+def test_gateway_stream_keeps_verified_jwt_claims_when_principal_overrides_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    token = _make_token(user_id="17", profile_id="1", owner_id="17")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.agents.services.AgentControlPlaneService.runtime_agent_config",
+        lambda self, *, access, slug: {"runtime_name": "wa-p1-host"},
+    )
+    monkeypatch.setattr(
+        "kafka_a2a.mainapps.agents.services.AgentControlPlaneService.build_principal_claim_overrides",
+        lambda self, *, profile_id: (_ for _ in ()).throw(RuntimeError("db unavailable")),
+    )
+
+    async def _fake_stream_message(self, **kwargs: object):
+        captured.update(kwargs)
+
+        async def _stream():
+            yield _FakeEvent(
+                {
+                    "kind": "status-update",
+                    "status": {"state": "completed"},
+                },
+                kind="status-update",
+                status=SimpleNamespace(state="completed"),
+            )
+
+        return _stream()
+
+    monkeypatch.setattr("kafka_a2a.client.Ka2aClient.stream_message", _fake_stream_message)
+
+    with _gateway_client(monkeypatch, tmp_path) as client:
+        response = client.post(
+            "/stream",
+            headers={"Origin": "http://localhost:3000", **_auth_headers(token)},
+            json={"text": "hello", "agentName": "host", "historyLength": 6},
+        )
+
+    assert response.status_code == 200
+    metadata = captured["metadata"]
+    principal = metadata["urn:ka2a:principal"]
+    assert principal["userId"] == "17"
+    assert principal["claims"]["profile_id"] == "1"
 
 
 def test_gateway_stream_uses_stream_specific_timeout_override(

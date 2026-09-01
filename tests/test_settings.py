@@ -120,3 +120,63 @@ def test_settings_resolve_llm_credentials_auto_falls_back_to_env_when_claim_decr
     assert cred is not None
     assert cred.provider == "chatgpt"
     assert cred.api_key == "sk-fallback"
+
+
+def test_settings_resolve_llm_credentials_auto_falls_back_to_control_plane_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeControlPlaneClient:
+        enabled = True
+
+        def get_internal_workspace_ai_setup(self, *, profile_id: str) -> dict[str, object]:
+            assert profile_id == "4"
+            return {
+                "configured": True,
+                "agent": {
+                    "provider": "openai",
+                    "model_name": "gpt-4.1-mini",
+                    "effective_base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-profile",
+                },
+            }
+
+    monkeypatch.setattr("kafka_a2a.control_plane.ControlPlaneClient", FakeControlPlaneClient)
+
+    settings = Ka2aSettings(llm_credentials_source="auto")
+    metadata = with_principal({}, Principal(user_id="u1", tenant_id="4", claims={"profile_id": "4"}))
+
+    cred = settings.resolve_llm_credentials(metadata=metadata, env={})
+
+    assert cred is not None
+    assert cred.provider == "openai"
+    assert cred.model == "gpt-4.1-mini"
+    assert cred.base_url == "https://api.openai.com/v1"
+    assert cred.api_key == "sk-profile"
+
+
+def test_settings_resolve_llm_credentials_auto_uses_workspace_profile_env_for_control_plane_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeControlPlaneClient:
+        enabled = True
+
+        def get_internal_workspace_ai_setup(self, *, profile_id: str) -> dict[str, object]:
+            assert profile_id == "9"
+            return {
+                "configured": True,
+                "agent": {
+                    "provider": "openai",
+                    "model_name": "gpt-4.1",
+                    "api_key": "sk-env-profile",
+                },
+            }
+
+    monkeypatch.setattr("kafka_a2a.control_plane.ControlPlaneClient", FakeControlPlaneClient)
+
+    settings = Ka2aSettings(llm_credentials_source="auto")
+    cred = settings.resolve_llm_credentials(metadata=None, env={"KA2A_WORKSPACE_PROFILE_ID": "9"})
+
+    assert cred is not None
+    assert cred.provider == "openai"
+    assert cred.model == "gpt-4.1"
+    assert cred.api_key == "sk-env-profile"

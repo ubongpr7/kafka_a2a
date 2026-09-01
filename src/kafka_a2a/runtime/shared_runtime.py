@@ -41,6 +41,15 @@ def _text_from_parts(parts: list[Any] | None) -> str:
     return "\n".join(part.text for part in (parts or []) if isinstance(part, TextPart)).strip()
 
 
+def _workspace_instruction(agent_payload: dict[str, Any]) -> str:
+    """Apply every workspace instruction layer to text and non-text runtimes."""
+    return "\n\n".join(
+        str(agent_payload.get(key) or "").strip()
+        for key in ("system_instruction", "special_instruction", "assistant_instruction")
+        if str(agent_payload.get(key) or "").strip()
+    )
+
+
 def _timestamp_to_iso(value: Any) -> str | None:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -296,11 +305,12 @@ def _build_processor(agent_payload: dict[str, Any], *, delegation_backend_factor
         runtime_config,
         delegation_backend_factory=delegation_backend_factory,
     )
+    workspace_instruction = _workspace_instruction(agent_payload)
 
     if processor_name in {"langgraph-chat", "langgraph_chat", "langgraph"}:
         return make_langgraph_chat_processor_from_env(
             agent_name=public_slug,
-            system_prompt_override=str(agent_payload.get("system_instruction") or ""),
+            system_prompt_override=workspace_instruction,
             tool_executor_override=tool_executor,
         )
 
@@ -314,9 +324,9 @@ def _build_processor(agent_payload: dict[str, Any], *, delegation_backend_factor
             if str(item).strip()
         )
         or None,
-        "KA2A_SYSTEM_PROMPT": str(agent_payload.get("system_instruction") or ""),
+        "KA2A_SYSTEM_PROMPT": workspace_instruction,
         "KA2A_SYSTEM_PROMPT_PATH": None,
-        "KA2A_AGENT_SYSTEM_PROMPT": str(agent_payload.get("system_instruction") or ""),
+        "KA2A_AGENT_SYSTEM_PROMPT": workspace_instruction,
         "KA2A_AGENT_SYSTEM_PROMPT_PATH": None,
     }
     with _env_overrides(env_values):
@@ -552,13 +562,29 @@ class SharedRuntimeService:
             if runtime_name not in desired:
                 await self._stop_agent(runtime_name)
 
+        agents_to_start: list[tuple[str, str, dict[str, Any]]] = []
         for runtime_name, (fingerprint, agent_payload) in desired.items():
             current = self._managed.get(runtime_name)
             if current is not None and current.fingerprint == fingerprint:
                 continue
             if current is not None:
                 await self._stop_agent(runtime_name)
-            await self._start_agent(runtime_name=runtime_name, fingerprint=fingerprint, agent_payload=agent_payload)
+            agents_to_start.append((runtime_name, fingerprint, agent_payload))
+
+        # Kafka consumer group joins take seconds. Starting workspace workers one
+        # at a time leaves the active host unavailable behind unrelated agents.
+        # They are independent runtime names, so registration can proceed together.
+        if agents_to_start:
+            await asyncio.gather(
+                *(
+                    self._start_agent(
+                        runtime_name=runtime_name,
+                        fingerprint=fingerprint,
+                        agent_payload=agent_payload,
+                    )
+                    for runtime_name, fingerprint, agent_payload in agents_to_start
+                )
+            )
 
     async def _start_agent(self, *, runtime_name: str, fingerprint: str, agent_payload: dict[str, Any]) -> None:
         runtime_card_payload = agent_payload.get("runtime_card_payload")

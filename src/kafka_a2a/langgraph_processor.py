@@ -551,7 +551,7 @@ def _resolve_insight_time_window(
         prefix = str(count_match.group(1) or "last").strip().lower()
         count = _parse_relative_count(count_match.group(2)) or 1
         unit = str(count_match.group(3) or "day")
-        if prefix in {"last", "previous"} and unit in {"month", "quarter", "year"}:
+        if prefix in {"last", "previous"} and unit in {"month", "quarter", "year"} and count > 1:
             calendar_window = _calendar_window_for_recent_period(today, count, unit)
             if calendar_window is not None:
                 return _build_time_window(
@@ -625,10 +625,78 @@ def _resolve_insight_time_window(
     )
 
 
+def _is_cross_domain_business_review_query(query: str) -> bool:
+    text = _normalize_user_text(query)
+    if not text:
+        return False
+    return any(
+        token in text
+        for token in (
+            "business analyst",
+            "data analyst",
+            "analyze my business data",
+            "analyse my business data",
+            "business performance",
+            "quarterly performance",
+            "quarterly business review",
+            "quarterly business performance",
+            "business performance review",
+            "performance review for my business",
+            "act as an analyst",
+            "act like an analyst",
+            "analyze the entire data",
+            "analyse the entire data",
+            "analyze my whole business",
+            "analyse my whole business",
+            "analyze the whole workspace",
+            "analyse the whole workspace",
+            "analyze my entire system",
+            "analyse my entire system",
+            "analyze the entire system",
+            "analyse the entire system",
+            "analyze my whole system",
+            "analyse my whole system",
+            "analyze the whole system",
+            "analyse the whole system",
+            "what am i not seeing",
+            "what are we missing",
+            "hidden insight",
+            "hidden insights",
+            "strategic business review",
+            "management review",
+            "owner review",
+        )
+    ) or (
+        _text_matches_all_terms(text, r"\b(business|data)\b", r"\banalyst\b")
+        or _text_matches_all_terms(text, r"\bbusiness\b", r"\bdata\b", r"\b(analy[sz]e|analysis|review|report)\b")
+        or _text_matches_all_terms(text, r"\bbusiness\b", r"\bperformance\b", r"\b(analy[sz]e|analysis|review|report)\b")
+        or _text_matches_all_terms(
+            text,
+            r"\bbusiness\b",
+            r"\b(analy[sz]e|analysis|review|report)\b",
+            r"\b(last|past|this)\b",
+            r"\b(day|days|week|weeks|month|months|quarter|quarters|year|years)\b",
+        )
+        or _text_matches_all_terms(text, r"\b(last|past|this)\b", r"\bquarter\b", r"\b(business|performance|review|analysis)\b")
+        or _text_matches_all_terms(text, r"\b(entire|whole|overall)\b", r"\b(data|business|workspace|system|operation|operations)\b", r"\b(analy[sz]e|review|insight|insights)\b")
+        or _text_matches_all_terms(text, r"\bwhat\b", r"\b(missing|not seeing|overlooked)\b")
+    )
+
+
 def _strong_domain_agent_override(query: str) -> str | None:
     text = _normalize_user_text(query)
     if not text:
         return None
+    if _is_cross_domain_business_review_query(text):
+        return None
+    if _is_inventory_stock_snapshot_query(text):
+        return "inventory"
+    if _is_ambiguous_product_risk_query(text):
+        # A product-risk request without catalog-quality language needs a short
+        # inventory-oriented clarification, not a catalog-admin questionnaire.
+        return "inventory"
+    if _is_non_import_onboarding_request(text):
+        return "onboarding"
     if (
         any(token in text for token in ("import", "onboard", "onboarding"))
         and any(
@@ -656,8 +724,6 @@ def _strong_domain_agent_override(query: str) -> str | None:
         return "pos"
     if _text_matches_all_terms(text, r"\b(top|best)\s+sellers?\b"):
         return "pos"
-    if _text_matches_all_terms(text, r"\bout[\s-]*of[\s-]*stock\b", r"\bproducts?\b"):
-        return "inventory"
     if _text_matches_all_terms(text, r"\bstaff\b", r"\bactivity\b"):
         return "users"
     if _text_matches_all_terms(text, r"\bsupport\b", r"\baccess\b", r"\baudit\b"):
@@ -668,6 +734,97 @@ def _strong_domain_agent_override(query: str) -> str | None:
         return "onboarding"
     if _text_matches_all_terms(text, r"\b(purchase order|po)\b", r"\b(receiving|lifecycle|timeline)\b"):
         return "inventory"
+    return None
+
+
+def _is_inventory_stock_snapshot_query(value: str) -> bool:
+    text = _normalize_user_text(value)
+    if not text:
+        return False
+    return any(
+        phrase in text
+        for phrase in (
+            "low stock",
+            "low-stock",
+            "out of stock",
+            "out-of-stock",
+            "stock risk",
+            "stock risks",
+            "stock posture",
+            "reorder candidates",
+            "should i reorder",
+            "what should i reorder",
+            "below reorder",
+            "run out soon",
+            "zero balance",
+            "zero-balance",
+            "missing from the shelf",
+            "expiring stock",
+            "expiring soon",
+            "expiry risk",
+        )
+    )
+
+
+def _is_inventory_loss_or_shrinkage_query(value: str) -> bool:
+    text = _normalize_user_text(value)
+    if not text or "low stock" in text or "low-stock" in text:
+        return False
+    return any(
+        phrase in text
+        for phrase in (
+            "lose stock",
+            "lost stock",
+            "stock loss",
+            "stock losses",
+            "shrinkage",
+            "theft",
+            "missing inventory",
+        )
+    )
+
+
+def _is_ambiguous_product_risk_query(value: str) -> bool:
+    text = _normalize_user_text(value)
+    if not text or "risk" not in text:
+        return False
+    if not any(token in text for token in ("product", "products", "system", "inventory")):
+        return False
+    catalog_risk_terms = (
+        "catalog",
+        "barcode",
+        "sku",
+        "pricing",
+        "price",
+        "metadata",
+        "duplicate",
+        "visibility",
+        "description",
+        "image",
+    )
+    return not any(term in text for term in catalog_risk_terms)
+
+
+def _corrected_inventory_request(value: str) -> str | None:
+    """Convert an explicit user correction into the requested stock snapshot."""
+    text = _normalize_user_text(value)
+    if not text:
+        return None
+    correction_signal = bool(
+        re.search(
+            r"\b(?:i\s+(?:did(?: not|n't)|do(?: not|n't))\s+(?:say|mean)|"
+            r"i\s+said|not\s+(?:new|low|out[\s-]*of)\s+stock|instead)\b",
+            text,
+        )
+    )
+    if not correction_signal:
+        return None
+    if "low stock" in text or "low-stock" in text:
+        return "Show low-stock products."
+    if "out of stock" in text or "out-of-stock" in text:
+        return "Show out-of-stock products."
+    if "reorder" in text:
+        return "Show reorder candidates."
     return None
 
 
@@ -742,12 +899,7 @@ def _insight_location_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if location_rows:
             return location_rows
 
-    candidate_widgets = payload.get("widgets")
-    if not isinstance(candidate_widgets, list):
-        candidate_widgets = []
-    for candidate in candidate_widgets:
-        if not isinstance(candidate, dict):
-            continue
+    for candidate in _insight_widgets(payload):
         widget_type = str(candidate.get("type") or "").strip().lower()
         if widget_type not in {"comparison_table", "table", "ranked_list"}:
             continue
@@ -886,14 +1038,32 @@ def _latest_repeated_question_response_parts(user_text: str, history: Any) -> li
     return None
 
 
+def _insight_widgets(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten nested review sections so follow-ups can reuse the completed result."""
+    widgets = payload.get("widgets") if isinstance(payload.get("widgets"), list) else []
+    flattened: list[dict[str, Any]] = []
+
+    def _append_widgets(candidates: list[Any]) -> None:
+        for widget in candidates:
+            if not isinstance(widget, dict):
+                continue
+            flattened.append(widget)
+            if str(widget.get("type") or "").strip() != "section_stack":
+                continue
+            sections = widget.get("sections") if isinstance(widget.get("sections"), list) else []
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                section_widgets = section.get("widgets") if isinstance(section.get("widgets"), list) else []
+                _append_widgets(section_widgets)
+
+    _append_widgets(widgets)
+    return flattened
+
+
 def _insight_widget_by_title(payload: dict[str, Any], *title_terms: str) -> dict[str, Any] | None:
-    widgets = payload.get("widgets")
-    if not isinstance(widgets, list):
-        return None
     normalized_terms = [term.strip().lower() for term in title_terms if term.strip()]
-    for widget in widgets:
-        if not isinstance(widget, dict):
-            continue
+    for widget in _insight_widgets(payload):
         title = str(widget.get("title") or "").strip().lower()
         if all(term in title for term in normalized_terms):
             return widget
@@ -902,7 +1072,7 @@ def _insight_widget_by_title(payload: dict[str, Any], *title_terms: str) -> dict
 
 def _insight_metric_value(payload: dict[str, Any], label: str) -> Any:
     label_lower = label.strip().lower()
-    for widget in payload.get("widgets") or []:
+    for widget in _insight_widgets(payload):
         if not isinstance(widget, dict) or str(widget.get("type") or "") != "metric_grid":
             continue
         for item in widget.get("data") or []:
@@ -1027,6 +1197,64 @@ def _insight_comparison_value(item: dict[str, Any], *keys: str) -> float:
     return 0.0
 
 
+def _business_review_location_attention_answer(
+    user_text: str,
+    payload: dict[str, Any],
+    *,
+    timeframe_suffix: str,
+) -> str | None:
+    """Answer location-priority follow-ups from the completed cross-domain review."""
+    text = _normalize_user_text(user_text)
+    if not any(term in text for term in ("location", "branch", "store", "outlet", "warehouse")):
+        return None
+    if not any(term in text for term in ("attention", "intervention", "priority", "risk", "problem", "issue")):
+        return None
+    if not any(str(widget.get("type") or "").strip() == "section_stack" for widget in _insight_widgets(payload)):
+        return None
+
+    risk_counts: dict[str, int] = {}
+    for widget in _insight_widgets(payload):
+        if str(widget.get("type") or "").strip() != "risk_panel":
+            continue
+        if "stock risk" not in str(widget.get("title") or "").strip().lower():
+            continue
+        items = widget.get("items") if isinstance(widget.get("items"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            detail = str(item.get("detail") or "").strip()
+            location = detail.split("·", 1)[0].strip()
+            if location:
+                risk_counts[location] = risk_counts.get(location, 0) + 1
+
+    if not risk_counts:
+        return None
+    location, risk_count = max(risk_counts.items(), key=lambda item: (item[1], item[0]))
+    location_rows = _insight_location_rows(payload)
+    sales_row = next(
+        (
+            row
+            for row in location_rows
+            if str(row.get("location") or row.get("label") or "").strip().lower() == location.lower()
+        ),
+        None,
+    )
+    if not isinstance(sales_row, dict):
+        return (
+            f"{location} needs the most attention{timeframe_suffix}: it has "
+            f"{_format_plain_number(risk_count)} active stock risk{'s' if risk_count != 1 else ''}."
+        )
+
+    sales = _insight_comparison_value(sales_row, "sales", "total_sales", "revenue", "amount", "value")
+    orders = _insight_comparison_value(sales_row, "orders", "order_count", "count", "transaction_count")
+    return (
+        f"{location} needs the most attention{timeframe_suffix}: it has "
+        f"{_format_plain_number(risk_count)} active stock risk{'s' if risk_count != 1 else ''} while contributing "
+        f"{_format_plain_money(sales, payload)} across {_format_plain_number(orders)} orders. "
+        "Prioritize replenishment there so stockouts do not affect a major sales location."
+    )
+
+
 def _latest_insight_follow_up_answer(
     user_text: str,
     history: Any,
@@ -1039,6 +1267,10 @@ def _latest_insight_follow_up_answer(
     if _is_simple_greeting_query(text):
         return None
     if _is_new_scoped_insight_request(text):
+        return None
+    # A new operational request must never be answered from the previous
+    # report just because an insight payload is present in the conversation.
+    if _is_explicit_product_import_request(text):
         return None
     payload = _select_history_insight_payload(user_text, history)
     if not payload and memory is not None and isinstance(memory.analysis, dict):
@@ -1053,6 +1285,49 @@ def _latest_insight_follow_up_answer(
     timeframe = payload.get("timeframe") if isinstance(payload.get("timeframe"), dict) else {}
     timeframe_label = str(timeframe.get("label") or "").strip()
     timeframe_suffix = f" for {timeframe_label}" if timeframe_label else ""
+
+    location_attention_answer = _business_review_location_attention_answer(
+        user_text,
+        payload,
+        timeframe_suffix=timeframe_suffix,
+    )
+    if location_attention_answer:
+        return location_attention_answer
+
+    if (
+        re.search(r"\b(right|correct|is that|are those|are these)\b", text)
+        and re.search(r"\b(sales?|report|reports|summary|summaries|result|results|figures)\b", text)
+    ):
+        summary = str(payload.get("summary") or "").strip()
+        return (
+            f"Yes. Those are the sales results{timeframe_suffix}. {summary}"
+            if summary
+            else f"Yes. Those are the sales results{timeframe_suffix}."
+        )
+
+    wants_location_grouping = bool(
+        re.search(r"\b(group|grouped|break\s*down|breakdown|split)\b", text)
+        and re.search(r"\b(location|locations|branch|branches|store|stores|outlet|outlets|warehouse|warehouses)\b", text)
+    )
+    if wants_location_grouping:
+        rows = _insight_location_rows(payload)
+        if rows:
+            value_keys = ("sales", "value", "total_sales", "revenue", "amount", "total_revenue")
+            order_keys = ("orders", "count", "order_count", "orderCount", "transaction_count")
+            ranked_rows = sorted(
+                (row for row in rows if isinstance(row, dict)),
+                key=lambda row: _insight_comparison_value(row, *value_keys),
+                reverse=True,
+            )
+            lines = []
+            for row in ranked_rows:
+                label = str(row.get("location") or row.get("label") or "Location").strip()
+                sales = _insight_comparison_value(row, *value_keys)
+                orders = _insight_comparison_value(row, *order_keys)
+                order_suffix = f" across {_format_plain_number(orders)} orders" if orders else ""
+                lines.append(f"- {label}: {_format_plain_money(sales, payload)}{order_suffix}")
+            if lines:
+                return f"The existing sales report is already grouped by location{timeframe_suffix}:\n" + "\n".join(lines)
 
     if re.search(r"\b(procurement|purchasing|purchase order|po|receiving|supplier)\b", text):
         procurement_items = _insight_procurement_items(payload)
@@ -1286,7 +1561,21 @@ def _latest_insight_follow_up_answer(
             if lines:
                 return "From the last analysis, the top products were:\n" + "\n".join(lines)
 
-    if any(phrase in text for phrase in ("what should i do", "what do i do", "first action", "next action", "recommend", "priority")):
+    if any(
+        phrase in text
+        for phrase in (
+            "what should i do",
+            "what do i do",
+            "what decisions",
+            "which decisions",
+            "decision",
+            "first action",
+            "next action",
+            "next step",
+            "recommend",
+            "priority",
+        )
+    ):
         ranked = _insight_widget_by_title(payload, "recommended", "actions") or _insight_widget_by_title(payload, "next", "actions")
         items = ranked.get("items") if isinstance(ranked, dict) else []
         if isinstance(items, list) and items:
@@ -1296,6 +1585,34 @@ def _latest_insight_follow_up_answer(
                 detail = str(item.get("detail") or item.get("description") or "").strip()
                 lines.append(f"{index}. {label}{f': {detail}' if detail else ''}")
             return "From the last analysis, prioritize:\n" + "\n".join(lines)
+
+        # Sales-only reports do not always carry the cross-service action
+        # widget. Still answer the owner's decision question from the data
+        # that is present instead of returning a routing diagnostic.
+        priorities: list[str] = []
+        location_rows = _insight_location_rows(payload)
+        if location_rows:
+            best_location = max(
+                (row for row in location_rows if isinstance(row, dict)),
+                key=lambda row: _insight_comparison_value(row, "sales", "value", "total_sales", "revenue"),
+                default=None,
+            )
+            if best_location:
+                location_label = str(best_location.get("location") or best_location.get("label") or "the leading location")
+                priorities.append(f"protect availability at {location_label}, the leading revenue location")
+        product_rows = _insight_widget_by_title(payload, "top", "product")
+        product_items = product_rows.get("items") if isinstance(product_rows, dict) else []
+        if isinstance(product_items, list) and product_items:
+            top_product = next((item for item in product_items if isinstance(item, dict)), None)
+            if top_product:
+                product_label = str(top_product.get("label") or top_product.get("product_name") or "the top-selling product")
+                priorities.append(f"keep {product_label} in stock because it is leading the product mix")
+        if payload.get("timeframe"):
+            priorities.append("review the daily sales trend regularly and compare weaker periods with stock and purchasing activity")
+        if priorities:
+            return "Based on the saved sales report, the key decisions are:\n" + "\n".join(
+                f"{index}. {priority}." for index, priority in enumerate(priorities[:3], start=1)
+            )
 
     if any(phrase in text for phrase in ("risk", "risks", "problem", "problems", "attention", "concern", "weak")):
         panel = _insight_widget_by_title(payload, "attention") or _insight_widget_by_title(payload, "risk")
@@ -1331,10 +1648,9 @@ def _latest_insight_follow_up_answer(
         if explanation or insights:
             return "\n".join([part for part in [explanation, *insights[:3]] if part])
 
-    return (
-        f"I have the previous analysis{timeframe_suffix}, but that follow-up is not mapped yet. "
-        "Ask about the leader, laggard, gap, trend, risk, or next action, and I will answer from the saved result."
-    )
+    # Do not trap a new or unsupported request behind the previous insight.
+    # Returning None lets the normal host/router path classify it correctly.
+    return None
 
 
 QUERY_TOKEN_ALLOWLIST: set[str] = {"pos", "sku", "api", "ui"}
@@ -1538,6 +1854,7 @@ HOST_DOMAIN_AREA_PICKERS: dict[str, dict[str, Any]] = {
         "title": "Inventory Management",
         "description": "Choose the inventory area you want help with. You can also type a specific inventory question.",
         "options": [
+            {"value": "inventory_setup", "label": "Set Up Inventory"},
             {"value": "inventory_visibility", "label": "Stock and Warehouse Visibility"},
             {"value": "inventory_procurement", "label": "Purchase Orders and Receiving"},
             {"value": "inventory_fulfillment", "label": "Transfers, Adjustments, and Fulfillment"},
@@ -1584,9 +1901,9 @@ HOST_DOMAIN_AREA_REQUESTS: dict[str, dict[str, str]] = {
     },
     "inventory": {
         "inventory_setup": (
-            "The user selected Product Import from the Product Management menu. "
-            "Help them discover curated products, select items, and import them into the workspace. "
-            "Start with a short structured choice or the next required import step. "
+            "The user selected Set Up Inventory from the Inventory Management menu. "
+            "Help them create or configure stock locations, inventory categories, or inventory items. "
+            "Start with a short structured choice or the next required setup step. "
             "Never ask for raw internal ids when lookups or selections can be used instead."
         ),
         "inventory_visibility": (
@@ -1891,6 +2208,8 @@ def _should_offer_host_unavailable_domain_picker(value: str) -> bool:
         return True
     if _is_host_introspection_query(text) or _is_host_capability_picker_query(text) or _is_host_availability_query(text):
         return True
+    if "onboard" in text or "onboarding" in text:
+        return True
     if _is_domain_action_request(text):
         return True
     generic_help_phrases = (
@@ -1916,7 +2235,11 @@ def _is_host_capability_picker_payload(payload: dict[str, Any] | None) -> bool:
 
 
 def _friendly_agent_label(name: str) -> str:
-    return HOST_AGENT_LABELS.get(name, name.replace("_", " ").title())
+    raw_name = str(name or "").strip()
+    canonical_name = _canonical_host_domain_agent(raw_name)
+    if canonical_name in HOST_AGENT_LABELS:
+        return HOST_AGENT_LABELS[canonical_name]
+    return raw_name.replace("_", " ").title()
 
 
 def _host_unavailable_follow_up_text(agent_name: str) -> str:
@@ -2066,23 +2389,37 @@ def _request_explicitly_mentions_time_range(value: str) -> bool:
         "this week",
         "last week",
         "past week",
+        "past one week",
         "this month",
         "last month",
         "past month",
+        "past one month",
         "this quarter",
         "last quarter",
         "past quarter",
+        "past one quarter",
         "this year",
         "last year",
         "past year",
+        "past one year",
         "date range",
-        "between ",
-        "from ",
         "for the past ",
         "for the last ",
     )
     return any(token in text for token in time_tokens) or bool(
-        re.search(r"\b\d+\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)\b", text)
+        # A bare "from" is conversational (for example, "from that review"),
+        # not a time range. Only accept it when it introduces an ISO date span.
+        re.search(
+            r"\b(?:from|between)\s+\d{4}-\d{2}-\d{2}\s+(?:to|and)\s+\d{4}-\d{2}-\d{2}\b",
+            text,
+        )
+        or re.search(r"\b\d{4}-\d{2}-\d{2}\s+(?:to|and)\s+\d{4}-\d{2}-\d{2}\b", text)
+        or re.search(r"\b\d+\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)\b", text)
+        or re.search(
+            r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+            r"(day|days|week|weeks|month|months|quarter|quarters|year|years)\b",
+            text,
+        )
     )
 
 
@@ -2092,20 +2429,66 @@ def _fresh_host_request_clarification(query: str, agent_name: str | None = None)
     if not text:
         return None
 
-    if target == "onboarding" or _infer_onboarding_scope_from_text(text) == "product_onboarding":
+    if _is_cross_domain_business_review_query(text):
+        if not _request_explicitly_mentions_time_range(text):
+            return (
+                "What time range should I use for the business review: last 7 days, "
+                "last month, last quarter, or last year?"
+            )
+        return None
+
+    if _infer_onboarding_scope_from_text(text) == "product_onboarding":
         return (
             "I can start the product import flow. Do you want to browse products by category or by brand?"
         )
 
     if target == "pos":
         mentions_analysis = any(token in text for token in ("analyse", "analyze", "analysis", "review", "report", "sales", "revenue", "orders"))
+        mentions_concrete_pos_metric = any(
+            token in text
+            for token in (
+                "sold",
+                "seller",
+                "sellers",
+                "top product",
+                "top products",
+                "terminal",
+                "terminals",
+                "cashier",
+                "cashiers",
+                "location",
+                "locations",
+                "payment",
+                "payments",
+                "refund",
+                "refunds",
+                "failed",
+                "exception",
+                "exceptions",
+            )
+        )
+        if mentions_concrete_pos_metric:
+            return None
         if mentions_analysis and not _request_explicitly_mentions_time_range(text):
             return "What time range should I use for the sales analysis?"
         if any(token in text for token in ("compare", "comparison")) and "location" not in text:
             return "Do you want me to compare sales by location, by product, or by period?"
+        if mentions_analysis:
+            return None
         return "What part of sales would you like me to analyze: revenue, orders, top sellers, locations, or trends?"
 
     if target == "inventory":
+        if _is_inventory_loss_or_shrinkage_query(text) and not _request_explicitly_mentions_time_range(text):
+            return (
+                "Do you mean a current low-stock check, or stock loss and shrinkage over a time range?"
+            )
+        if _is_ambiguous_product_risk_query(text):
+            return (
+                "Do you want a current inventory-risk check (out of stock, low stock, reorder, and expiry), "
+                "or a catalog data-quality review?"
+            )
+        if _is_inventory_stock_snapshot_query(text):
+            return None
         if any(token in text for token in ("analyse", "analyze", "analysis", "review", "report")) and not _request_explicitly_mentions_time_range(text):
             return "What time range should I use for the inventory analysis?"
         if "inventory" in text and not any(
@@ -2153,6 +2536,231 @@ def _coerce_host_failure_into_follow_up(
     if not follow_up:
         return None
     return follow_up, TaskState.input_required
+
+
+def _host_unavailable_capability_picker_description(agent_name: str) -> str:
+    return (
+        f"{_friendly_agent_label(agent_name)} is not currently available. "
+        "Choose one of the areas that is available right now."
+    )
+
+
+def _history_content_text(value: Any) -> str:
+    if hasattr(value, "text"):
+        text = str(getattr(value, "text", "") or "").strip()
+        if text:
+            return text
+    if hasattr(value, "parts"):
+        parts = getattr(value, "parts", None)
+        if isinstance(parts, list):
+            fragments = [_history_content_text(item) for item in parts]
+            return "\n".join(fragment for fragment in fragments if fragment)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        fragments: list[str] = []
+        for item in value:
+            text = _history_content_text(item)
+            if text:
+                fragments.append(text)
+        return "\n".join(fragment for fragment in fragments if fragment)
+    if isinstance(value, dict):
+        parts = value.get("parts")
+        if isinstance(parts, list):
+            fragments = [_history_content_text(item) for item in parts]
+            return "\n".join(fragment for fragment in fragments if fragment)
+        for key in ("text", "content", "value"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                return candidate
+        for key in ("root", "message", "part"):
+            nested = value.get(key)
+            if nested is not None:
+                nested_text = _history_content_text(nested)
+                if nested_text:
+                    return nested_text
+    return ""
+
+
+def _history_message_text(item: Any) -> str:
+    if hasattr(item, "parts"):
+        parts = getattr(item, "parts", None)
+        if isinstance(parts, list):
+            return _text_from_parts(parts)
+    if isinstance(item, dict):
+        direct_text = _history_content_text(item.get("content"))
+        if direct_text:
+            return direct_text
+        parts = item.get("parts")
+        if isinstance(parts, list):
+            text = _history_content_text(parts)
+            if text:
+                return text
+        message = item.get("message")
+        if isinstance(message, dict):
+            nested_text = _history_content_text(message.get("content"))
+            if nested_text:
+                return nested_text
+            nested_parts = message.get("parts")
+            if isinstance(nested_parts, list):
+                text = _history_content_text(nested_parts)
+                if text:
+                    return text
+        nested_text = _history_content_text(item)
+        if nested_text:
+            return nested_text
+    return ""
+
+
+def _history_message_role(item: Any) -> str:
+    role = getattr(item, "role", None)
+    if isinstance(role, str):
+        return role.strip().lower()
+    if hasattr(role, "value"):
+        return str(getattr(role, "value", "")).strip().lower()
+    if isinstance(item, dict):
+        message = item.get("message")
+        if isinstance(message, dict):
+            nested_role = message.get("role")
+            if isinstance(nested_role, str):
+                return nested_role.strip().lower()
+        item_role = item.get("role")
+        if isinstance(item_role, str):
+            return item_role.strip().lower()
+    return ""
+
+
+def _host_time_range_suffix(answer: str) -> str:
+    cleaned = str(answer or "").strip().rstrip("?.!,")
+    if not cleaned:
+        return ""
+    normalized = _normalize_user_text(cleaned)
+    if normalized.startswith("for "):
+        return cleaned
+    if normalized.startswith(("past ", "last ", "this ", "previous ")):
+        return f"for the {cleaned}"
+    if normalized.startswith(("today", "yesterday")):
+        return f"for {cleaned}"
+    if normalized.startswith(("from ", "between ", "since ", "during ", "over ", "in ")):
+        return cleaned
+    return f"for {cleaned}"
+
+
+def _host_merge_clarification_answer(original_request: str, answer: str) -> str | None:
+    if not _request_explicitly_mentions_time_range(answer):
+        return None
+    original = str(original_request or "").strip().rstrip("?.!,")
+    if not original:
+        return None
+    original = re.sub(
+        r"^(?:can|could|would)\s+you\s+",
+        "",
+        original,
+        flags=re.IGNORECASE,
+    )
+    original = re.sub(
+        r"^(?:please|help me(?:\s+to)?|i need to|i want to)\s+",
+        "",
+        original,
+        flags=re.IGNORECASE,
+    ).strip()
+    suffix = _host_time_range_suffix(answer)
+    if not suffix:
+        return None
+    merged = f"{original} {suffix}".strip()
+    if not merged:
+        return None
+    return merged[0].upper() + merged[1:]
+
+
+def _latest_host_clarification_merge(user_text: str, history: Any) -> str | None:
+    if not _request_explicitly_mentions_time_range(user_text):
+        return None
+    if not isinstance(history, list):
+        return None
+    for index in range(len(history) - 1, -1, -1):
+        item = history[index]
+        if _history_message_role(item) not in {"agent", "assistant", "ai"}:
+            continue
+        prompt = _normalize_user_text(_history_message_text(item))
+        if prompt not in {
+            _normalize_user_text("What time range should I use for the sales analysis?"),
+            _normalize_user_text("What time range should I use for the business review: last 7 days, last month, last quarter, or last year?"),
+            _normalize_user_text("What time range should I use for the inventory analysis?"),
+            _normalize_user_text("What time range should I use for the product analysis?"),
+            _normalize_user_text("What time range should I use for that audit or activity check?"),
+        }:
+            continue
+        for prior_index in range(index - 1, -1, -1):
+            prior_item = history[prior_index]
+            if _history_message_role(prior_item) not in {"user", "human"}:
+                continue
+            merged = _host_merge_clarification_answer(_history_message_text(prior_item), user_text)
+            if merged:
+                return merged
+            return None
+        break
+    return None
+
+
+def _latest_host_clarification_target(user_text: str, history: Any) -> str | None:
+    """Recover the domain when a serialized task history lost its text parts."""
+    if not _request_explicitly_mentions_time_range(user_text) or not isinstance(history, list):
+        return None
+    for index in range(len(history) - 1, -1, -1):
+        item = history[index]
+        if _history_message_role(item) not in {"agent", "assistant", "ai"}:
+            continue
+        if not _is_known_host_clarification_prompt(_history_message_text(item)):
+            continue
+        for prior_index in range(index - 1, -1, -1):
+            prior_item = history[prior_index]
+            if _history_message_role(prior_item) not in {"user", "human"}:
+                continue
+            return _canonical_host_domain_agent(_infer_domain_agent_name(_history_message_text(prior_item)) or "") or None
+        break
+    return None
+
+
+def _is_known_host_clarification_prompt(value: str) -> bool:
+    prompt = _normalize_user_text(value)
+    return prompt in {
+        _normalize_user_text("What time range should I use for the sales analysis?"),
+        _normalize_user_text("What time range should I use for the business review: last 7 days, last month, last quarter, or last year?"),
+        _normalize_user_text("What time range should I use for the inventory analysis?"),
+        _normalize_user_text("What time range should I use for the product analysis?"),
+        _normalize_user_text("What time range should I use for that audit or activity check?"),
+    }
+
+
+def _clarification_workflow_state(
+    *,
+    original_request: str,
+    clarification_prompt: str,
+    inferred_agent: str | None,
+) -> dict[str, Any]:
+    return {
+        "workflow": "clarification",
+        "status": "awaiting_input",
+        "stage": "follow_up",
+        "original_request": str(original_request or "").strip(),
+        "clarification_prompt": str(clarification_prompt or "").strip(),
+        "target_agent": _canonical_host_domain_agent(inferred_agent or _infer_domain_agent_name(original_request) or ""),
+    }
+
+
+def _workflow_state_clarification_merge(user_text: str, workflow_state: dict[str, Any] | None) -> str | None:
+    if not isinstance(workflow_state, dict):
+        return None
+    if str(workflow_state.get("workflow") or "").strip().lower() != "clarification":
+        return None
+    clarification_prompt = str(workflow_state.get("clarification_prompt") or "").strip()
+    if not _is_known_host_clarification_prompt(clarification_prompt):
+        return None
+    original_request = str(workflow_state.get("original_request") or "").strip()
+    if not original_request:
+        return None
+    return _host_merge_clarification_answer(original_request, user_text)
 
 
 def _looks_like_fresh_freeform_request(value: str) -> bool:
@@ -2220,8 +2828,22 @@ def _host_orchestration_plan(query: str, agent_summaries: list[dict[str, Any]] |
     text = _normalize_user_text(query)
     if not text:
         return []
-    inferred_agent = _strong_domain_agent_override(query)
     available_names = _available_agent_names(agent_summaries)
+    if _is_cross_domain_business_review_query(text):
+        preferred_order: list[str] = ["pos", "inventory", "users", "product"]
+        plan = [
+            name
+            for name in preferred_order
+            if (not available_names or name in available_names)
+        ]
+        if plan:
+            return plan
+    # Snapshot questions are resolved by one inventory specialist. Do not let
+    # overlapping words such as "product" create a product-to-inventory plan.
+    if _is_inventory_stock_snapshot_query(text):
+        if not available_names or "inventory" in available_names:
+            return ["inventory"]
+    inferred_agent = _strong_domain_agent_override(query)
     if inferred_agent and inferred_agent != "onboarding" and (not available_names or inferred_agent in available_names):
         return [inferred_agent]
     candidates: list[tuple[str, int]] = []
@@ -2273,6 +2895,73 @@ def _host_orchestration_next_request(workflow_state: dict[str, Any], next_agent:
     completed_agents = workflow_state.get("completed_agents") if isinstance(workflow_state.get("completed_agents"), list) else []
     last_response_text = str(workflow_state.get("last_response_text") or "").strip()
     completed_labels = ", ".join(_friendly_agent_label(str(name)) for name in completed_agents if str(name).strip())
+    if _is_cross_domain_business_review_query(original_request):
+        analyst_window = _resolve_insight_time_window(
+            original_request,
+            default_days=365,
+            default_label="last 1 year",
+        )
+        next_agent_domain = _canonical_host_domain_agent(next_agent)
+        blocks = [
+            "Continue the user's multi-domain business review.",
+            f"Original user request: {original_request}" if original_request else "",
+            f"Completed steps so far: {completed_labels}." if completed_labels else "",
+            f"Latest completed step result: {last_response_text}" if last_response_text else "",
+            (
+                "Time range to use: "
+                f"{analyst_window['label']} ({analyst_window['start_date']} to {analyst_window['end_date']})."
+            ),
+        ]
+        if next_agent_domain == "inventory":
+            blocks.extend(
+                [
+                    "Run the full Inventory Management portion of the business review for that same time range.",
+                    (
+                        "Cover all of these in one response: stock posture and availability; turnover and velocity; "
+                        "reorder recommendations; ageing and expiry analysis; valuation and carrying cost; "
+                        "fulfillment and reservation issues; and procurement or receiving signals that affect stock health."
+                    ),
+                    (
+                        "Use defaults without asking the user to choose a single focus: include all locations, provide "
+                        "both company-wide and per-location outputs, use POS sales from earlier steps as the demand signal "
+                        "where helpful, and only include lot or expiry-aware analysis if the workspace tracks it."
+                    ),
+                    (
+                        "Do not send a focus picker, a default-confirmation checklist, or any retry prompt unless "
+                        "required permissions or source data are truly unavailable."
+                    ),
+                ]
+            )
+        elif next_agent_domain == "users":
+            blocks.extend(
+                [
+                    "Run the full Users and Workspace Controls portion of the business review for that same time range.",
+                    (
+                        "Cover staff activity, audit anomalies, role or permission risks, and subscription or capacity pressure "
+                        "that could affect operations."
+                    ),
+                    "Use sensible defaults and do not ask the user to choose a sub-focus unless access is genuinely blocked.",
+                ]
+            )
+        elif next_agent_domain == "product":
+            blocks.extend(
+                [
+                    "Run the full Product Management portion of the business review for that same time range.",
+                    (
+                        "Cover catalog health, assortment gaps, duplicate-code risks, media or merchandising weaknesses, "
+                        "and global catalog import opportunities that could strengthen current demand coverage."
+                    ),
+                    "Use sensible defaults and do not ask the user to choose a sub-focus unless access is genuinely blocked.",
+                ]
+            )
+        else:
+            blocks.extend(
+                [
+                    f"Run the full {_friendly_agent_label(next_agent)} portion of the business review for that same time range.",
+                    "Use sensible defaults and do not ask the user for a menu selection unless access is genuinely blocked.",
+                ]
+            )
+        return "\n".join(block for block in blocks if block)
     blocks = [
         "Continue the user's multi-domain workflow.",
         f"Original user request: {original_request}" if original_request else "",
@@ -2282,6 +2971,463 @@ def _host_orchestration_next_request(workflow_state: dict[str, Any], next_agent:
         "Use structured interactions if more information is still required.",
     ]
     return "\n".join(block for block in blocks if block)
+
+
+def _host_orchestration_should_auto_continue(query: str, plan: list[str] | None) -> bool:
+    return _is_cross_domain_business_review_query(query) and len(plan or []) > 1
+
+
+def _host_orchestration_compose_final_text(
+    original_request: str,
+    sections: list[tuple[str, str]],
+) -> str:
+    normalized_request = str(original_request or "").strip()
+    heading = (
+        f"I completed the business review for: {normalized_request}"
+        if normalized_request
+        else "I completed the business review."
+    )
+    rendered_sections: list[str] = []
+    for agent_name, section_text in sections:
+        text = str(section_text or "").strip()
+        if not text:
+            continue
+        rendered_sections.append(f"{_friendly_agent_label(agent_name)}\n{text}")
+    if not rendered_sections:
+        return heading
+    return f"{heading}\n\n" + "\n\n".join(rendered_sections)
+
+
+def _insight_response_from_candidate(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        if str(value.get("kind") or "").strip() == "insight_response":
+            return value
+        for key in ("structured_payload", "structuredPayload", "payload", "data"):
+            nested = value.get(key)
+            if isinstance(nested, dict) and str(nested.get("kind") or "").strip() == "insight_response":
+                return nested
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except Exception:
+            decoded = None
+        if isinstance(decoded, dict) and str(decoded.get("kind") or "").strip() == "insight_response":
+            return decoded
+    return None
+
+
+def _insight_response_from_parts(parts: list[Any] | None) -> dict[str, Any] | None:
+    for part in parts or []:
+        if isinstance(part, DataPart):
+            payload = _insight_response_from_candidate(part.data)
+            if isinstance(payload, dict):
+                return payload
+            continue
+        if isinstance(part, ToolResultPart):
+            payload = _insight_response_from_candidate(part.output)
+            if isinstance(payload, dict):
+                return payload
+            continue
+        if isinstance(part, TextPart):
+            payload = _insight_response_from_candidate(part.text)
+            if isinstance(payload, dict):
+                return payload
+    return None
+
+
+def _insight_response_from_artifacts(artifacts: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(artifacts, dict):
+        return None
+    for payload in artifacts.values():
+        if isinstance(payload, list):
+            parts = _ka2a_parts_from_model_content(payload)
+            insight_payload = _insight_response_from_parts(parts)
+            if isinstance(insight_payload, dict):
+                return insight_payload
+        else:
+            insight_payload = _insight_response_from_candidate(payload)
+            if isinstance(insight_payload, dict):
+                return insight_payload
+    return None
+
+
+def _business_review_strip_list_marker(value: str) -> str:
+    return re.sub(r"^\s*(?:[-*]|\d+[.)])\s+", "", str(value or "").strip()).strip()
+
+
+def _business_review_parse_number(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    cleaned = text.replace(",", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
+
+
+def _business_review_first_sentence(text: str) -> str:
+    normalized = " ".join(str(text or "").strip().split())
+    if not normalized:
+        return ""
+    sentence_match = re.match(r"(.+?[.!?])(?:\s|$)", normalized)
+    if sentence_match:
+        return sentence_match.group(1).strip()
+    return normalized[:220].strip()
+
+
+def _business_review_section_blocks(text: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    lines = [str(line or "").strip() for line in str(text or "").splitlines()]
+    lines = [line for line in lines if line]
+    intro: list[str] = []
+    blocks: list[tuple[str, list[str]]] = []
+    current_title: str | None = None
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_title, current_lines
+        if current_title and current_lines:
+            blocks.append((current_title, current_lines[:]))
+        current_title = None
+        current_lines = []
+
+    for index, line in enumerate(lines):
+        is_list_item = bool(re.match(r"^\s*(?:[-*]|\d+[.)])\s+", line))
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        next_is_list_item = bool(re.match(r"^\s*(?:[-*]|\d+[.)])\s+", next_line))
+        is_heading = (not is_list_item) and (line.endswith(":") or next_is_list_item)
+        if is_heading:
+            flush()
+            current_title = line.rstrip(":").strip()
+            continue
+        if current_title is None and not intro and not is_list_item:
+            intro.append(line)
+            continue
+        target = current_lines if current_title is not None else intro
+        target.append(line)
+
+    flush()
+    return intro, blocks
+
+
+def _business_review_metric_items(lines: list[str]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for line in lines:
+        stripped = _business_review_strip_list_marker(line)
+        if ":" not in stripped:
+            continue
+        label, raw_value = stripped.split(":", 1)
+        label = label.strip()
+        raw_value = raw_value.strip()
+        if not label or not raw_value:
+            continue
+        numeric_value = _business_review_parse_number(raw_value)
+        items.append(
+            {
+                "label": label,
+                "value": numeric_value if numeric_value is not None else raw_value,
+                "detail": "" if numeric_value is not None else raw_value,
+            }
+        )
+    return items
+
+
+def _business_review_ranked_items(lines: list[str]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for line in lines:
+        stripped = _business_review_strip_list_marker(line)
+        if "—" in stripped:
+            label, raw_value = stripped.split("—", 1)
+        elif " - " in stripped:
+            label, raw_value = stripped.split(" - ", 1)
+        else:
+            continue
+        label = label.strip()
+        raw_value = raw_value.strip()
+        if not label or not raw_value:
+            continue
+        numeric_value = _business_review_parse_number(raw_value)
+        item: dict[str, Any] = {"label": label}
+        if numeric_value is not None:
+            item["value"] = numeric_value
+            if raw_value and str(int(numeric_value) if numeric_value.is_integer() else numeric_value) != raw_value:
+                item["detail"] = raw_value
+        else:
+            item["detail"] = raw_value
+            item["hide_value"] = True
+        items.append(item)
+    return items
+
+
+def _business_review_text_list_widget(title: str, lines: list[str]) -> dict[str, Any]:
+    return {
+        "type": "text_list",
+        "title": title,
+        "items": [
+            {"detail": _business_review_strip_list_marker(line)}
+            for line in lines
+            if _business_review_strip_list_marker(line)
+        ],
+    }
+
+
+def _business_review_plain_section_widgets(agent_name: str, text: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], str]:
+    intro, blocks = _business_review_section_blocks(text)
+    widgets: list[dict[str, Any]] = []
+    suggested_actions: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    section_summary = _business_review_first_sentence("\n".join(intro)) or _business_review_first_sentence(text)
+
+    if intro:
+        widgets.append(_business_review_text_list_widget("Overview", intro))
+
+    for title, lines in blocks:
+        normalized_title = _normalize_user_text(title)
+        if not lines:
+            continue
+        if "would you like me to" in normalized_title or "next steps" in normalized_title:
+            for line in lines:
+                prompt = _business_review_strip_list_marker(line)
+                if not prompt:
+                    continue
+                suggested_actions.append(
+                    {
+                        "label": prompt[:72],
+                        "prompt": prompt,
+                        "payload": {
+                            "type": "insight_suggested_action",
+                            "prompt": prompt,
+                        },
+                    }
+                )
+            widgets.append(_business_review_text_list_widget(title, lines))
+            continue
+
+        metric_items = _business_review_metric_items(lines)
+        ranked_items = _business_review_ranked_items(lines)
+
+        if ("risk" in normalized_title or "flag" in normalized_title or "check" in normalized_title or "warning" in normalized_title):
+            warnings.extend(_business_review_strip_list_marker(line) for line in lines if _business_review_strip_list_marker(line))
+            widgets.append(
+                {
+                    "type": "risk_panel",
+                    "title": title,
+                    "items": [
+                        {
+                            "label": _business_review_strip_list_marker(line)[:96],
+                            "detail": _business_review_strip_list_marker(line),
+                            "severity": "warning",
+                        }
+                        for line in lines
+                        if _business_review_strip_list_marker(line)
+                    ],
+                }
+            )
+            continue
+
+        if metric_items and len(metric_items) >= 2:
+            widgets.append(
+                {
+                    "type": "metric_grid",
+                    "title": title,
+                    "data": metric_items[:8],
+                }
+            )
+            continue
+
+        if ranked_items:
+            widgets.append(
+                {
+                    "type": "ranked_list",
+                    "title": title,
+                    "items": ranked_items[:12],
+                }
+            )
+            continue
+
+        widgets.append(_business_review_text_list_widget(title, lines))
+
+    if not widgets:
+        widgets.append(
+            {
+                "type": "text_block",
+                "title": _friendly_agent_label(agent_name),
+                "content": str(text or "").strip(),
+            }
+        )
+
+    return widgets, suggested_actions, warnings, section_summary
+
+
+def _host_orchestration_compose_final_payload(
+    original_request: str,
+    sections: list[dict[str, Any]],
+) -> dict[str, Any]:
+    normalized_request = str(original_request or "").strip()
+    analyst_window = _resolve_insight_time_window(
+        normalized_request,
+        default_days=365,
+        default_label="last 1 year",
+    )
+    section_widgets: list[dict[str, Any]] = []
+    suggested_actions: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    def _payload_has_positive_pos_data(payload: dict[str, Any]) -> bool:
+        widgets = payload.get("widgets") if isinstance(payload.get("widgets"), list) else []
+        for widget in widgets:
+            if not isinstance(widget, dict):
+                continue
+            rows = widget.get("data")
+            if not isinstance(rows, list):
+                rows = widget.get("rows") if isinstance(widget.get("rows"), list) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                for key, value in row.items():
+                    if key in {"label", "location", "product", "detail", "format"}:
+                        continue
+                    try:
+                        if float(value) > 0:
+                            return True
+                    except (TypeError, ValueError):
+                        continue
+        return False
+
+    def _is_empty_pos_payload(entry: dict[str, Any]) -> bool:
+        if _canonical_host_domain_agent(str(entry.get("agent_name") or "")) != "pos":
+            return False
+        payload = entry.get("payload")
+        if not isinstance(payload, dict) or str(payload.get("kind") or "").strip() != "insight_response":
+            return False
+        summary = " ".join(
+            str(payload.get(key) or "").strip().lower()
+            for key in ("summary", "explanation")
+        )
+        return bool(
+            re.search(r"no (?:completed )?(?:(?:pos|variant) )?sales|no completed sales|no sales", summary)
+            and not _payload_has_positive_pos_data(payload)
+        )
+
+    has_non_empty_pos_section = any(
+        _canonical_host_domain_agent(str(entry.get("agent_name") or "")) == "pos"
+        and not _is_empty_pos_payload(entry)
+        for entry in sections
+    )
+
+    for entry in sections:
+        # A broad review can cause both the audit path and a generic product-sales
+        # fallback to return. Keep the factual non-empty POS report and discard the
+        # contradictory empty fallback when both are present.
+        if has_non_empty_pos_section and _is_empty_pos_payload(entry):
+            continue
+        agent_name = str(entry.get("agent_name") or "").strip()
+        section_text = str(entry.get("text") or "").strip()
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else None
+        section_title = _friendly_agent_label(agent_name)
+        section_summary = ""
+        widgets: list[dict[str, Any]] = []
+        if isinstance(payload, dict) and str(payload.get("kind") or "").strip() == "insight_response":
+            widgets = [widget for widget in (payload.get("widgets") if isinstance(payload.get("widgets"), list) else []) if isinstance(widget, dict)]
+            section_summary = str(payload.get("summary") or payload.get("explanation") or "").strip()
+            suggested_actions.extend(
+                action
+                for action in (payload.get("suggested_actions") if isinstance(payload.get("suggested_actions"), list) else [])
+                if isinstance(action, dict)
+            )
+            warnings.extend(str(item).strip() for item in (payload.get("warnings") if isinstance(payload.get("warnings"), list) else []) if str(item).strip())
+        else:
+            widgets, section_actions, section_warnings, fallback_summary = _business_review_plain_section_widgets(agent_name, section_text)
+            suggested_actions.extend(section_actions)
+            warnings.extend(section_warnings)
+            section_summary = fallback_summary
+
+        if not section_summary:
+            section_summary = _business_review_first_sentence(section_text)
+
+        section_widgets.append(
+            {
+                "id": agent_name or section_title.lower().replace(" ", "_"),
+                "title": section_title,
+                "summary": section_summary,
+                "widgets": widgets,
+                "raw_text": section_text,
+            }
+        )
+
+    deduped_actions: list[dict[str, Any]] = []
+    seen_action_keys: set[str] = set()
+    for action in suggested_actions:
+        key = json.dumps(action, sort_keys=True, ensure_ascii=False)
+        if key in seen_action_keys:
+            continue
+        seen_action_keys.add(key)
+        deduped_actions.append(action)
+
+    overview_items: list[dict[str, Any]] = [
+        {"label": "Domains Completed", "value": len(section_widgets)},
+        {"label": "Review Window", "value": analyst_window["label"]},
+        {"label": "Start Date", "value": analyst_window["start_date"]},
+        {"label": "End Date", "value": analyst_window["end_date"]},
+    ]
+
+    return {
+        "kind": "insight_response",
+        "title": "Business performance review",
+        "summary": (
+            f"Business review is ready for {analyst_window['label']}."
+            if analyst_window.get("label")
+            else "Business review is ready."
+        ),
+        "explanation": (
+            f"I completed the business review for: {normalized_request}"
+            if normalized_request
+            else "I completed the business review."
+        ),
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Review coverage",
+                "data": overview_items,
+            },
+            {
+                "type": "section_stack",
+                "title": "Business review dashboard",
+                "sections": section_widgets,
+            },
+        ],
+        "suggested_actions": deduped_actions[:8],
+        "warnings": warnings[:12],
+        "confidence": "medium",
+        "data_sources": [],
+        "permissions_checked": [],
+    }
+
+
+def _host_orchestration_compose_partial_follow_up(
+    *,
+    completed_sections: list[tuple[str, str]],
+    follow_up_text: str,
+) -> str:
+    follow_up = str(follow_up_text or "").strip()
+    if not completed_sections:
+        return follow_up
+    completed_summary = "; ".join(
+        f"{_friendly_agent_label(agent_name)}: {str(section_text or '').strip()}"
+        for agent_name, section_text in completed_sections
+        if str(section_text or "").strip()
+    )
+    if not completed_summary:
+        return follow_up
+    return (
+        "I completed part of the review already. "
+        f"{completed_summary}\n\nTo finish the remaining part, I need this clarification:\n{follow_up}"
+    )
 
 
 _DELEGATED_CONFIRMATION_TEXT_PATTERNS = (
@@ -2604,13 +3750,16 @@ def _is_onboarding_payload(payload: dict[str, Any] | None, *, stage: str) -> boo
 
 def _onboarding_scope_picker_arguments(
     *,
-    description: str = "Choose the product import flow you want to start. I will guide you step by step.",
+    description: str = "Choose the setup area you want to complete first. I will guide you step by step.",
 ) -> dict[str, Any]:
     return {
         "title": "Start Product Import",
         "description": description,
         "options": [
             {"value": "product_onboarding", "label": "Product Import"},
+            {"value": "stock_locations", "label": "Stock Locations"},
+            {"value": "inventory_categories", "label": "Inventory Categories"},
+            {"value": "inventory_setup", "label": "Inventory Setup"},
         ],
         "multiple": False,
         "allow_input": True,
@@ -2665,210 +3814,262 @@ def _select_options(options: list[tuple[str, str]]) -> list[dict[str, str]]:
 
 
 def _onboarding_wizard_steps(scope: str) -> list[dict[str, Any]]:
-    if scope == "product_onboarding":
+    if scope == "inventory_setup":
         return [
             {
-                "id": "filters",
-                "title": "Choose Catalog Filters",
-                "description": "First choose whether you want to browse by category or by brand. Then list the names you want.",
+                "id": "inventory",
+                "title": "Inventory Setup",
+                "description": "Define the first inventory item you want to create.",
                 "fields": [
                     {
-                        "name": "catalog_scope",
+                        "name": "default_inventory_name",
+                        "type": "text",
+                        "label": "Inventory Name",
+                        "required": True,
+                        "placeholder": "Main Inventory",
+                    },
+                    {
+                        "name": "inventory_description",
+                        "type": "textarea",
+                        "label": "Inventory Description",
+                        "required": False,
+                        "placeholder": "Primary sellable stock ledger",
+                    },
+                    {
+                        "name": "related_stock_location_id",
                         "type": "select",
-                        "label": "Browse By",
+                        "label": "Primary Location for This Inventory",
+                        "required": False,
+                        "options": [],
+                        "placeholder": "Choose a stock location",
+                    },
+                    {
+                        "name": "inventory_category_id",
+                        "type": "select",
+                        "label": "Default Category",
+                        "required": False,
+                        "options": [],
+                        "placeholder": "Choose a default category",
+                    },
+                ],
+            }
+        ]
+
+    if scope == "stock_locations":
+        return [
+            {
+                "id": "locations",
+                "title": "Stock Locations",
+                "description": "Set up the primary stock location and any additional locations.",
+                "fields": [
+                    {
+                        "name": "primary_location_mode",
+                        "type": "select",
+                        "label": "Primary Location Mode",
                         "required": True,
                         "options": _select_options(
                             [
-                                ("category", "Product Category"),
-                                ("brand", "Brand"),
+                                ("new", "Create New Location"),
+                                ("existing", "Use Existing Location"),
                             ]
                         ),
-                        "placeholder": "Choose how you want to filter products",
                     },
                     {
-                        "name": "selected_category_names",
+                        "name": "primary_location_id",
+                        "type": "select",
+                        "label": "Existing Primary Location",
+                        "required": False,
+                        "options": [],
+                        "placeholder": "Choose an existing stock location",
+                    },
+                    {
+                        "name": "primary_location_name",
+                        "type": "text",
+                        "label": "Primary Location Name",
+                        "required": False,
+                        "placeholder": "Main Warehouse",
+                    },
+                    {
+                        "name": "primary_location_type",
+                        "type": "text",
+                        "label": "Primary Location Type",
+                        "required": False,
+                        "placeholder": "warehouse",
+                    },
+                    {
+                        "name": "additional_locations",
                         "type": "textarea",
-                        "label": "Selected Categories",
+                        "label": "Additional Locations",
                         "required": False,
-                        "placeholder": "Beverages\nSnacks\nHousehold Care",
+                        "placeholder": "Front Store\nReturns Shelf",
                     },
+                ],
+            }
+        ]
+
+    if scope == "inventory_categories":
+        return [
+            {
+                "id": "categories",
+                "title": "Inventory Categories",
+                "description": "List the inventory categories you want to create.",
+                "fields": [
                     {
-                        "name": "selected_brand_names",
+                        "name": "category_names",
                         "type": "textarea",
-                        "label": "Selected Brands",
-                        "required": False,
-                        "placeholder": "Nivea\nCoca-Cola\nCadbury",
+                        "label": "Category Names",
+                        "required": True,
+                        "placeholder": "Beverages\nSnacks\nCleaning Supplies",
+                    }
+                ],
+            }
+        ]
+
+    if scope in {"product_onboarding", "full_setup"}:
+        return [
+            {
+                "id": "locations",
+                "title": "Stock Locations",
+                "description": "Set up the primary stock location and any additional locations.",
+                "fields": [
+                    {
+                        "name": "primary_location_mode",
+                        "type": "select",
+                        "label": "Primary Location Mode",
+                        "required": True,
+                        "options": _select_options(
+                            [
+                                ("new", "Create New Location"),
+                                ("existing", "Use Existing Location"),
+                            ]
+                        ),
                     },
                     {
-                        "name": "browse_all_categories",
-                        "type": "boolean",
-                        "label": "Browse all global categories",
+                        "name": "primary_location_id",
+                        "type": "select",
+                        "label": "Existing Primary Location",
                         "required": False,
+                        "options": [],
+                        "placeholder": "Choose an existing stock location",
                     },
                     {
-                        "name": "browse_all_brands",
-                        "type": "boolean",
-                        "label": "Browse all global brands",
+                        "name": "primary_location_name",
+                        "type": "text",
+                        "label": "Primary Location Name",
                         "required": False,
+                        "placeholder": "Main Warehouse",
+                    },
+                    {
+                        "name": "primary_location_type",
+                        "type": "text",
+                        "label": "Primary Location Type",
+                        "required": False,
+                        "placeholder": "warehouse",
+                    },
+                    {
+                        "name": "additional_locations",
+                        "type": "textarea",
+                        "label": "Additional Locations",
+                        "required": False,
+                        "placeholder": "Front Store\nReturns Shelf",
+                    },
+                ],
+            },
+            {
+                "id": "categories",
+                "title": "Inventory Categories",
+                "description": "List the inventory categories you want to create.",
+                "fields": [
+                    {
+                        "name": "category_names",
+                        "type": "textarea",
+                        "label": "Category Names",
+                        "required": True,
+                        "placeholder": "Beverages\nSnacks\nCleaning Supplies",
+                    }
+                ],
+            },
+            {
+                "id": "inventory",
+                "title": "Inventory Setup",
+                "description": "Define the first inventory item you want to create.",
+                "fields": [
+                    {
+                        "name": "default_inventory_name",
+                        "type": "text",
+                        "label": "Inventory Name",
+                        "required": True,
+                        "placeholder": "Main Inventory",
+                    },
+                    {
+                        "name": "inventory_description",
+                        "type": "textarea",
+                        "label": "Inventory Description",
+                        "required": False,
+                        "placeholder": "Primary sellable stock ledger",
+                    },
+                    {
+                        "name": "related_stock_location_id",
+                        "type": "select",
+                        "label": "Primary Location for This Inventory",
+                        "required": False,
+                        "options": [],
+                        "placeholder": "Choose a stock location",
+                    },
+                    {
+                        "name": "inventory_category_id",
+                        "type": "select",
+                        "label": "Default Category",
+                        "required": False,
+                        "options": [],
+                        "placeholder": "Choose a default category",
                     },
                 ],
             },
             {
                 "id": "products",
-                "title": "Review Catalog Page",
-                "description": "I will browse products 30 at a time. Pick the ones you want from this page and choose whether to import now or continue.",
+                "title": "Product Import",
+                "description": "Choose whether to continue to product import and optionally prefill the first products.",
                 "fields": [
                     {
-                        "name": "current_page",
-                        "type": "text",
-                        "label": "Current Page",
+                        "name": "continue_to_product_onboarding",
+                        "type": "boolean",
+                        "label": "Continue To Product Import",
                         "required": False,
-                        "placeholder": "1",
                     },
                     {
-                        "name": "page_size",
-                        "type": "select",
-                        "label": "Products Per Page",
-                        "required": False,
-                        "options": _select_options([("30", "30 products")]),
-                        "placeholder": "30",
-                    },
-                    {
-                        "name": "selected_product_barcodes",
+                        "name": "initial_product_names",
                         "type": "textarea",
-                        "label": "Selected Product Barcodes",
+                        "label": "Initial Product Names",
                         "required": False,
-                        "placeholder": "8800000002501\n8800000002502",
+                        "placeholder": "Coca-Cola 50cl\nFanta 50cl",
                     },
                     {
-                        "name": "page_action",
+                        "name": "product_category_id",
                         "type": "select",
-                        "label": "Page Action",
-                        "required": True,
-                        "options": _select_options(
-                            [
-                                ("import_current_page", "Import Current Page"),
-                                ("select_more", "Select More"),
-                                ("end", "End For Now"),
-                            ]
-                        ),
-                        "placeholder": "Choose what to do next",
-                    },
-                ],
-            },
-            {
-                "id": "review",
-                "title": "Confirm Import",
-                "description": "Review the selected products and confirm that I should import them into your workspace.",
-                "fields": [
-                    {
-                        "name": "confirm_import",
-                        "type": "boolean",
-                        "label": "Confirm Import",
-                        "required": True,
+                        "label": "Product Category",
+                        "required": False,
+                        "options": [],
+                        "placeholder": "Choose a product category",
                     },
                     {
-                        "name": "send_in_app_notification",
+                        "name": "pos_ready",
                         "type": "boolean",
-                        "label": "Notify me in app when import processing completes",
+                        "label": "Mark Products As POS Ready",
                         "required": False,
                     },
                 ],
             },
         ]
 
-    # Any non-product import setup request now falls back to the same product-import workflow.
-    return [
-        {
-            "id": "categories",
-            "title": "Choose Product Categories",
-            "description": "Start by selecting the product categories you want to browse from the global catalog.",
-            "fields": [
-                {
-                    "name": "selected_category_names",
-                    "type": "textarea",
-                    "label": "Selected Categories",
-                    "required": True,
-                    "placeholder": "Beverages\nSnacks\nHousehold Care",
-                },
-                {
-                    "name": "browse_all_categories",
-                    "type": "boolean",
-                    "label": "Browse all global categories",
-                    "required": False,
-                },
-            ],
-        },
-        {
-            "id": "products",
-            "title": "Review Catalog Page",
-            "description": "I will browse products 30 at a time. Pick the ones you want from this page and choose whether to import now or continue.",
-            "fields": [
-                {
-                    "name": "current_page",
-                    "type": "text",
-                    "label": "Current Page",
-                    "required": False,
-                    "placeholder": "1",
-                },
-                {
-                    "name": "page_size",
-                    "type": "select",
-                    "label": "Products Per Page",
-                    "required": False,
-                    "options": _select_options([("30", "30 products")]),
-                    "placeholder": "30",
-                },
-                {
-                    "name": "selected_product_barcodes",
-                    "type": "textarea",
-                    "label": "Selected Product Barcodes",
-                    "required": False,
-                    "placeholder": "8800000002501\n8800000002502",
-                },
-                {
-                    "name": "page_action",
-                    "type": "select",
-                    "label": "Page Action",
-                    "required": True,
-                    "options": _select_options(
-                        [
-                            ("import_current_page", "Import Current Page"),
-                            ("select_more", "Select More"),
-                            ("end", "End For Now"),
-                        ]
-                    ),
-                    "placeholder": "Choose what to do next",
-                },
-            ],
-        },
-        {
-            "id": "review",
-            "title": "Confirm Import",
-            "description": "Review the selected products and confirm that I should import them into your workspace.",
-            "fields": [
-                {
-                    "name": "confirm_import",
-                    "type": "boolean",
-                    "label": "Confirm Import",
-                    "required": True,
-                },
-                {
-                    "name": "send_in_app_notification",
-                    "type": "boolean",
-                    "label": "Notify me in app when import processing completes",
-                    "required": False,
-                },
-            ],
-        },
-    ]
+    return _onboarding_wizard_steps("product_onboarding")
 
 
 def _onboarding_wizard_arguments(scope: str) -> dict[str, Any]:
     label = ONBOARDING_SCOPE_LABELS.get(scope, "Product Import")
     return {
         "title": f"{label} Wizard",
-        "description": "Fill in the import details and I will prepare the product import plan.",
+        "description": "Fill in the setup details and I will prepare the onboarding action plan.",
         "steps": _onboarding_wizard_steps(scope),
         "allow_back": True,
         "show_progress": True,
@@ -2936,18 +4137,70 @@ def _infer_onboarding_scope_from_text(text: str) -> str | None:
     normalized = _normalize_user_text(text)
     if not normalized:
         return None
-    has_product = "product" in normalized or "sku" in normalized
-    has_import_intent = any(token in normalized for token in ("import", "catalog", "barcode", "variant", "variants", "select all", "global products"))
-    mentions_product_import = "product import" in normalized or "catalog import" in normalized
-    mentions_onboarding = "onboarding" in normalized or "onboard" in normalized
-    if has_import_intent or has_product or mentions_product_import or mentions_onboarding:
+    if _is_internal_onboarding_execution_request(normalized):
+        return None
+    has_product_scope = any(
+        token in normalized
+        for token in (
+            "product",
+            "products",
+            "sku",
+            "catalog",
+            "barcode",
+            "brand",
+            "brands",
+            "category",
+            "categories",
+            "variant",
+            "variants",
+            "global products",
+            "global catalog",
+        )
+    )
+    has_import_intent = any(
+        token in normalized
+        for token in (
+            "import",
+            "bring in",
+            "pull from global",
+            "load from global",
+            "catalog import",
+            "product import",
+            "product onboarding",
+            "select all",
+        )
+    )
+    if has_import_intent and has_product_scope:
         return "product_onboarding"
     return None
+
+
+def _is_non_import_onboarding_request(text: str) -> bool:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return False
+    if _is_explicit_product_import_request(normalized):
+        return False
+    onboarding_phrases = (
+        "help me get started with onboarding",
+        "continue onboarding",
+        "get started with onboarding",
+        "set up my inventory workspace",
+        "setup my inventory workspace",
+        "inventory workspace from scratch",
+        "help me set up inventory",
+        "onboard a new inventory",
+        "new inventory",
+        "from scratch",
+    )
+    return any(phrase in normalized for phrase in onboarding_phrases)
 
 
 def _is_explicit_product_import_request(text: str) -> bool:
     normalized = _normalize_user_text(text)
     if not normalized:
+        return False
+    if _is_internal_onboarding_execution_request(normalized):
         return False
     has_import_intent = any(
         token in normalized
@@ -2970,10 +4223,23 @@ def _is_explicit_product_import_request(text: str) -> bool:
             "brands",
             "category",
             "categories",
-            "inventory",
+            "sku",
+            "barcode",
+            "variant",
+            "variants",
         )
     )
     return has_import_intent and has_product_scope
+
+
+def _is_internal_onboarding_execution_request(text: str) -> bool:
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return False
+    return (
+        "collected onboarding data json" in normalized
+        or "import the requested product selection using the available product import tools" in normalized
+    )
 
 
 def _parse_onboarding_prefill_from_text(scope: str, text: str) -> dict[str, Any]:
@@ -3347,8 +4613,27 @@ def _normalize_onboarding_wizard_data(
             if label_value and label_key and label_key not in flat:
                 flat[label_key] = label_value
 
+    normalized_scope = scope
+    if scope == "product_onboarding" and any(
+        key in flat
+        for key in (
+            "primary_location_mode",
+            "primary_location_id",
+            "primary_location_name",
+            "primary_location_type",
+            "additional_locations",
+            "category_names",
+            "default_inventory_name",
+            "inventory_description",
+            "related_stock_location_id",
+            "inventory_category_id",
+            "continue_to_product_onboarding",
+        )
+    ):
+        normalized_scope = "full_setup"
+
     return {
-        "scope": scope,
+        "scope": normalized_scope,
         "steps": step_values,
         "flat": flat,
         "raw_response": response,
@@ -3435,7 +4720,7 @@ def _onboarding_summary_text(scope: str, data: dict[str, Any]) -> str:
 
 def _onboarding_review_picker_arguments(summary: str) -> dict[str, Any]:
     return {
-        "title": "Review Product Import Plan",
+        "title": "Review Onboarding Plan",
         "description": summary + "\n\nChoose what you want me to do next.",
         "options": [
             {"value": "create_now", "label": "Import These Products"},
@@ -5108,7 +6393,12 @@ def _pos_admin_named_insight_from_text(text: str) -> str | None:
     normalized = _normalize_user_text(text)
     if not normalized:
         return None
-    comparison_terms = ("compare", "comparison", "versus", "vs", "side by side", "side-by-side", "performance")
+    if re.search(r"\b(purchase order|purchase orders|po|supplier|suppliers|receiving|procurement)\b", normalized):
+        return None
+    # "Performance" alone is not a product-comparison request. Broad business
+    # review prompts contain that word and may also mention terminals, stores,
+    # or other entities that must never be treated as product identifiers.
+    comparison_terms = ("compare", "comparison", "versus", "vs", "side by side", "side-by-side")
     comparison_queries = _extract_product_comparison_queries_from_text(text)
     if (
         any(token in normalized for token in ("variant", "variants"))
@@ -5121,7 +6411,9 @@ def _pos_admin_named_insight_from_text(text: str) -> str | None:
         and (
             any(token in normalized for token in ("product", "products", "item", "items", "barcode", "sku"))
             or any(re.fullmatch(r"\d{8,18}", query.strip()) for query in comparison_queries)
-            or not any(
+            or (
+                not any(token in normalized for token in ("sales", "revenue", "orders", "sold"))
+                and not any(
                 token in normalized
                 for token in (
                     "location",
@@ -5139,6 +6431,7 @@ def _pos_admin_named_insight_from_text(text: str) -> str | None:
                     "security",
                 )
             )
+            )
         )
     ):
         return "product_comparison"
@@ -5153,6 +6446,12 @@ def _pos_admin_named_insight_from_text(text: str) -> str | None:
         and any(token in normalized for token in ("day", "daily", "ever", "all time", "historical", "history"))
     ):
         return "best_sales_day"
+    if (
+        any(token in normalized for token in ("how many", "total", "count", "number of"))
+        and any(token in normalized for token in ("sell", "sold", "selling", "sales"))
+        and any(token in normalized for token in ("goods", "products", "product", "items", "item", "units", "unit"))
+    ):
+        return "top_sellers_seven_days"
     if (
         any(token in normalized for token in ("sales", "revenue", "orders", "order count", "avg basket", "average basket"))
         and any(
@@ -5172,6 +6471,8 @@ def _pos_admin_named_insight_from_text(text: str) -> str | None:
                 "generated",
                 "did we make",
                 "did we do",
+                "what is my",
+                "what's my",
                 "data",
             )
         )
@@ -5199,6 +6500,16 @@ def _pos_admin_named_insight_from_text(text: str) -> str | None:
         r"\b(location|locations|branch|branches)\b",
     ):
         return "sales_by_location_today"
+    if (
+        any(token in normalized for token in ("sold the most", "selling the most", "highest sales", "most revenue", "highest revenue"))
+        and any(token in normalized for token in ("location", "locations", "branch", "branches", "store", "stores"))
+    ):
+        return "sales_by_location_today"
+    if (
+        any(token in normalized for token in ("sold the most", "selling the most", "highest sales", "most revenue", "highest revenue"))
+        and any(token in normalized for token in ("terminal", "terminals", "cashier", "cashiers"))
+    ):
+        return "terminal_cashier_activity"
     if (
         _text_matches_all_terms(normalized, r"\b(top|best)\s+sellers?\b")
         or (
@@ -5268,6 +6579,10 @@ def _pos_admin_named_insight_from_text(text: str) -> str | None:
             "revenue contribution",
             "average basket by cashier",
             "refund activity",
+            "failed payment",
+            "failed payments",
+            "declined payment",
+            "declined payments",
         )
     ):
         if any(
@@ -5306,6 +6621,11 @@ def _pos_admin_named_insight_from_text(text: str) -> str | None:
         for token in (
             "pos risk signals",
             "refunds unusually high",
+            "refunds today",
+            "refund today",
+            "failed pos payments",
+            "failed payments",
+            "declined payments",
             "suspicious activity",
             "voided or cancelled",
             "abnormal discount activity",
@@ -5364,6 +6684,17 @@ def _inventory_procurement_named_insight_from_text(text: str) -> str | None:
         )
     ):
         return "receiving_lifecycle"
+    if any(
+        token in normalized
+        for token in (
+            "suppliers have delayed deliveries",
+            "supplier delayed deliveries",
+            "supplier delays",
+            "delayed deliveries",
+            "late deliveries",
+        )
+    ):
+        return "delay_exceptions"
     if (
         _text_matches_all_terms(normalized, r"\b(purchase order|purchase orders|po)\b", r"\b(status|statuses|pipeline|lifecycle|open|pending|approved|issued|received)\b")
         or _text_matches_all_terms(normalized, r"\bhow many\b", r"\b(purchase order|purchase orders|po)\b")
@@ -5450,6 +6781,9 @@ def _product_discovery_named_insight_from_text(text: str) -> str | None:
             "audit timeline for product changes",
             "recent catalog activity",
             "barcode or sku change activity",
+            "who changed prices",
+            "price changes",
+            "changed prices",
             "product families are seeing the most edits",
             "recently modified products with audit evidence",
             "product records changed across multiple staff",
@@ -5510,6 +6844,8 @@ def _product_discovery_named_insight_from_text(text: str) -> str | None:
         token in normalized
         for token in (
             "duplicate barcode risks",
+            "duplicate barcodes",
+            "duplicate skus",
             "skus or barcodes may conflict",
             "product code collisions",
             "duplicate identifiers",
@@ -5526,6 +6862,12 @@ def _product_discovery_named_insight_from_text(text: str) -> str | None:
         token in normalized
         for token in (
             "missing strong media coverage",
+            "products with no image",
+            "products without image",
+            "products missing image",
+            "missing product images",
+            "not visible in pos",
+            "not showing in pos",
             "better curated product content",
             "weak image coverage",
             "merchandising cleanup first",
@@ -5568,40 +6910,7 @@ def _host_named_insight_from_text(text: str) -> str | None:
     normalized = _normalize_user_text(text)
     if not normalized:
         return None
-    if any(
-        token in normalized
-        for token in (
-            "business analyst",
-            "data analyst",
-            "act as an analyst",
-            "act like an analyst",
-            "analyze the entire data",
-            "analyse the entire data",
-            "analyze my whole business",
-            "analyse my whole business",
-            "analyze the whole workspace",
-            "analyse the whole workspace",
-            "analyze my entire system",
-            "analyse my entire system",
-            "analyze the entire system",
-            "analyse the entire system",
-            "analyze my whole system",
-            "analyse my whole system",
-            "analyze the whole system",
-            "analyse the whole system",
-            "what am i not seeing",
-            "what are we missing",
-            "hidden insight",
-            "hidden insights",
-            "strategic business review",
-            "management review",
-            "owner review",
-        )
-    ) or (
-        _text_matches_all_terms(normalized, r"\b(business|data)\b", r"\banalyst\b")
-        or _text_matches_all_terms(normalized, r"\b(entire|whole|overall)\b", r"\b(data|business|workspace|system|operation|operations)\b", r"\b(analy[sz]e|review|insight|insights)\b")
-        or _text_matches_all_terms(normalized, r"\bwhat\b", r"\b(missing|not seeing|overlooked)\b")
-    ):
+    if _is_cross_domain_business_review_query(normalized):
         return "business_analyst_review"
     if any(
         token in normalized
@@ -5692,6 +7001,8 @@ def _inventory_visibility_named_insight_from_text(text: str) -> str | None:
         )
     ):
         return "stock_risk_out_of_stock"
+    if any(token in normalized for token in ("expiring soon", "expiring stock", "expiry risk", "expiry risks")):
+        return "stock_risk"
     if _text_matches_all_terms(normalized, r"\blow\b", r"\bstock\b"):
         return "stock_risk_low_stock"
     if any(token in normalized for token in ("run out soon", "below reorder level", "closest to stockout")):
@@ -5755,10 +7066,12 @@ def _inventory_visibility_named_insight_from_text(text: str) -> str | None:
             return "realtime_snapshot"
         return "location_health"
     if (
-        _text_matches_all_terms(normalized, r"\breorder\b", r"\b(candidate|candidates|need|needs|priority|priorities|now)\b")
+        _text_matches_all_terms(normalized, r"\breorder\b", r"\b(candidate|candidates|need|needs|priority|priorities|now|today)\b")
         or any(
             token in normalized
             for token in (
+                "what should i reorder",
+                "should i reorder",
                 "purchasing prioritize",
                 "safety stock",
                 "supplier defaults",
@@ -5778,6 +7091,8 @@ def _inventory_visibility_named_insight_from_text(text: str) -> str | None:
                 "recent stock movements",
                 "inventory movements happened today",
                 "stock in versus stock out",
+                "stock transfer activity",
+                "transfer activity",
                 "movement timeline",
                 "receiving, transfers, and issues",
                 "movement trends",
@@ -5810,6 +7125,11 @@ def _inventory_risk_rows(payload: dict[str, Any], *, focus: str | None = None) -
     risk_items = payload.get("risk_items") if isinstance(payload.get("risk_items"), dict) else {}
     if focus and isinstance(risk_items.get(focus), list):
         rows = risk_items.get(focus)
+        # An out-of-stock item is more urgent than a low-stock item. When a
+        # low-stock query has no threshold breaches but does have stockouts,
+        # return those products instead of an empty detail list.
+        if focus == "low_stock" and not rows and isinstance(risk_items.get("out_of_stock"), list):
+            rows = risk_items.get("out_of_stock")
     else:
         rows = []
         for key in ("out_of_stock", "needs_reorder", "low_stock", "expiring_soon"):
@@ -5819,23 +7139,71 @@ def _inventory_risk_rows(payload: dict[str, Any], *, focus: str | None = None) -
     return [row for row in rows if isinstance(row, dict)]
 
 
-def _build_inventory_stock_risk_insight(payload: dict[str, Any], *, focus: str | None = None) -> dict[str, Any]:
+def _inventory_risk_category_for_row(
+    row: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    focus: str | None,
+) -> str:
+    explicit_category = str(row.get("risk_category") or "").strip()
+    if explicit_category:
+        return explicit_category
+    risk_items = payload.get("risk_items") if isinstance(payload.get("risk_items"), dict) else {}
+    row_id = str(row.get("id") or "").strip()
+    row_barcode = str(row.get("barcode") or "").strip()
+    row_name = str(row.get("name") or row.get("inventory_item_name") or "").strip()
+    for category in ("out_of_stock", "needs_reorder", "low_stock", "expiring_soon"):
+        for candidate in risk_items.get(category) if isinstance(risk_items.get(category), list) else []:
+            if not isinstance(candidate, dict):
+                continue
+            if row_id and row_id == str(candidate.get("id") or "").strip():
+                return category
+            if row_barcode and row_barcode == str(candidate.get("barcode") or "").strip():
+                return category
+            if row_name and row_name == str(candidate.get("name") or candidate.get("inventory_item_name") or "").strip():
+                return category
+    return focus or "stock_risk"
+
+
+def _inventory_risk_category_label(category: str) -> str:
+    return {
+        "out_of_stock": "Out of Stock",
+        "needs_reorder": "Needs Reorder",
+        "low_stock": "Low Stock",
+        "expiring_soon": "Expiring Soon",
+    }.get(category, "Stock Risk")
+
+
+def _build_inventory_stock_risk_insight(
+    payload: dict[str, Any],
+    *,
+    focus: str | None = None,
+    scope_label: str | None = None,
+) -> dict[str, Any]:
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    risk_items = payload.get("risk_items") if isinstance(payload.get("risk_items"), dict) else {}
+    has_requested_low_stock_rows = bool(risk_items.get("low_stock"))
     rows = _inventory_risk_rows(payload, focus=focus)
     ranked_items = []
     risk_panel_items = []
-    for row in rows[:12]:
+    detail_rows = []
+    for row in rows[:25]:
         label = _first_string(row, ["name", "inventory_item_name", "product_variant", "sku", "barcode"]) or "Inventory item"
         quantity = float(row.get("quantity_available") or row.get("quantity") or 0)
         location_name = _first_string(row, ["location_name"]) or "Unassigned location"
+        risk_category = _inventory_risk_category_for_row(row, payload, focus=focus)
+        barcode = str(row.get("barcode") or "").strip()
+        sku = str(row.get("sku") or "").strip()
         ranked_items.append(
             {
                 "label": label,
                 "value": quantity,
+                "format": "number",
                 "secondary_value": location_name,
+                "image_url": str(row.get("product_variant_image_url") or row.get("image_url") or "").strip(),
                 "meta": {
-                    "sku": str(row.get("sku") or ""),
-                    "barcode": str(row.get("barcode") or ""),
+                    "sku": sku,
+                    "barcode": barcode,
                     "location_name": location_name,
                     "reorder_point": float(row.get("reorder_point") or 0),
                     "minimum_stock_level": float(row.get("minimum_stock_level") or 0),
@@ -5844,10 +7212,22 @@ def _build_inventory_stock_risk_insight(payload: dict[str, Any], *, focus: str |
         )
         risk_panel_items.append(
             {
-                "label": label,
-                "severity": "high" if focus == "out_of_stock" else "medium",
-                "detail": f"{location_name} · available {quantity}",
+                "label": f"{_inventory_risk_category_label(risk_category)}: {label}",
+                "severity": "high" if quantity <= 0 or focus == "out_of_stock" else "medium",
+                "detail": f"{location_name} · {'out of stock' if quantity <= 0 else f'available {quantity}'}",
                 "next_action": "Review replenishment or transfer options.",
+            }
+        )
+        detail_rows.append(
+            {
+                "risk": _inventory_risk_category_label(risk_category),
+                "product": label,
+                "barcode": barcode or "Not set",
+                "sku": sku or "Not set",
+                "location": location_name,
+                "available": quantity,
+                "minimum_stock": float(row.get("minimum_stock_level") or 0),
+                "reorder_point": float(row.get("reorder_point") or 0),
             }
         )
     if focus == "out_of_stock":
@@ -5858,7 +7238,16 @@ def _build_inventory_stock_risk_insight(payload: dict[str, Any], *, focus: str |
         summary_text = "Reorder candidates are ready."
     else:
         summary_text = "Inventory stock risk is ready."
-    if not rows:
+    if focus == "low_stock" and not has_requested_low_stock_rows:
+        out_of_stock_count = int(summary.get("out_of_stock_count") or 0)
+        if out_of_stock_count:
+            summary_text = (
+                "No products are below their low-stock threshold, but "
+                f"{out_of_stock_count} product{' is' if out_of_stock_count == 1 else 's are'} out of stock and need attention."
+            )
+        else:
+            summary_text = "No low-stock products are active right now."
+    elif not rows:
         if focus == "out_of_stock":
             summary_text = "No out-of-stock products are active right now."
         elif focus == "low_stock":
@@ -5867,13 +7256,17 @@ def _build_inventory_stock_risk_insight(payload: dict[str, Any], *, focus: str |
             summary_text = "No reorder candidates are active right now."
         else:
             summary_text = "No inventory stock risks are active right now."
+    scope = str(scope_label or "").strip()
+    if scope:
+        summary_text = f"{summary_text.rstrip('.')} at {scope}."
     return {
         "kind": "insight_response",
         "summary": summary_text,
+        "scope": {"location": scope or "All locations"},
         "widgets": [
             {
                 "type": "metric_grid",
-                "title": "Inventory risk posture",
+                "title": f"Inventory risk posture - {scope or 'All locations'}",
                 "data": [
                     {"label": "Out of Stock", "value": int(summary.get("out_of_stock_count") or 0)},
                     {"label": "Needs Reorder", "value": int(summary.get("reorder_count") or 0)},
@@ -5883,14 +7276,20 @@ def _build_inventory_stock_risk_insight(payload: dict[str, Any], *, focus: str |
             },
             {
                 "type": "risk_panel",
-                "title": "Highest priority stock risks",
+                "title": f"Highest priority stock risks - {scope or 'All locations'}",
                 "items": risk_panel_items,
             },
             {
                 "type": "ranked_list",
-                "title": "Items needing attention",
+                "title": f"Items needing attention - {scope or 'All locations'}",
                 "items": ranked_items,
                 "ordered_by": "quantity_available",
+            },
+            {
+                "type": "comparison_table",
+                "title": f"Stock-risk product details - {scope or 'All locations'}",
+                "columns": ["risk", "product", "barcode", "sku", "location", "available", "minimum_stock", "reorder_point"],
+                "rows": detail_rows,
             },
         ],
         "suggested_actions": [],
@@ -5899,6 +7298,75 @@ def _build_inventory_stock_risk_insight(payload: dict[str, Any], *, focus: str |
         "confidence": "high",
         "warnings": [] if rows else ["No inventory items matched the requested risk posture."],
     }
+
+
+def _inventory_location_scope_requested(user_text: str) -> bool:
+    text = _normalize_user_text(user_text)
+    return bool(
+        re.search(r"\b(?:at|in|for|from)\s+(?:the\s+)?[a-z0-9][a-z0-9 &'()/.-]{1,80}\b", text)
+        and any(token in text for token in ("location", "branch", "store", "warehouse", "outlet", "showroom", "stock"))
+    )
+
+
+def _inventory_all_locations_requested(user_text: str) -> bool:
+    text = _normalize_user_text(user_text)
+    return any(
+        phrase in text
+        for phrase in ("all locations", "every location", "across locations", "company wide", "company-wide", "overall")
+    )
+
+
+def _matching_inventory_location_rows(user_text: str, location_output: Any) -> list[dict[str, Any]]:
+    if _inventory_all_locations_requested(user_text) or not isinstance(location_output, dict):
+        return []
+    text = _normalize_user_text(user_text)
+    rows = location_output.get("results")
+    if not isinstance(rows, list):
+        return []
+
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = _normalize_user_text(str(row.get("name") or ""))
+        if not name or len(name) < 3:
+            continue
+        if name in text:
+            matches.append(row)
+            continue
+        # Accept a meaningful location-name token such as "Airport" when it
+        # uniquely identifies a configured structural location.
+        name_tokens = [token for token in name.split() if len(token) >= 4]
+        if name_tokens and all(token in text for token in name_tokens[:1]):
+            matches.append(row)
+    return matches
+
+
+async def _resolve_inventory_stock_location_scope(
+    *,
+    user_text: str,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, str] | None:
+    if not _inventory_location_scope_requested(user_text) or _inventory_all_locations_requested(user_text):
+        return None
+    try:
+        location_output = await tool_executor.call_tool(
+            name="inventory.search_stock_locations",
+            arguments={"query": None, "limit": 50, "structural_only": True},
+            ctx=tool_ctx,
+        )
+    except Exception:
+        return None
+    matches = _matching_inventory_location_rows(user_text, location_output)
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    location_id = str(match.get("id") or "").strip()
+    location_name = str(match.get("name") or "").strip()
+    if not location_id or not location_name:
+        return None
+    return {"id": location_id, "name": location_name}
 
 
 def _build_inventory_movements_insight(payload: dict[str, Any]) -> dict[str, Any]:
@@ -6274,6 +7742,109 @@ def _build_inventory_adjustment_risk_insight(payload: dict[str, Any]) -> dict[st
         "confidence": "medium",
         "warnings": [] if timeline_items else ["No recent adjustment movements matched the requested window."],
     }
+
+
+def _sales_location_identifier(row: dict[str, Any]) -> str:
+    for key in (
+        "location_id",
+        "structural_location_id",
+        "structural_location_sync_identifier",
+        "location_sync_identifier",
+    ):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _sales_location_label(row: dict[str, Any]) -> str:
+    return str(row.get("label") or row.get("location") or row.get("location_name") or "").strip()
+
+
+def _normalize_sales_location_payload(
+    payload: dict[str, Any],
+    current_locations: dict[str, str],
+) -> dict[str, Any]:
+    """Replace POS terminal name snapshots with current inventory location names."""
+    if not isinstance(payload, dict) or not current_locations:
+        return payload
+
+    name_to_current_name = {
+        re.sub(r"\s+", " ", name).strip().lower(): name
+        for name in current_locations.values()
+        if name
+    }
+    for collection_key in ("groups", "locations"):
+        rows = payload.get(collection_key)
+        if not isinstance(rows, list):
+            continue
+
+        normalized_rows: dict[str, dict[str, Any]] = {}
+        for raw_row in rows:
+            if not isinstance(raw_row, dict):
+                continue
+            row = dict(raw_row)
+            location_id = _sales_location_identifier(row)
+            current_name = current_locations.get(location_id)
+            if not current_name:
+                current_name = name_to_current_name.get(
+                    re.sub(r"\s+", " ", _sales_location_label(row)).strip().lower()
+                )
+            if current_name:
+                row["label"] = current_name
+                row["location"] = current_name
+                row["location_name"] = current_name
+
+            identity = location_id or re.sub(r"\s+", " ", _sales_location_label(row)).strip().lower()
+            identity = identity or f"unassigned-{len(normalized_rows)}"
+            existing = normalized_rows.get(identity)
+            if existing is None:
+                normalized_rows[identity] = row
+                continue
+            for numeric_key in ("order_count", "total_sales", "quantity_sold", "sales_total"):
+                if numeric_key in row:
+                    existing[numeric_key] = (existing.get(numeric_key) or 0) + (row.get(numeric_key) or 0)
+
+        payload[collection_key] = list(normalized_rows.values())
+    return payload
+
+
+async def _refresh_sales_location_labels(
+    payload: dict[str, Any],
+    *,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any]:
+    """Resolve location labels live so renamed inventory locations reach POS insights."""
+    if not isinstance(payload, dict) or not any(isinstance(payload.get(key), list) for key in ("groups", "locations")):
+        return payload
+    try:
+        direct_lookup = getattr(tool_executor, "_direct_executor_for_tool_name", None)
+        # The current inventory MCP exposes the search endpoint to the host.
+        # It returns the same canonical location labels and does not rely on a
+        # legacy list endpoint being present in every agent tool allow-list.
+        lookup_tool = "inventory.search_stock_locations"
+        direct_executor = direct_lookup(lookup_tool) if callable(direct_lookup) else None
+        executor = direct_executor or tool_executor
+        locations_payload = await asyncio.wait_for(
+            executor.call_tool(
+                name=lookup_tool,
+                arguments={"query": None, "limit": 50, "structural_only": True},
+                ctx=tool_ctx,
+            ),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        logger.info("Live location label refresh skipped for POS insight: %s", exc)
+        return payload
+
+    results = locations_payload.get("results") if isinstance(locations_payload, dict) else []
+    current_locations = {
+        str(item.get("id") or item.get("stock_location_id") or "").strip(): str(item.get("name") or "").strip()
+        for item in (results if isinstance(results, list) else [])
+        if isinstance(item, dict) and str(item.get("id") or item.get("stock_location_id") or "").strip() and str(item.get("name") or "").strip()
+    }
+    return _normalize_sales_location_payload(payload, current_locations)
 
 
 def _build_pos_sales_by_location_insight(payload: dict[str, Any]) -> dict[str, Any]:
@@ -6987,13 +8558,15 @@ def _build_pos_product_comparison_insight(payloads: list[dict[str, Any]], *, win
     for payload_index, payload in enumerate(payloads, start=1):
         totals = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
         products = payload.get("products") if isinstance(payload.get("products"), list) else []
-        first_product = products[0] if products and isinstance(products[0], dict) else {}
-        product_name = str(
-            first_product.get("variant_name")
-            or first_product.get("product_name")
-            or payload.get("query")
-            or f"Product {payload_index}"
-        )
+        first_product = products[0] if products and isinstance(products[0], dict) else None
+        # Never use the search query as a product label when the POS query did
+        # not resolve to a product. A terminal, location, or staff name from a
+        # broader workflow must not become a fabricated zero-sales product.
+        if not first_product:
+            continue
+        product_name = str(first_product.get("variant_name") or first_product.get("product_name") or "").strip()
+        if not product_name:
+            continue
         key = _series_key(product_name, payload_index)
         series.append({"key": key, "label": product_name})
         sales_total = round(float(totals.get("sales_total") or 0), 2)
@@ -7040,6 +8613,17 @@ def _build_pos_product_comparison_insight(payloads: list[dict[str, Any]], *, win
     total_units = round(sum(float(row["quantity_sold"]) for row in rows), 2)
     total_orders = sum(int(row["order_count"]) for row in rows)
     leader = rows[0] if rows else None
+    unresolved_queries = [
+        str(payload.get("query") or "").strip()
+        for payload in payloads
+        if isinstance(payload, dict)
+        and not (
+            isinstance(payload.get("products"), list)
+            and any(isinstance(product, dict) and str(product.get("variant_name") or product.get("product_name") or "").strip() for product in payload["products"])
+        )
+        and str(payload.get("query") or "").strip()
+    ]
+    warnings = [f"No product matched '{query}' in the selected period." for query in unresolved_queries]
     ranked_items = [
         {
             "label": row["product"],
@@ -7069,12 +8653,12 @@ def _build_pos_product_comparison_insight(payloads: list[dict[str, Any]], *, win
         "summary": (
             f"{len(rows)} products were compared for {window_label}; {leader['product']} leads revenue."
             if leader
-            else f"No product sales were found for {window_label}."
+            else f"No matching products were found for comparison in {window_label}."
         ),
         "explanation": (
             f"The compared products generated {_money_label(total_sales)} across {_count_label(total_units)} units and {_count_label(total_orders)} orders. Use the trend lines to see when each product gained or lost momentum."
             if rows
-            else "There is not enough completed POS history to compare these products."
+            else "No requested product or variant matched the completed POS records for this period."
         ),
         "timeframe": {
             "label": window_label,
@@ -7158,8 +8742,8 @@ def _build_pos_product_comparison_insight(payloads: list[dict[str, Any]], *, win
         "suggested_actions": [],
         "data_sources": [{"service": "pos", "endpoint_or_topic": "get_product_sales_trend", "freshness": "live"}],
         "permissions_checked": ["view_pos_reports"],
-        "confidence": "high" if rows else "medium",
-        "warnings": [] if rows else ["No completed sales matched these product queries and date range."],
+        "confidence": "high" if rows and not unresolved_queries else "medium",
+        "warnings": warnings or (["No requested product or variant matched the completed POS records for this period."] if not rows else []),
     }
 
 
@@ -7225,8 +8809,14 @@ def _build_pos_variant_comparison_insight(payload: dict[str, Any], *, variant_pa
         "KES": "KSh",
         "ZAR": "R",
     }.get(currency_code, f"{currency_code} ")
-    money_label = lambda amount: f"{currency_symbol}{float(amount or 0):,.2f}"
-    count_label = lambda value: f"{float(value or 0):,.0f}" if float(value or 0).is_integer() else f"{float(value or 0):,.2f}"
+
+    def money_label(amount: Any) -> str:
+        return f"{currency_symbol}{float(amount or 0):,.2f}"
+
+    def count_label(value: Any) -> str:
+        number = float(value or 0)
+        return f"{number:,.0f}" if number.is_integer() else f"{number:,.2f}"
+
     label_by_identity: dict[str, str] = {}
     for row in rows:
         identity_parts = [
@@ -7844,7 +9434,11 @@ def _users_named_insight_from_text(text: str) -> str | None:
         )
     ) or _text_matches_all_terms(normalized, r"\bstaff\b", r"\bactivity\b"):
         return "staff_activity"
-    if "support access" in normalized or "support sessions should i review first" in normalized:
+    if (
+        "support access" in normalized
+        or "support sessions should i review first" in normalized
+        or _text_matches_all_terms(normalized, r"\bsupport\b", r"\b(accessed|access|session|sessions)\b")
+    ):
         return "support_access_audit"
     if any(
         token in normalized
@@ -7948,6 +9542,7 @@ def _counter_rows_to_ranked_items(rows: list[dict[str, Any]]) -> list[dict[str, 
             {
                 "label": str(row.get("key") or "Unknown"),
                 "value": int(row.get("count") or 0),
+                "format": "number",
             }
         )
     return items
@@ -8439,54 +10034,64 @@ def _build_product_import_opportunities_insight(matches_payload: dict[str, Any])
     results = results if isinstance(results, list) else []
     ranked_items = [
         {
+            "global_product_id": str(item.get("id") or item.get("global_product_id") or ""),
             "label": str(item.get("name") or "Catalog product"),
             "value": int(item.get("variant_count") or 0),
             "secondary_value": str(item.get("brand") or ""),
+            "category": str(item.get("category_name") or item.get("category") or ""),
+            "image_url": _product_image_url(item),
+            "barcode": str(item.get("primary_barcode") or item.get("barcode") or item.get("barcode_snapshot") or ""),
+            "sku": str(item.get("sku") or item.get("sku_snapshot") or ""),
         }
         for item in results
         if isinstance(item, dict) and not bool(item.get("already_imported"))
     ]
     rows = [
         {
+            "global_product_id": str(item.get("id") or item.get("global_product_id") or ""),
             "name": str(item.get("name") or ""),
             "brand": str(item.get("brand") or ""),
             "category": str(item.get("category_name") or ""),
             "variants": int(item.get("variant_count") or 0),
             "already_imported": bool(item.get("already_imported")),
+            "image_url": _product_image_url(item),
+            "barcode": str(item.get("primary_barcode") or item.get("barcode") or ""),
         }
         for item in results[:10]
-        if isinstance(item, dict)
+        if isinstance(item, dict) and not bool(item.get("already_imported"))
     ]
+    catalog_error = str(matches_payload.get("_error") or "").strip()
     return {
         "kind": "insight_response",
-        "summary": "Global catalog import opportunities are ready.",
+        "summary": "New global-catalog import opportunities are ready.",
         "widgets": [
             {
                 "type": "metric_grid",
                 "title": "Catalog opportunity snapshot",
                 "data": [
-                    {"label": "Matches", "value": int(matches_payload.get("count") or len(rows))},
+                    {"label": "New catalog products", "value": len(rows), "format": "number"},
                     {"label": "New Opportunities", "value": len(ranked_items)},
                 ],
             },
             {
                 "type": "ranked_list",
-                "title": "Top import opportunities",
+                "title": "Top new import opportunities",
                 "items": ranked_items,
                 "ordered_by": "variant_count",
             },
             {
                 "type": "comparison_table",
-                "title": "Catalog opportunity board",
-                "columns": ["name", "brand", "category", "variants", "already_imported"],
+                "title": "New catalog products",
+                "columns": ["name", "brand", "category", "variants", "barcode"],
                 "rows": rows,
             },
         ],
         "suggested_actions": [],
-        "data_sources": [{"service": "products", "endpoint_or_topic": "get_top_catalog_matches", "freshness": "live"}],
+        "data_sources": [{"service": "products", "endpoint_or_topic": "list_global_catalog_products", "freshness": "live"}],
         "permissions_checked": ["read_products"],
         "confidence": "high",
-        "warnings": [] if rows else ["No global catalog matches were returned."],
+        "warnings": ([f"Global catalog lookup unavailable: {catalog_error}"] if catalog_error else [])
+        or ([] if rows else ["No new global-catalog products were returned. Products already imported were excluded."]),
     }
 
 
@@ -8538,7 +10143,13 @@ def _build_variant_lookup_insight(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _build_catalog_gap_insight(dashboard_payload: dict[str, Any], matches_payload: dict[str, Any], alerts_payload: dict[str, Any]) -> dict[str, Any]:
+def _build_catalog_gap_insight(
+    dashboard_payload: dict[str, Any],
+    matches_payload: dict[str, Any],
+    alerts_payload: dict[str, Any],
+    *,
+    include_import_opportunities: bool = False,
+) -> dict[str, Any]:
     dashboard = dashboard_payload.get("dashboard") if isinstance(dashboard_payload, dict) else {}
     dashboard = dashboard if isinstance(dashboard, dict) else {}
     categories = dashboard.get("category_distribution") if isinstance(dashboard.get("category_distribution"), list) else []
@@ -8564,41 +10175,86 @@ def _build_catalog_gap_insight(dashboard_payload: dict[str, Any], matches_payloa
             }
         )
     ranked_items = [
-        {"label": str(item.get("name") or "Catalog product"), "value": int(item.get("variant_count") or 0)}
+        {
+            "global_product_id": str(item.get("id") or item.get("global_product_id") or ""),
+            "label": str(item.get("name") or "Catalog product"),
+            "value": int(item.get("variant_count") or 0),
+            "format": "number",
+            "brand": str(item.get("brand") or ""),
+            "category": str(item.get("category_name") or item.get("category") or ""),
+            "image_url": _product_image_url(item),
+            "barcode": str(item.get("primary_barcode") or item.get("barcode") or ""),
+        }
         for item in matches
         if isinstance(item, dict) and not bool(item.get("already_imported"))
     ]
-    return {
-        "kind": "insight_response",
-        "summary": "Catalog gap signals are ready.",
-        "widgets": [
-            {
-                "type": "risk_panel",
-                "title": "Assortment weaknesses",
-                "items": risk_items or [{"label": "Catalog posture", "severity": "low", "description": "No obvious assortment imbalance was detected."}],
-            },
+    opportunity_rows = [
+        {
+            "global_product_id": str(item.get("id") or item.get("global_product_id") or ""),
+            "name": str(item.get("name") or ""),
+            "brand": str(item.get("brand") or ""),
+            "category": str(item.get("category_name") or item.get("category") or ""),
+            "variants": int(item.get("variant_count") or 0),
+            "barcode": str(item.get("primary_barcode") or item.get("barcode") or ""),
+            "image_url": _product_image_url(item),
+        }
+        for item in matches[:10]
+        if isinstance(item, dict) and not bool(item.get("already_imported"))
+    ]
+    widgets: list[dict[str, Any]] = [
+        {
+            "type": "risk_panel",
+            "title": "Assortment weaknesses",
+            "items": risk_items or [{"label": "Catalog posture", "severity": "low", "description": "No obvious assortment imbalance was detected."}],
+        },
+        {
+            "type": "comparison_table",
+            "title": "Current category distribution",
+            "columns": ["category_name", "count"],
+            "rows": [item for item in categories if isinstance(item, dict)],
+        },
+    ]
+    if include_import_opportunities:
+        widgets[1:1] = [
             {
                 "type": "ranked_list",
-                "title": "Gap-closing opportunities",
+                "title": "New catalog opportunities",
                 "items": ranked_items[:10],
                 "ordered_by": "variant_count",
+                "value_format": "number",
             },
             {
                 "type": "comparison_table",
-                "title": "Category distribution",
-                "columns": ["category_name", "count"],
-                "rows": [item for item in categories if isinstance(item, dict)],
+                "title": "Catalog opportunity board",
+                "columns": ["name", "brand", "category", "variants", "barcode"],
+                "rows": opportunity_rows,
             },
-        ],
+        ]
+
+    data_sources = [
+        {"service": "products", "endpoint_or_topic": "get_product_dashboard_stats", "freshness": "live"},
+        {"service": "products", "endpoint_or_topic": "get_product_stock_alerts", "freshness": "live"},
+    ]
+    if include_import_opportunities:
+        data_sources.insert(1, {"service": "products", "endpoint_or_topic": "list_global_catalog_products", "freshness": "live"})
+
+    return {
+        "kind": "insight_response",
+        "summary": (
+            "Catalog gap signals and new import opportunities are ready."
+            if include_import_opportunities
+            else "Catalog health signals are ready."
+        ),
+        "widgets": widgets,
         "suggested_actions": [],
-        "data_sources": [
-            {"service": "products", "endpoint_or_topic": "get_product_dashboard_stats", "freshness": "live"},
-            {"service": "products", "endpoint_or_topic": "get_top_catalog_matches", "freshness": "live"},
-            {"service": "products", "endpoint_or_topic": "get_product_stock_alerts", "freshness": "live"},
-        ],
+        "data_sources": data_sources,
         "permissions_checked": ["read_products"],
         "confidence": "medium",
-        "warnings": [],
+        "warnings": (
+            []
+            if not include_import_opportunities or opportunity_rows
+            else ["No new global-catalog products were returned. Products already imported were excluded."]
+        ),
     }
 
 
@@ -8791,24 +10447,27 @@ def _build_host_cross_domain_insight(
 def _build_host_location_comparison_insight(
     sales_payload: dict[str, Any],
     location_payload: dict[str, Any],
+    stock_risk_by_location_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     window_label = _payload_window_label(sales_payload, fallback="today")
     sales_groups = sales_payload.get("groups") if isinstance(sales_payload, dict) else []
     sales_groups = sales_groups if isinstance(sales_groups, list) else []
     locations = location_payload.get("results") if isinstance(location_payload, dict) else []
     locations = locations if isinstance(locations, list) else []
-    by_name = {
-        str(item.get("name") or item.get("label") or "").strip().lower(): item
-        for item in locations
-        if isinstance(item, dict)
+    stock_risk_by_location_id = stock_risk_by_location_id or {}
+    sales_by_location = {
+        str(item.get("label") or "").strip().lower(): item
+        for item in sales_groups
+        if isinstance(item, dict) and str(item.get("label") or "").strip()
     }
     rows = []
     bar_rows = []
-    for sale in sales_groups:
-        if not isinstance(sale, dict):
+    for location in locations:
+        if not isinstance(location, dict):
             continue
-        label = str(sale.get("label") or "Location")
-        location = by_name.get(label.strip().lower(), {})
+        label = str(location.get("name") or "Location")
+        sale = sales_by_location.pop(label.strip().lower(), {})
+        risk_summary = stock_risk_by_location_id.get(str(location.get("id") or ""), {})
         row = {
             "location": label,
             "sales": float(sale.get("total_sales") or 0),
@@ -8816,6 +10475,26 @@ def _build_host_location_comparison_insight(
             "quantity": float(location.get("total_quantity") or 0),
             "value": float(location.get("total_value") or 0),
             "expiring_soon": int(location.get("expiring_soon_count") or 0),
+            "out_of_stock": int(risk_summary.get("out_of_stock_count") or 0),
+            "low_stock": int(risk_summary.get("low_stock_count") or 0),
+            "needs_reorder": int(risk_summary.get("reorder_count") or 0),
+        }
+        rows.append(row)
+        bar_rows.append({"label": label, "value": row["sales"]})
+    # Keep sales-only locations visible when a POS label does not map to a
+    # configured inventory location.
+    for sale in sales_by_location.values():
+        label = str(sale.get("label") or "Location")
+        row = {
+            "location": label,
+            "sales": float(sale.get("total_sales") or 0),
+            "orders": int(sale.get("order_count") or 0),
+            "quantity": 0,
+            "value": 0,
+            "expiring_soon": 0,
+            "out_of_stock": 0,
+            "low_stock": 0,
+            "needs_reorder": 0,
         }
         rows.append(row)
         bar_rows.append({"label": label, "value": row["sales"]})
@@ -8826,7 +10505,17 @@ def _build_host_location_comparison_insight(
             {
                 "type": "comparison_table",
                 "title": f"Location scorecard for {window_label}",
-                "columns": ["location", "sales", "orders", "quantity", "value", "expiring_soon"],
+                "columns": [
+                    "location",
+                    "sales",
+                    "orders",
+                    "quantity",
+                    "value",
+                    "out_of_stock",
+                    "low_stock",
+                    "needs_reorder",
+                    "expiring_soon",
+                ],
                 "rows": rows,
             },
             {
@@ -8854,6 +10543,36 @@ def _build_host_location_comparison_insight(
         "confidence": "high",
         "warnings": [],
     }
+
+
+async def _stock_risk_summaries_by_location(
+    location_payload: dict[str, Any],
+    *,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, dict[str, Any]]:
+    locations = location_payload.get("results") if isinstance(location_payload, dict) else []
+    locations = [location for location in locations if isinstance(location, dict)][:12] if isinstance(locations, list) else []
+    if not locations:
+        return {}
+
+    async def _load(location: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        location_id = str(location.get("id") or "").strip()
+        if not location_id:
+            return "", {}
+        try:
+            output = await tool_executor.call_tool(
+                name="inventory.get_stock_risk",
+                arguments={"limit": 12, "expiring_days": 30, "structural_location_id": location_id},
+                ctx=tool_ctx,
+            )
+        except Exception:
+            return location_id, {}
+        summary = output.get("summary") if isinstance(output, dict) and isinstance(output.get("summary"), dict) else {}
+        return location_id, summary
+
+    results = await asyncio.gather(*(_load(location) for location in locations))
+    return {location_id: summary for location_id, summary in results if location_id}
 
 
 def _build_host_recommendations_insight(
@@ -9716,6 +11435,11 @@ async def _pos_admin_named_insight_payload(
             arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "location"},
             ctx=tool_ctx,
         )
+        output = await _refresh_sales_location_labels(
+            output if isinstance(output, dict) else {},
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+        )
         daily_output = await tool_executor.call_tool(
             name="pos.get_sales_summary",
             arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "day"},
@@ -9742,6 +11466,11 @@ async def _pos_admin_named_insight_payload(
             name="pos.get_sales_summary",
             arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "location"},
             ctx=tool_ctx,
+        )
+        output = await _refresh_sales_location_labels(
+            output if isinstance(output, dict) else {},
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
         )
         return _build_pos_sales_by_location_insight(_with_window_label(output, window=sales_window))
     if insight_key == "top_sellers_seven_days":
@@ -9841,9 +11570,17 @@ async def _inventory_visibility_named_insight_payload(
 ) -> dict[str, Any] | None:
     movement_window = _resolve_insight_time_window(user_text, default_days=30, default_label="last 30 days")
     if insight_key in {"stock_risk_out_of_stock", "stock_risk_low_stock", "stock_risk"}:
+        location_scope = await _resolve_inventory_stock_location_scope(
+            user_text=user_text,
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+        )
+        stock_risk_arguments: dict[str, Any] = {"limit": 25, "expiring_days": 30}
+        if location_scope:
+            stock_risk_arguments["structural_location_id"] = location_scope["id"]
         output = await tool_executor.call_tool(
             name="inventory.get_stock_risk",
-            arguments={"limit": 12, "expiring_days": 30},
+            arguments=stock_risk_arguments,
             ctx=tool_ctx,
         )
         focus_map = {
@@ -9851,7 +11588,11 @@ async def _inventory_visibility_named_insight_payload(
             "stock_risk_low_stock": "low_stock",
             "stock_risk": None,
         }
-        return _build_inventory_stock_risk_insight(output if isinstance(output, dict) else {}, focus=focus_map[insight_key])
+        return _build_inventory_stock_risk_insight(
+            output if isinstance(output, dict) else {},
+            focus=focus_map[insight_key],
+            scope_label=location_scope["name"] if location_scope else None,
+        )
     if insight_key == "reorder_candidates":
         output = await tool_executor.call_tool(
             name="inventory.get_reorder_candidates",
@@ -10054,44 +11795,18 @@ async def _product_discovery_named_insight_payload(
             preview_kind="Product",
         )
     if insight_key == "import_opportunities":
-        dashboard_output = await tool_executor.call_tool(
-            name="product.get_product_dashboard_stats",
-            arguments={},
-            ctx=tool_ctx,
+        try:
+            catalog_output = await tool_executor.call_tool(
+                name="product.list_global_catalog_products",
+                arguments={"page": 1, "page_size": 12, "exclude_imported": True},
+                ctx=tool_ctx,
+            )
+        except Exception as exc:
+            logger.warning("Global catalog opportunity lookup failed: %s", exc)
+            catalog_output = {"count": 0, "results": [], "_error": "the global catalog could not be reached"}
+        return _build_product_import_opportunities_insight(
+            catalog_output if isinstance(catalog_output, dict) else {"count": 0, "results": []}
         )
-        variant_output = await tool_executor.call_tool(
-            name="product.search_product_variants",
-            arguments={"limit": 12, "active_only": True},
-            ctx=tool_ctx,
-        )
-        dashboard = dashboard_output.get("dashboard") if isinstance(dashboard_output, dict) else {}
-        categories = dashboard.get("category_distribution") if isinstance(dashboard, dict) else []
-        results: list[dict[str, Any]] = []
-        if not results:
-            results = [
-                {
-                    "name": str(item.get("product_name") or item.get("name") or "Catalog opportunity"),
-                    "brand": "",
-                    "category_name": "",
-                    "variant_count": 1,
-                    "already_imported": False,
-                }
-                for item in (variant_output.get("results") or [])
-                if isinstance(item, dict)
-            ]
-        if not results and isinstance(categories, list):
-            results = [
-                {
-                    "name": str(item.get("category_name") or "Category opportunity"),
-                    "brand": "",
-                    "category_name": str(item.get("category_name") or ""),
-                    "variant_count": int(item.get("count") or 0),
-                    "already_imported": False,
-                }
-                for item in categories
-                if isinstance(item, dict)
-            ]
-        return _build_product_import_opportunities_insight({"count": len(results), "results": results})
     if insight_key == "variant_lookup":
         output = await tool_executor.call_tool(
             name="product.search_product_variants",
@@ -10105,11 +11820,6 @@ async def _product_discovery_named_insight_payload(
             arguments={},
             ctx=tool_ctx,
         )
-        variant_output = await tool_executor.call_tool(
-            name="product.search_product_variants",
-            arguments={"limit": 12, "active_only": True},
-            ctx=tool_ctx,
-        )
         alerts_output = await tool_executor.call_tool(
             name="product.get_product_stock_alerts",
             arguments={},
@@ -10117,7 +11827,7 @@ async def _product_discovery_named_insight_payload(
         )
         return _build_catalog_gap_insight(
             dashboard_output if isinstance(dashboard_output, dict) else {},
-            variant_output if isinstance(variant_output, dict) else {},
+            {},
             alerts_output if isinstance(alerts_output, dict) else {},
         )
     if insight_key == "duplicate_codes":
@@ -10143,6 +11853,298 @@ async def _product_discovery_named_insight_payload(
             variant_output if isinstance(variant_output, dict) else {},
         )
     return None
+
+
+def _delegated_business_review_original_request(text: str) -> str | None:
+    """Return the user's request only for host-generated business-review work."""
+    raw = str(text or "").strip()
+    normalized = _normalize_user_text(raw)
+    if "continue the user's multi-domain business review" not in normalized:
+        return None
+    match = re.search(r"^Original user request:\s*(.+?)\s*$", raw, flags=re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return None
+    original_request = match.group(1).strip()
+    return original_request or None
+
+
+def _business_review_specialist_domain(agent_name: str, text: str) -> tuple[str, str] | None:
+    """Identify host-generated review work before a router falls back to an LLM."""
+    original_request = _delegated_business_review_original_request(text)
+    specialist_domains = {
+        "pos_admin": "pos",
+        "inventory_visibility": "inventory",
+        "users": "users",
+        "product_discovery": "product",
+    }
+    domain = specialist_domains.get(agent_name)
+    if not original_request or domain is None:
+        return None
+    return domain, original_request
+
+
+def _combine_business_review_insights(
+    *,
+    title: str,
+    summary: str,
+    payloads: list[dict[str, Any] | None],
+    required_permissions: list[str],
+) -> dict[str, Any]:
+    """Merge independently retrieved domain widgets without serializing raw payloads."""
+    widgets: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    suggested_actions: list[dict[str, Any]] = []
+    data_sources: list[dict[str, Any]] = []
+    permissions_checked: list[str] = []
+    seen_sources: set[str] = set()
+    seen_permissions: set[str] = set()
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        widgets.extend(
+            widget
+            for widget in (payload.get("widgets") if isinstance(payload.get("widgets"), list) else [])
+            if isinstance(widget, dict)
+        )
+        warnings.extend(
+            str(item).strip()
+            for item in (payload.get("warnings") if isinstance(payload.get("warnings"), list) else [])
+            if str(item).strip()
+        )
+        suggested_actions.extend(
+            item
+            for item in (payload.get("suggested_actions") if isinstance(payload.get("suggested_actions"), list) else [])
+            if isinstance(item, dict)
+        )
+        for source in payload.get("data_sources") if isinstance(payload.get("data_sources"), list) else []:
+            if not isinstance(source, dict):
+                continue
+            key = json.dumps(source, sort_keys=True, ensure_ascii=False)
+            if key not in seen_sources:
+                seen_sources.add(key)
+                data_sources.append(source)
+        for permission in payload.get("permissions_checked") if isinstance(payload.get("permissions_checked"), list) else []:
+            value = str(permission).strip()
+            if value and value not in seen_permissions:
+                seen_permissions.add(value)
+                permissions_checked.append(value)
+
+    for permission in required_permissions:
+        if permission not in seen_permissions:
+            seen_permissions.add(permission)
+            permissions_checked.append(permission)
+
+    if not widgets:
+        widgets.append(
+            {
+                "type": "metric_grid",
+                "title": title,
+                "data": [{"label": "Live data sources available", "value": 0}],
+            }
+        )
+        warnings.append("No live data source returned a usable result for this review section.")
+
+    return {
+        "kind": "insight_response",
+        "title": title,
+        "summary": summary,
+        "widgets": widgets,
+        "suggested_actions": suggested_actions[:8],
+        "data_sources": data_sources,
+        "permissions_checked": permissions_checked,
+        "confidence": "high" if data_sources else "low",
+        "warnings": list(dict.fromkeys(warnings))[:12],
+    }
+
+
+def _compact_business_review_reorder_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Keep the business-review replenishment section useful without repeating stock risk."""
+    if not isinstance(payload, dict):
+        return None
+
+    compact_widgets: list[dict[str, Any]] = []
+    widgets = payload.get("widgets") if isinstance(payload.get("widgets"), list) else []
+    for widget in widgets:
+        if not isinstance(widget, dict):
+            continue
+        widget_type = str(widget.get("type") or "").strip()
+        if widget_type == "metric_grid":
+            metric_rows = widget.get("data") if isinstance(widget.get("data"), list) else []
+            reorder_count = next(
+                (
+                    int(item.get("value") or 0)
+                    for item in metric_rows
+                    if isinstance(item, dict)
+                    and str(item.get("label") or "").strip().lower() == "needs reorder"
+                ),
+                0,
+            )
+            compact_widgets.append(
+                {
+                    "type": "metric_grid",
+                    "title": "Replenishment candidates",
+                    "data": [{"label": "Products to replenish", "value": reorder_count, "format": "number"}],
+                }
+            )
+        elif widget_type == "ranked_list":
+            compact_widgets.append(
+                {
+                    **widget,
+                    "title": "Products to replenish",
+                    "value_format": "number",
+                }
+            )
+
+    return {
+        **payload,
+        "summary": "Replenishment candidates are ready.",
+        "widgets": compact_widgets,
+    }
+
+
+async def _safe_business_review_payload(
+    payload_coro: Any,
+    *,
+    domain: str,
+    timeout_s: float = 35.0,
+) -> dict[str, Any] | None:
+    try:
+        payload = await asyncio.wait_for(payload_coro, timeout=timeout_s)
+    except Exception as exc:
+        logger.warning("business review specialist payload failed domain=%s error=%s", domain, exc)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+async def _business_review_specialist_payload(
+    *,
+    domain: str,
+    original_request: str,
+    tool_executor: ToolExecutor,
+    tool_ctx: ToolContext,
+) -> dict[str, Any]:
+    """Build a reliable, independently renderable review section for one domain."""
+    window = _resolve_insight_time_window(original_request, default_days=365, default_label="last 1 year")
+    if domain == "pos":
+        payload = await _safe_business_review_payload(
+            _pos_admin_named_insight_payload(
+                insight_key="sales_overview",
+                tool_executor=tool_executor,
+                tool_ctx=tool_ctx,
+                user_text=original_request,
+            ),
+            domain=domain,
+        )
+        return _combine_business_review_insights(
+            title="Sales performance",
+            summary=f"Sales performance for {window['label']} is ready.",
+            payloads=[payload],
+            required_permissions=["view_pos_reports"],
+        )
+
+    if domain == "inventory":
+        stock_risk, reorder, movements = await asyncio.gather(
+            _safe_business_review_payload(
+                _inventory_visibility_named_insight_payload(
+                    insight_key="stock_risk",
+                    tool_executor=tool_executor,
+                    tool_ctx=tool_ctx,
+                    user_text=original_request,
+                ),
+                domain=domain,
+            ),
+            _safe_business_review_payload(
+                _inventory_visibility_named_insight_payload(
+                    insight_key="reorder_candidates",
+                    tool_executor=tool_executor,
+                    tool_ctx=tool_ctx,
+                    user_text=original_request,
+                ),
+                domain=domain,
+            ),
+            _safe_business_review_payload(
+                _inventory_visibility_named_insight_payload(
+                    insight_key="stock_movements",
+                    tool_executor=tool_executor,
+                    tool_ctx=tool_ctx,
+                    user_text=original_request,
+                ),
+                domain=domain,
+            ),
+        )
+        reorder = _compact_business_review_reorder_payload(reorder)
+        return _combine_business_review_insights(
+            title="Inventory health",
+            summary="Inventory health is ready with current stock risks, replenishment candidates, and movement activity.",
+            payloads=[stock_risk, reorder, movements],
+            required_permissions=["read_inventory"],
+        )
+
+    if domain == "users":
+        staff_activity, security_activity, subscription_usage = await asyncio.gather(
+            _safe_business_review_payload(
+                _users_named_insight_payload(
+                    insight_key="staff_activity",
+                    tool_executor=tool_executor,
+                    tool_ctx=tool_ctx,
+                    user_text=original_request,
+                ),
+                domain=domain,
+            ),
+            _safe_business_review_payload(
+                _users_named_insight_payload(
+                    insight_key="permission_security_activity",
+                    tool_executor=tool_executor,
+                    tool_ctx=tool_ctx,
+                    user_text=original_request,
+                ),
+                domain=domain,
+            ),
+            _safe_business_review_payload(
+                _users_named_insight_payload(
+                    insight_key="subscription_usage_limits",
+                    tool_executor=tool_executor,
+                    tool_ctx=tool_ctx,
+                    user_text=original_request,
+                ),
+                domain=domain,
+            ),
+        )
+        return _combine_business_review_insights(
+            title="Workspace controls",
+            summary=f"Workspace controls for {window['label']} are ready.",
+            payloads=[staff_activity, security_activity, subscription_usage],
+            required_permissions=["view_audit_logs"],
+        )
+
+    # Product MCP serves these requests through a synchronous Django bridge.
+    # Keep the catalog reads ordered so concurrent stream sessions cannot block
+    # each other and turn an otherwise valid business review into a failure.
+    catalog_health = await _safe_business_review_payload(
+        _product_discovery_named_insight_payload(
+            insight_key="catalog_gaps",
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            user_text=original_request,
+        ),
+        domain=domain,
+    )
+    duplicate_codes = await _safe_business_review_payload(
+        _product_discovery_named_insight_payload(
+            insight_key="duplicate_codes",
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+            user_text=original_request,
+        ),
+        domain=domain,
+    )
+    return _combine_business_review_insights(
+        title="Product catalog health",
+        summary="Product catalog health is ready with assortment and identifier checks.",
+        payloads=[catalog_health, duplicate_codes],
+        required_permissions=["read_products"],
+    )
 
 
 async def _host_named_insight_payload(
@@ -10256,6 +12258,11 @@ async def _host_named_insight_payload(
                 timeout_s=14.0,
             ),
         )
+        sales_by_location_output = await _refresh_sales_location_labels(
+            sales_by_location_output if isinstance(sales_by_location_output, dict) else {},
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+        )
         top_sellers_output = await _enrich_top_seller_results_with_variant_context(
             results_payload=top_sellers_output if isinstance(top_sellers_output, dict) else {},
             tool_executor=tool_executor,
@@ -10294,6 +12301,11 @@ async def _host_named_insight_payload(
             arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "location"},
             ctx=tool_ctx,
         )
+        sales_output = await _refresh_sales_location_labels(
+            sales_output if isinstance(sales_output, dict) else {},
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+        )
         stock_output = await tool_executor.call_tool(
             name="inventory.get_stock_risk",
             arguments={"limit": 12, "expiring_days": 30},
@@ -10322,14 +12334,26 @@ async def _host_named_insight_payload(
             arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "location"},
             ctx=tool_ctx,
         )
+        sales_output = await _refresh_sales_location_labels(
+            sales_output if isinstance(sales_output, dict) else {},
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
+        )
         location_output = await tool_executor.call_tool(
             name="inventory.search_stock_locations",
-            arguments={"limit": 25},
+            arguments={"query": None, "limit": 25, "structural_only": True},
             ctx=tool_ctx,
+        )
+        normalized_location_output = location_output if isinstance(location_output, dict) else {}
+        stock_risk_by_location_id = await _stock_risk_summaries_by_location(
+            normalized_location_output,
+            tool_executor=tool_executor,
+            tool_ctx=tool_ctx,
         )
         return _build_host_location_comparison_insight(
             _with_window_label(sales_output, window=sales_window),
-            location_output if isinstance(location_output, dict) else {},
+            normalized_location_output,
+            stock_risk_by_location_id,
         )
     if insight_key == "recommendations":
         stock_output = await tool_executor.call_tool(
@@ -10886,6 +12910,46 @@ def _coerce_list_from_tool_output(value: Any) -> list[Any]:
     return []
 
 
+def _tool_output_error_text(value: Any) -> str | None:
+    mapping = _coerce_mapping_from_tool_output(value)
+    if not isinstance(mapping, dict):
+        return None
+    is_error = mapping.get("isError") is True
+    success = mapping.get("success")
+    status = str(mapping.get("status") or "").strip().lower()
+    if not is_error and success is not False and status not in {"error", "failed", "failure"}:
+        return None
+    direct_error = _first_string(mapping, ["error", "error_message", "message", "detail"])
+    if direct_error:
+        return direct_error
+    content = mapping.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    return "The upstream import tool returned an error."
+
+
+def _product_import_failure_text(error_text: str | None) -> str:
+    classified = _classify_error_text(error_text)
+    summary = str(classified.get("error_summary") or "").strip()
+    kind = str(classified.get("error_kind") or "").strip().lower()
+    if kind == "auth":
+        detail = "The global catalog connection rejected the request. Reconnect the product MCP credentials and retry the import."
+    elif kind == "tool_unavailable":
+        detail = "The global catalog import tool is not exposed in the current product agent configuration."
+    elif kind in {"dns", "tls", "timeout"}:
+        detail = f"The global catalog service is currently unavailable: {summary}"
+    else:
+        detail = summary or "The global catalog import failed for an unknown reason."
+    return f"I couldn't import the selected products from the global catalog. {detail}"
+
+
 def _extract_company_context(value: Any) -> dict[str, Any] | None:
     obj = _coerce_mapping_from_tool_output(value)
     if not isinstance(obj, dict):
@@ -11014,6 +13078,9 @@ def _onboarding_retry_picker_arguments(
 
 def _onboarding_completed_text(created_operations: dict[str, Any]) -> str:
     counts = {
+        "stock_location": 0,
+        "inventory_category": 0,
+        "inventory": 0,
         "category": 0,
         "catalog_page": 0,
         "review": 0,
@@ -11027,6 +13094,14 @@ def _onboarding_completed_text(created_operations: dict[str, Any]) -> str:
             counts[operation_type] += 1
 
     parts: list[str] = []
+    if counts["stock_location"]:
+        parts.append(f"{counts['stock_location']} stock location" + ("s" if counts["stock_location"] != 1 else ""))
+    if counts["inventory_category"]:
+        parts.append(
+            f"{counts['inventory_category']} inventory categor" + ("ies" if counts["inventory_category"] != 1 else "y")
+        )
+    if counts["inventory"]:
+        parts.append(f"{counts['inventory']} inventory item" + ("s" if counts["inventory"] != 1 else ""))
     if counts["category"]:
         parts.append(f"{counts['category']} category selection" + ("s" if counts["category"] != 1 else ""))
     if counts["catalog_page"]:
@@ -11037,10 +13112,10 @@ def _onboarding_completed_text(created_operations: dict[str, Any]) -> str:
         parts.append(f"{counts['product']} product" + ("s" if counts["product"] != 1 else ""))
 
     if not parts:
-        return "No product import records were created."
+        return "No onboarding records were created."
     if len(parts) == 1:
-        return f"Created {parts[0]} for product import."
-    return "Created " + ", ".join(parts[:-1]) + f", and {parts[-1]} for product import."
+        return f"Created {parts[0]} for onboarding."
+    return "Created " + ", ".join(parts[:-1]) + f", and {parts[-1]} for onboarding."
 
 
 def _tool_discovery_failures_for_name(tool_executor: ToolExecutor | None, tool_name: str) -> list[dict[str, Any]]:
@@ -11842,6 +13917,13 @@ def _selected_interaction_value(response: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _interaction_response_type(response: dict[str, Any] | None) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    interaction_type = str(response.get("type") or response.get("interaction_type") or "").strip().lower()
+    return interaction_type or None
+
+
 def _is_marketplace_results_payload(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -12456,6 +14538,26 @@ def _select_router_handoff_agent(router_agent_name: str, query: str, agents: lis
         return None
 
     available_names = _available_agent_names(route_agents)
+    normalized_query = _normalize_user_text(query)
+    if _delegated_business_review_original_request(query):
+        # Generic domain routers deliberately have no direct MCP tools. Send
+        # business reviews to the concrete read specialist, which emits the
+        # typed, deterministic section without an LLM synthesis pass.
+        review_specialists = {
+            "pos": "pos_admin",
+            "inventory": "inventory_visibility",
+            "product": "product_discovery",
+        }
+        specialist = review_specialists.get(router_agent_name)
+        if specialist:
+            return specialist
+    if router_agent_name == "inventory" and (
+        _is_cross_domain_business_review_query(query)
+        or "comprehensive inventory health review" in normalized_query
+        or "inventory health review" in normalized_query
+    ):
+        if not available_names or "inventory_visibility" in available_names:
+            return "inventory_visibility"
     selected_specialist = _select_router_specialist_agent(router_agent_name, query, route_agents)
     if selected_specialist:
         return selected_specialist
@@ -12477,6 +14579,45 @@ def _select_router_handoff_agent(router_agent_name: str, query: str, agents: lis
     return _select_router_delegation_agent(query, route_agents)
 
 
+def _router_delegate_request(router_agent_name: str, query: str, selected_agent: str) -> str:
+    normalized_query = _normalize_user_text(query)
+    if (
+        router_agent_name == "inventory"
+        and selected_agent == "inventory_visibility"
+        and (
+            _is_cross_domain_business_review_query(query)
+            or "comprehensive inventory health review" in normalized_query
+            or "inventory health review" in normalized_query
+        )
+    ):
+        analyst_window = _resolve_insight_time_window(
+            query,
+            default_days=365,
+            default_label="last 1 year",
+        )
+        blocks = [
+            "Run a comprehensive inventory health review for the requested time range.",
+            f"Original request: {query}" if query else "",
+            (
+                "Time range to use: "
+                f"{analyst_window['label']} ({analyst_window['start_date']} to {analyst_window['end_date']})."
+            ),
+            (
+                "Cover all of these in one consolidated response: stock posture and availability; turnover and velocity; "
+                "reorder recommendations; ageing and expiry analysis; valuation and carrying cost; fulfillment and "
+                "reservation issues; and procurement or receiving signals that affect stock health."
+            ),
+            (
+                "Use defaults without asking the user to choose a focus: include all locations, provide both company-wide "
+                "and per-location outputs, use established POS demand signals where helpful, and only include lot or "
+                "expiry-aware analysis if the workspace tracks it."
+            ),
+            "Do not send a focus picker, a default-confirmation checklist, or a retry-with-defaults prompt unless access is genuinely blocked.",
+        ]
+        return "\n".join(block for block in blocks if block)
+    return query
+
+
 def _coerce_delegated_response(
     delegated: Any,
     *,
@@ -12496,7 +14637,7 @@ def _coerce_delegated_response(
         delegated_final_state = _coerce_task_state(update.get("state"), default=TaskState.completed)
         break
 
-    child_artifacts = delegated_obj.get("artifacts") if isinstance(delegated_obj.get("artifacts"), dict) else {}
+    child_artifacts = dict(delegated_obj.get("artifacts") or {}) if isinstance(delegated_obj.get("artifacts"), dict) else {}
     result_payload = delegated_obj.get("result_parts")
     response_parts = _ka2a_parts_from_model_content(result_payload) if isinstance(result_payload, list) else []
     response_text = str(delegated_obj.get("response_text") or "").strip()
@@ -12521,6 +14662,10 @@ def _coerce_delegated_response(
     if not response_parts:
         response_parts = [TextPart(text="(no result)")]
         response_text = "(no result)"
+    # The delegated response can contain only result_parts and no named
+    # artifacts. Promote that response to a standard child result so the host
+    # stream can publish each specialist completion before its final summary.
+    child_artifacts.setdefault("result", response_parts)
     if interaction_payload is not None and delegated_final_state == TaskState.completed:
         delegated_final_state = TaskState.input_required
     if (
@@ -12591,23 +14736,37 @@ def _interaction_payload_summary_text(payload: dict[str, Any] | None) -> str | N
     return None
 
 
+def _public_delegation_agent_label(agent_name: str) -> str:
+    normalized = str(agent_name or "").strip().lower().replace("_", "-")
+    normalized = re.sub(r"^wa-p\d+-", "", normalized)
+    normalized = re.sub(r"-[0-9a-f]{8,}$", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized.replace("-", " ")).strip()
+    if "product catalog" in normalized:
+        return "product catalog"
+    domain = _canonical_host_domain_agent(normalized)
+    if domain in HOST_AGENT_LABELS:
+        return HOST_AGENT_LABELS[domain].lower()
+    return normalized or "workspace"
+
+
 def _format_delegation_status_text(*, agent_name: str, state: TaskState, message: str | None) -> str:
+    public_agent_name = _public_delegation_agent_label(agent_name)
     detail = (message or "").strip()
     if detail and detail.lower() not in {"working", state.value.lower()}:
-        return f"{agent_name} agent: {detail}"
+        return f"{public_agent_name} specialist: {detail}"
     if state == TaskState.submitted:
-        return f"{agent_name} agent accepted the delegated task."
+        return f"The {public_agent_name} specialist has accepted the task."
     if state == TaskState.working:
-        return f"{agent_name} agent is processing the delegated task."
+        return f"The {public_agent_name} specialist is working on it now."
     if state == TaskState.failed:
-        return f"{agent_name} agent reported an error."
+        return f"The {public_agent_name} specialist reported an error."
     if state == TaskState.input_required:
-        return f"{agent_name} agent needs more information from you."
+        return f"The {public_agent_name} specialist needs more information from you."
     if state == TaskState.auth_required:
-        return f"{agent_name} agent requires authentication before it can continue."
+        return f"The {public_agent_name} specialist requires authentication before it can continue."
     if state == TaskState.completed:
-        return f"{agent_name} agent completed the delegated task."
-    return f"{agent_name} agent status: {state.value}"
+        return f"The {public_agent_name} specialist completed the task."
+    return f"The {public_agent_name} specialist status is {state.value}."
 
 
 def _interaction_payload_from_text(text: str) -> dict[str, Any] | None:
@@ -13842,6 +16001,11 @@ def make_langgraph_chat_processor_from_env(
     ) -> AsyncIterator[TaskEvent]:
         _ = configuration
         user_text_for_memory = "\n".join([part.text for part in message.parts if isinstance(part, TextPart)]).strip()
+        corrected_inventory_request = _corrected_inventory_request(user_text_for_memory)
+        if corrected_inventory_request:
+            # Speech repair can arrive after an incorrect transcript has already
+            # started a task. Route the explicit correction, never the stale text.
+            user_text_for_memory = corrected_inventory_request
 
         if _is_simple_greeting_query(user_text_for_memory):
             response_text = _agent_intro_text(agent_name)
@@ -13958,6 +16122,51 @@ def make_langgraph_chat_processor_from_env(
         last_interaction_payload = _last_agent_interaction_payload(task)
         interaction_response = _interaction_response_from_text(user_text_for_memory)
         saved_workflow_state = await _load_workflow_state(context_id=task.context_id, metadata=metadata)
+        clarification_target_agent: str | None = None
+        if interaction_response is None and user_text_for_memory:
+            merged_from_workflow_state = _workflow_state_clarification_merge(
+                user_text_for_memory,
+                saved_workflow_state,
+            )
+            if merged_from_workflow_state:
+                clarification_target_agent = _canonical_host_domain_agent(
+                    str(saved_workflow_state.get("target_agent") or "")
+                    if isinstance(saved_workflow_state, dict)
+                    else ""
+                ) or _canonical_host_domain_agent(_infer_domain_agent_name(merged_from_workflow_state) or "")
+                user_text_for_memory = merged_from_workflow_state
+                saved_workflow_state = None
+                await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+        if (
+            _canonical_host_domain_agent(agent_name) == "host"
+            and interaction_response is None
+            and user_text_for_memory
+        ):
+            host_clarification_history = (
+                history
+                if isinstance(history, list)
+                else (task.history if isinstance(task.history, list) else None)
+            )
+            merged_host_follow_up = _latest_host_clarification_merge(
+                user_text_for_memory,
+                host_clarification_history,
+            )
+            if merged_host_follow_up:
+                clarification_target_agent = _canonical_host_domain_agent(
+                    _infer_domain_agent_name(merged_host_follow_up) or ""
+                ) or clarification_target_agent
+                user_text_for_memory = merged_host_follow_up
+                if (
+                    isinstance(saved_workflow_state, dict)
+                    and str(saved_workflow_state.get("workflow") or "").strip().lower() == "clarification"
+                ):
+                    saved_workflow_state = None
+                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+            elif clarification_target_agent is None:
+                clarification_target_agent = _latest_host_clarification_target(
+                    user_text_for_memory,
+                    host_clarification_history,
+                )
 
         if (
             interaction_response is None
@@ -13969,6 +16178,7 @@ def make_langgraph_chat_processor_from_env(
             inferred_domain_agent = _canonical_host_domain_agent(
                 _strong_domain_agent_override(user_text_for_memory)
                 or _infer_domain_agent_name(user_text_for_memory)
+                or clarification_target_agent
                 or ""
             )
             inferred_onboarding_scope = _infer_onboarding_scope_from_text(user_text_for_memory)
@@ -14059,6 +16269,38 @@ def make_langgraph_chat_processor_from_env(
                     response_parts=response_parts,
                 )
                 return
+
+        business_review_specialist = _business_review_specialist_domain(agent_name, user_text_for_memory)
+        if interaction_response is None and business_review_specialist and tool_executor is not None:
+            review_domain, original_request = business_review_specialist
+            insight_output = await _business_review_specialist_payload(
+                domain=review_domain,
+                original_request=original_request,
+                tool_executor=tool_executor,
+                tool_ctx=tool_ctx,
+            )
+            response_text = str(insight_output.get("summary") or "").strip() or "Business review section is ready."
+            response_parts = [DataPart(data=insight_output)]
+            yield Artifact(name="result", parts=response_parts)
+            yield TaskStatus(
+                state=TaskState.completed,
+                message=Message(
+                    role=Role.agent,
+                    parts=response_parts,
+                    context_id=task.context_id,
+                ),
+            )
+            await _maybe_update_memory(
+                llm=llm,
+                context_id=task.context_id,
+                metadata=metadata,
+                existing=mem,
+                history=history if isinstance(history, list) else None,
+                user_text=user_text_for_memory,
+                assistant_text=response_text,
+                response_parts=response_parts,
+            )
+            return
 
         if agent_name == "pos_admin" and interaction_response is None and user_text_for_memory and tool_executor is not None:
             named_insight = _pos_admin_named_insight_from_text(user_text_for_memory)
@@ -14269,7 +16511,43 @@ def make_langgraph_chat_processor_from_env(
                 user_text_for_memory,
                 named_insight,
             )
-            if named_insight:
+            if named_insight and named_insight != "business_analyst_review":
+                host_follow_up = _fresh_host_request_clarification(
+                    user_text_for_memory,
+                    _infer_domain_agent_name(user_text_for_memory),
+                )
+                if host_follow_up:
+                    response_parts = [TextPart(text=host_follow_up)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _save_workflow_state(
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        workflow_state=_clarification_workflow_state(
+                            original_request=user_text_for_memory,
+                            clarification_prompt=host_follow_up,
+                            inferred_agent=_infer_domain_agent_name(user_text_for_memory),
+                        ),
+                    )
+                    saved_workflow_state = await _load_workflow_state(context_id=task.context_id, metadata=metadata)
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=host_follow_up,
+                        response_parts=response_parts,
+                    )
+                    return
                 try:
                     insight_output = await _host_named_insight_payload(
                         insight_key=named_insight,
@@ -14278,6 +16556,12 @@ def make_langgraph_chat_processor_from_env(
                         user_text=user_text_for_memory,
                     )
                 except Exception:
+                    logger.exception(
+                        "host deterministic insight failed agent=%s insight_key=%s user_text=%s",
+                        agent_name,
+                        named_insight,
+                        user_text_for_memory,
+                    )
                     insight_output = None
                 if isinstance(insight_output, dict):
                     response_text = str(insight_output.get("summary") or "").strip() or "Workspace insight ready."
@@ -14452,7 +16736,7 @@ def make_langgraph_chat_processor_from_env(
             agent_listing = await _load_host_agent_listing()
             available_names = sorted(_agent_listing_names(agent_listing, "agents"))
             registered_names = sorted(_agent_listing_names(agent_listing, "registered_agents"))
-            inferred_agent = _infer_domain_agent_name(user_text_for_memory)
+            inferred_agent = _infer_domain_agent_name(user_text_for_memory) or clarification_target_agent
             if registered_names:
                 labels = ", ".join(_friendly_agent_label(name) for name in registered_names)
                 if inferred_agent and _is_host_availability_query(user_text_for_memory):
@@ -14785,6 +17069,30 @@ def make_langgraph_chat_processor_from_env(
             agent_summaries = (await _load_host_agent_listing()).get("agents")
             available_names = _available_agent_names(agent_summaries)
             if available_names and selected_value not in available_names:
+                try:
+                    interaction_output = await tool_executor.call_tool(
+                        name="create_multiple_choice",
+                        arguments=_host_capability_picker_arguments(
+                            agent_summaries,
+                            description=_host_unavailable_capability_picker_description(selected_value),
+                        ),
+                        ctx=tool_ctx,
+                    )
+                except Exception:
+                    interaction_output = None
+                if isinstance(interaction_output, dict):
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [DataPart(data=interaction_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
                 response_text = _host_unavailable_follow_up_text(selected_value)
                 response_parts = [TextPart(text=response_text)]
                 yield Artifact(name="result", parts=response_parts)
@@ -15841,7 +18149,10 @@ def make_langgraph_chat_processor_from_env(
         product_import_router_active = (
             current_domain_agent in ROUTER_AGENT_NAMES
             and (
-                explicit_product_import_request
+                (
+                    explicit_product_import_request
+                    and not _is_internal_onboarding_execution_request(user_text_for_memory or "")
+                )
                 or (
                     isinstance(saved_workflow_state, dict)
                     and str(saved_workflow_state.get("workflow") or "").strip().lower() == "product_import"
@@ -16213,8 +18524,9 @@ def make_langgraph_chat_processor_from_env(
                     imported_count=imported_count,
                 )
 
-            async def _build_product_import_wizard(
+            async def _build_onboarding_wizard(
                 *,
+                scope: str,
                 prefill_data: dict[str, Any] | None = None,
                 description: str,
             ) -> tuple[dict[str, Any], dict[str, Any]] | None:
@@ -16222,7 +18534,7 @@ def make_langgraph_chat_processor_from_env(
                 try:
                     interaction_output = await tool_executor.call_tool(
                         name="create_wizard_flow",
-                        arguments=_onboarding_wizard_arguments("product_onboarding"),
+                        arguments=_onboarding_wizard_arguments(scope),
                         ctx=tool_ctx,
                     )
                 except Exception:
@@ -16240,12 +18552,12 @@ def make_langgraph_chat_processor_from_env(
                 existing_responses: dict[str, Any] = {}
                 if prefill_data:
                     existing_responses = _build_onboarding_existing_responses(
-                        "product_onboarding",
+                        scope,
                         wizard_payload=interaction_output,
                         prefill_data=prefill_data,
                     )
                     existing_responses = _normalize_onboarding_existing_responses(
-                        "product_onboarding",
+                        scope,
                         wizard_payload=interaction_output,
                         existing_responses=existing_responses,
                     )
@@ -16255,14 +18567,14 @@ def make_langgraph_chat_processor_from_env(
                     interaction_output,
                     workflow="product_import",
                     workflow_stage="wizard",
-                    onboarding_scope="product_onboarding",
+                    onboarding_scope=scope,
                 )
                 interaction_output["description"] = description
                 workflow_state = {
                     "workflow": "product_import",
                     "status": "collecting",
                     "stage": "wizard",
-                    "scope": "product_onboarding",
+                    "scope": scope,
                     "pending_interaction": interaction_output,
                     "existing_responses": existing_responses,
                 }
@@ -16275,6 +18587,7 @@ def make_langgraph_chat_processor_from_env(
                 await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
 
             inferred_onboarding_scope = _infer_onboarding_scope_from_text(user_text_for_memory or "")
+            generic_onboarding_request = _is_non_import_onboarding_request(user_text_for_memory or "")
             saved_workflow_name = (
                 str(saved_workflow_state.get("workflow") or "").strip().lower()
                 if isinstance(saved_workflow_state, dict)
@@ -16303,7 +18616,11 @@ def make_langgraph_chat_processor_from_env(
                 _is_onboarding_payload(last_interaction_payload, stage=stage)
                 for stage in ("resume_prompt", "scope_picker", "wizard", "review", "retry")
             )
-            if product_import_context_active and legacy_product_import_stage_active:
+            should_reset_legacy_product_import_state = (
+                explicit_product_import_request
+                or (inferred_onboarding_scope == "product_onboarding" and not generic_onboarding_request)
+            )
+            if should_reset_legacy_product_import_state and legacy_product_import_stage_active:
                 interaction_response = None
                 last_interaction_payload = None
                 saved_pending_interaction = None
@@ -16433,64 +18750,22 @@ def make_langgraph_chat_processor_from_env(
                 and "create_multiple_choice" in tool_names
             ):
                 selected_scope = _selected_interaction_value(interaction_response) or "product_onboarding"
-                if selected_scope == "product_onboarding":
-                    description = "I can start the product import flow. Do you want to browse products by category or by brand?"
-                    try:
-                        interaction_output = await tool_executor.call_tool(
-                            name="create_multiple_choice",
-                            arguments=_onboarding_catalog_scope_picker_arguments(description=description),
-                            ctx=tool_ctx,
-                        )
-                    except Exception:
-                        interaction_output = None
-                    if isinstance(interaction_output, dict):
-                        interaction_output = _with_interaction_metadata(
-                            interaction_output,
-                            workflow="product_import",
-                            workflow_stage="catalog_scope_prompt",
-                            onboarding_scope="product_onboarding",
-                        )
-                        workflow_state = {
-                            "workflow": "product_import",
-                            "status": "awaiting_catalog_scope",
-                            "stage": "catalog_scope_prompt",
-                            "scope": "product_onboarding",
-                            "pending_interaction": interaction_output,
-                        }
-                        company_context = await _maybe_active_company_context()
-                        if company_context:
-                            workflow_state["company_context"] = company_context
-                        await _save_workflow_state(
-                            context_id=task.context_id,
-                            metadata=metadata,
-                            workflow_state=workflow_state,
-                        )
-                        response_text = json.dumps(interaction_output, ensure_ascii=False)
-                        response_parts = [DataPart(data=interaction_output)]
-                        yield Artifact(name="result", parts=response_parts)
-                        yield TaskStatus(
-                            state=TaskState.input_required,
-                            message=Message(
-                                role=Role.agent,
-                                parts=response_parts,
-                                context_id=task.context_id,
-                            ),
-                        )
-                        return
-                else:
-                    workflow_state = {
-                        "workflow": "product_import",
-                        "status": "collecting",
-                        "stage": "wizard",
-                        "scope": selected_scope,
-                        "pending_interaction": None,
-                    }
-                    response_text = "Only product import is available in this onboarding flow right now."
-                    response_parts = [TextPart(text=response_text)]
-                    await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=workflow_state)
+                wizard_bundle = await _build_onboarding_wizard(
+                    scope=selected_scope,
+                    description="Fill in the setup details and I will prepare the onboarding action plan.",
+                )
+                if wizard_bundle is not None:
+                    interaction_output, workflow_state = wizard_bundle
+                    await _save_workflow_state(
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        workflow_state=workflow_state,
+                    )
+                    response_text = json.dumps(interaction_output, ensure_ascii=False)
+                    response_parts = [DataPart(data=interaction_output)]
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
-                        state=TaskState.completed,
+                        state=TaskState.input_required,
                         message=Message(
                             role=Role.agent,
                             parts=response_parts,
@@ -16498,6 +18773,18 @@ def make_langgraph_chat_processor_from_env(
                         ),
                     )
                     return
+                response_text = "I couldn't load the onboarding wizard right now."
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.failed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                return
 
             category_selection_payload = _active_product_import_payload(stage="category_selection")
             if interaction_response is not None and category_selection_payload is not None:
@@ -16597,7 +18884,9 @@ def make_langgraph_chat_processor_from_env(
 
             product_selection_payload = _active_product_import_payload(stage="product_selection")
             if interaction_response is not None and product_selection_payload is not None:
-                selected_product_ids = _searchable_selection_selected_ids(interaction_response)
+                selected_product_ids = _dedupe_preserving_order(
+                    _searchable_selection_selected_ids(interaction_response)
+                )
                 if not selected_product_ids:
                     response_text = "Select at least one product to import from this page."
                     response_parts = [TextPart(text=response_text)]
@@ -16622,7 +18911,17 @@ def make_langgraph_chat_processor_from_env(
                         ctx=tool_ctx,
                     )
                 except Exception as exc:
-                    response_text = str(exc).strip() or "I couldn't import the selected global catalog products."
+                    response_text = _product_import_failure_text(str(exc))
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                    )
+                    return
+                output_error_text = _tool_output_error_text(import_output)
+                if output_error_text:
+                    response_text = _product_import_failure_text(output_error_text)
                     response_parts = [TextPart(text=response_text)]
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
@@ -16663,6 +18962,10 @@ def make_langgraph_chat_processor_from_env(
                         total_pages=total_pages,
                         imported_count=imported_total,
                     )
+                    interaction_output = {
+                        **interaction_output,
+                        "last_import_selection_ids": list(selected_product_ids),
+                    }
                     workflow_state = {
                         "workflow": "product_import",
                         "status": "awaiting_page_continue",
@@ -16674,6 +18977,7 @@ def make_langgraph_chat_processor_from_env(
                         "page": page,
                         "total_pages": total_pages,
                         "imported_count": imported_total,
+                        "last_import_selection_ids": selected_product_ids,
                         "pending_interaction": interaction_output,
                     }
                     company_context = await _maybe_active_company_context()
@@ -16712,6 +19016,34 @@ def make_langgraph_chat_processor_from_env(
 
             page_continue_payload = _active_product_import_payload(stage="page_continue")
             if interaction_response is not None and page_continue_payload is not None:
+                response_type = _interaction_response_type(interaction_response)
+                last_import_selection_ids = (
+                    _dedupe_preserving_order(
+                        [
+                            str(value).strip()
+                            for value in page_continue_payload.get("last_import_selection_ids") or []
+                            if str(value or "").strip()
+                        ]
+                    )
+                    if isinstance(page_continue_payload.get("last_import_selection_ids"), list)
+                    else []
+                )
+                if response_type == "searchable_selection_response":
+                    repeated_selection_ids = _dedupe_preserving_order(
+                        _searchable_selection_selected_ids(interaction_response)
+                    )
+                    if repeated_selection_ids and repeated_selection_ids == last_import_selection_ids:
+                        response_text = (
+                            "Those products were already imported from this catalog page. "
+                            "Use the current prompt to continue to the next page or finish the import."
+                        )
+                        response_parts = [TextPart(text=response_text)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(role=Role.agent, parts=response_parts, context_id=task.context_id),
+                        )
+                        return
                 selected_action = _selected_interaction_value(interaction_response) or "finish_import"
                 catalog_scope = str(page_continue_payload.get("catalog_scope") or "category").strip() or "category"
                 selected_category_names = (
@@ -16773,7 +19105,7 @@ def make_langgraph_chat_processor_from_env(
                 )
                 return
 
-            if product_import_context_active:
+            if product_import_context_active and interaction_response is None:
                 direct_prefill = _parse_onboarding_prefill_from_text(
                     "product_onboarding",
                     user_text_for_memory or "",
@@ -16950,10 +19282,11 @@ def make_langgraph_chat_processor_from_env(
                     interaction_response,
                     wizard_payload=last_interaction_payload,
                 )
+                execution_scope = str(onboarding_data.get("scope") or selected_scope).strip() or selected_scope
                 company_context = await _maybe_active_company_context()
                 if company_context:
                     onboarding_data["company_context"] = company_context
-                summary = _onboarding_summary_text(selected_scope, onboarding_data)
+                summary = _onboarding_summary_text(execution_scope, onboarding_data)
                 try:
                     interaction_output = await tool_executor.call_tool(
                         name="create_multiple_choice",
@@ -16976,7 +19309,7 @@ def make_langgraph_chat_processor_from_env(
                         "workflow": "product_import",
                         "status": "awaiting_review",
                         "stage": "review",
-                        "scope": selected_scope,
+                        "scope": execution_scope,
                         "summary": summary,
                         "onboarding_data": onboarding_data,
                         "pending_interaction": interaction_output,
@@ -17019,7 +19352,11 @@ def make_langgraph_chat_processor_from_env(
                     if isinstance(last_interaction_payload.get("onboarding_data"), dict)
                     else {}
                 )
-                onboarding_summary = str(last_interaction_payload.get("onboarding_summary") or "").strip() or _onboarding_summary_text(selected_scope, onboarding_data)
+                execution_scope = str(onboarding_data.get("scope") or selected_scope).strip() or selected_scope
+                onboarding_summary = (
+                    str(last_interaction_payload.get("onboarding_summary") or "").strip()
+                    or _onboarding_summary_text(execution_scope, onboarding_data)
+                )
                 created_operations = (
                     last_interaction_payload.get("created_operations")
                     if isinstance(last_interaction_payload.get("created_operations"), dict)
@@ -17073,7 +19410,7 @@ def make_langgraph_chat_processor_from_env(
                     key: value for key, value in created_operations.items() if isinstance(value, dict)
                 }
                 executed_map, failed_items, any_tool_executed = await _execute_onboarding_plan_operations(
-                    selected_scope=selected_scope,
+                    selected_scope=execution_scope,
                     onboarding_data=onboarding_data,
                     tool_specs=tool_specs,
                     company_context=company_context,
@@ -17084,12 +19421,12 @@ def make_langgraph_chat_processor_from_env(
                 created_map = executed_map
 
                 if not any_tool_executed and not created_map and "delegate_to_agent" in tool_names:
-                    fallback_agent = _onboarding_target_agent(selected_scope)
+                    fallback_agent = _onboarding_target_agent(execution_scope)
                     try:
                         delegated = await tool_executor.call_tool(
                             name="delegate_to_agent",
                             arguments={
-                                "request": _onboarding_creation_request(selected_scope, onboarding_data),
+                                "request": _onboarding_creation_request(execution_scope, onboarding_data),
                                 "agent_name": fallback_agent,
                             },
                             ctx=tool_ctx,
@@ -17347,6 +19684,24 @@ def make_langgraph_chat_processor_from_env(
             if "create_multiple_choice" in tool_names:
                 if saved_workflow_state and user_text_for_memory and not explicit_product_import_request:
                     normalized_text = _normalize_user_text(user_text_for_memory)
+                    saved_pending_interaction = (
+                        saved_workflow_state.get("pending_interaction")
+                        if isinstance(saved_workflow_state.get("pending_interaction"), dict)
+                        else None
+                    )
+                    if "continue onboarding" in normalized_text and isinstance(saved_pending_interaction, dict):
+                        response_text = json.dumps(saved_pending_interaction, ensure_ascii=False)
+                        response_parts = [DataPart(data=saved_pending_interaction)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
                     if not any(phrase in normalized_text for phrase in ("start over", "restart", "new onboarding")):
                         try:
                             interaction_output = await tool_executor.call_tool(
@@ -17377,10 +19732,26 @@ def make_langgraph_chat_processor_from_env(
 
                 direct_scope = _infer_onboarding_scope_from_text(user_text_for_memory or "")
                 direct_prefill = _parse_onboarding_prefill_from_text(
-                    direct_scope or "product_onboarding",
+                    "full_setup" if generic_onboarding_request else (direct_scope or "product_onboarding"),
                     user_text_for_memory or "",
                 )
-                if direct_scope == "product_onboarding":
+                has_onboarding_prefill = any(
+                    key in direct_prefill
+                    for key in (
+                        "primary_location_mode",
+                        "primary_location_name",
+                        "additional_locations",
+                        "category_names",
+                        "default_inventory_name",
+                        "inventory_description",
+                        "related_stock_location_name",
+                        "inventory_category_name",
+                        "initial_product_names",
+                        "product_category_name",
+                        "continue_to_product_onboarding",
+                    )
+                )
+                if direct_scope == "product_onboarding" and not generic_onboarding_request:
                     selected_catalog_scope = _normalize_catalog_scope_selection(str(direct_prefill.get("catalog_scope") or ""))
                     if selected_catalog_scope is None:
                         description = "I can start the product import flow. Do you want to browse products by category or by brand?"
@@ -17487,6 +19858,106 @@ def make_langgraph_chat_processor_from_env(
                     yield Artifact(name="result", parts=response_parts)
                     yield TaskStatus(
                         state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
+
+                if generic_onboarding_request and has_onboarding_prefill:
+                    wizard_bundle = await _build_onboarding_wizard(
+                        scope="product_onboarding",
+                        prefill_data=direct_prefill,
+                        description="I prefilled this setup from your message.",
+                    )
+                    if wizard_bundle is not None:
+                        interaction_output, workflow_state = wizard_bundle
+                        await _save_workflow_state(
+                            context_id=task.context_id,
+                            metadata=metadata,
+                            workflow_state=workflow_state,
+                        )
+                        response_text = json.dumps(interaction_output, ensure_ascii=False)
+                        response_parts = [DataPart(data=interaction_output)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
+                    response_text = "I couldn't load the onboarding wizard right now."
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    return
+
+                if generic_onboarding_request:
+                    company_context = await _maybe_active_company_context()
+                    description = "Choose the setup area you want to complete first. I will guide you step by step."
+                    if isinstance(company_context, dict):
+                        company_name = str(company_context.get("name") or "").strip()
+                        if company_name:
+                            description = f"Current company: {company_name}\n\n{description}"
+                    try:
+                        interaction_output = await tool_executor.call_tool(
+                            name="create_multiple_choice",
+                            arguments=_onboarding_scope_picker_arguments(description=description),
+                            ctx=tool_ctx,
+                        )
+                    except Exception:
+                        interaction_output = None
+
+                    if isinstance(interaction_output, dict):
+                        interaction_output = _with_interaction_metadata(
+                            interaction_output,
+                            workflow="product_import",
+                            workflow_stage="scope_picker",
+                        )
+                        workflow_state = {
+                            "workflow": "product_import",
+                            "status": "awaiting_scope",
+                            "stage": "scope_picker",
+                            "scope": "product_onboarding",
+                            "pending_interaction": interaction_output,
+                        }
+                        if company_context:
+                            workflow_state["company_context"] = company_context
+                        await _save_workflow_state(
+                            context_id=task.context_id,
+                            metadata=metadata,
+                            workflow_state=workflow_state,
+                        )
+                        response_text = json.dumps(interaction_output, ensure_ascii=False)
+                        response_parts = [DataPart(data=interaction_output)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
+
+                    response_text = description
+                    response_parts = [TextPart(text=response_text)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
                         message=Message(
                             role=Role.agent,
                             parts=response_parts,
@@ -18162,10 +20633,15 @@ def make_langgraph_chat_processor_from_env(
                 )
 
                 try:
+                    delegated_request = _router_delegate_request(
+                        agent_name,
+                        user_text_for_memory,
+                        selected_agent,
+                    )
                     delegated = await tool_executor.call_tool(
                         name="delegate_to_agent",
                         arguments={
-                            "request": user_text_for_memory,
+                            "request": delegated_request,
                             "agent_name": selected_agent,
                         },
                         ctx=tool_ctx,
@@ -18319,7 +20795,43 @@ def make_langgraph_chat_processor_from_env(
             and not _is_host_introspection_query(user_text_for_memory)
         ):
             named_insight = _host_named_insight_from_text(user_text_for_memory)
-            if named_insight:
+            if named_insight and named_insight != "business_analyst_review":
+                host_follow_up = _fresh_host_request_clarification(
+                    user_text_for_memory,
+                    _infer_domain_agent_name(user_text_for_memory),
+                )
+                if host_follow_up:
+                    response_parts = [TextPart(text=host_follow_up)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.input_required,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _save_workflow_state(
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        workflow_state=_clarification_workflow_state(
+                            original_request=user_text_for_memory,
+                            clarification_prompt=host_follow_up,
+                            inferred_agent=_infer_domain_agent_name(user_text_for_memory),
+                        ),
+                    )
+                    saved_workflow_state = await _load_workflow_state(context_id=task.context_id, metadata=metadata)
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=host_follow_up,
+                        response_parts=response_parts,
+                    )
+                    return
                 try:
                     insight_output = await _host_named_insight_payload(
                         insight_key=named_insight,
@@ -18354,11 +20866,15 @@ def make_langgraph_chat_processor_from_env(
                     return
 
             inferred_agent = _infer_domain_agent_name(user_text_for_memory)
+            broad_business_review = _is_cross_domain_business_review_query(user_text_for_memory)
             explicit_product_import_request = _is_explicit_product_import_request(user_text_for_memory)
+            host_availability_query = _is_host_availability_query(user_text_for_memory)
             direct_host_agent = _canonical_host_domain_agent(
                 _strong_domain_agent_override(user_text_for_memory) or inferred_agent or ""
             )
-            selected_agent: str | None = "onboarding" if explicit_product_import_request else (direct_host_agent or None)
+            selected_agent: str | None = None if host_availability_query else (
+                "onboarding" if explicit_product_import_request else (direct_host_agent or None)
+            )
 
             agent_listing: dict[str, list[dict[str, Any]]] = {
                 "agents": [],
@@ -18368,11 +20884,98 @@ def make_langgraph_chat_processor_from_env(
             agent_summaries: list[dict[str, Any]] = []
             available_names: set[str] = set()
             registered_names: set[str] = set()
-            if selected_agent is None or _is_host_availability_query(user_text_for_memory):
+            skip_listing_for_direct_product_import = (
+                explicit_product_import_request
+                and selected_agent == "onboarding"
+                and not host_availability_query
+            )
+            if not skip_listing_for_direct_product_import:
                 agent_listing = await _load_host_agent_listing()
                 agent_summaries = agent_listing.get("agents")
                 available_names = _available_agent_names(agent_summaries)
                 registered_names = _agent_listing_names(agent_listing, "registered_agents")
+
+            orchestration_plan = _host_orchestration_plan(user_text_for_memory, agent_summaries)
+            host_clarification_target = _canonical_host_domain_agent(inferred_agent or "")
+            host_clarification_text = (
+                _fresh_host_request_clarification(user_text_for_memory, inferred_agent)
+                if (
+                    not host_availability_query
+                    and not explicit_product_import_request
+                    and (
+                        broad_business_review
+                        or host_clarification_target in {"host", "pos", "inventory", "product", "users", "onboarding"}
+                    )
+                )
+                else None
+            )
+
+            if host_clarification_text:
+                response_parts = [TextPart(text=host_clarification_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.input_required,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _save_workflow_state(
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    workflow_state=_clarification_workflow_state(
+                        original_request=user_text_for_memory,
+                        clarification_prompt=host_clarification_text,
+                        inferred_agent=inferred_agent,
+                    ),
+                )
+                saved_workflow_state = await _load_workflow_state(context_id=task.context_id, metadata=metadata)
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=host_clarification_text,
+                    response_parts=response_parts,
+                )
+                return
+
+            if broad_business_review and not orchestration_plan:
+                try:
+                    insight_output = await _host_named_insight_payload(
+                        insight_key="business_analyst_review",
+                        tool_executor=tool_executor,
+                        tool_ctx=tool_ctx,
+                        user_text=user_text_for_memory,
+                    )
+                except Exception:
+                    insight_output = None
+                if isinstance(insight_output, dict):
+                    response_text = str(insight_output.get("summary") or "").strip() or "Workspace insight ready."
+                    response_parts = [DataPart(data=insight_output)]
+                    yield Artifact(name="result", parts=response_parts)
+                    yield TaskStatus(
+                        state=TaskState.completed,
+                        message=Message(
+                            role=Role.agent,
+                            parts=response_parts,
+                            context_id=task.context_id,
+                        ),
+                    )
+                    await _maybe_update_memory(
+                        llm=llm,
+                        context_id=task.context_id,
+                        metadata=metadata,
+                        existing=mem,
+                        history=history if isinstance(history, list) else None,
+                        user_text=user_text_for_memory,
+                        assistant_text=response_text,
+                        response_parts=response_parts,
+                    )
+                    return
 
             if (
                 selected_agent is None
@@ -18431,8 +21034,72 @@ def make_langgraph_chat_processor_from_env(
                 )
                 return
 
+            if (
+                selected_agent
+                and selected_agent not in available_names
+                and (available_names or registered_names)
+            ):
+                should_reprompt_unavailable = (
+                    _should_offer_host_unavailable_domain_picker(user_text_for_memory)
+                    or _is_host_capability_picker_payload(last_interaction_payload)
+                )
+                if "create_multiple_choice" in tool_names and should_reprompt_unavailable:
+                    try:
+                        interaction_output = await tool_executor.call_tool(
+                            name="create_multiple_choice",
+                            arguments=_host_capability_picker_arguments(
+                                agent_summaries,
+                                description=_host_unavailable_capability_picker_description(selected_agent),
+                            ),
+                            ctx=tool_ctx,
+                        )
+                    except Exception:
+                        interaction_output = None
+                    if isinstance(interaction_output, dict):
+                        response_text = json.dumps(interaction_output, ensure_ascii=False)
+                        response_parts = [DataPart(data=interaction_output)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.input_required,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        return
+                response_text = _host_unavailable_agent_text(
+                    agent_name=selected_agent,
+                    available_names=available_names,
+                    registered_names=registered_names,
+                )
+                response_parts = [TextPart(text=response_text)]
+                yield Artifact(name="result", parts=response_parts)
+                yield TaskStatus(
+                    state=TaskState.completed,
+                    message=Message(
+                        role=Role.agent,
+                        parts=response_parts,
+                        context_id=task.context_id,
+                    ),
+                )
+                await _maybe_update_memory(
+                    llm=llm,
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    existing=mem,
+                    history=history if isinstance(history, list) else None,
+                    user_text=user_text_for_memory,
+                    assistant_text=response_text,
+                    response_parts=response_parts,
+                )
+                return
+
             if selected_agent is None:
-                selected_agent = _select_host_delegation_agent(user_text_for_memory, agent_summaries)
+                if broad_business_review and orchestration_plan:
+                    selected_agent = orchestration_plan[0]
+                else:
+                    selected_agent = _select_host_delegation_agent(user_text_for_memory, agent_summaries)
             if selected_agent or len(agent_summaries) == 1 or not agent_summaries:
                 if selected_agent is None and len(agent_summaries) == 1:
                     selected_agent = str(agent_summaries[0].get("name") or "").strip() or None
@@ -18450,11 +21117,22 @@ def make_langgraph_chat_processor_from_env(
                     ),
                 )
 
+                delegation_request = user_text_for_memory
+                if broad_business_review and selected_agent:
+                    delegation_request = _host_orchestration_next_request(
+                        {
+                            "original_request": user_text_for_memory,
+                            "completed_agents": [],
+                            "last_response_text": "",
+                        },
+                        selected_agent,
+                    )
+
                 try:
                     delegated = await tool_executor.call_tool(
                         name="delegate_to_agent",
                         arguments={
-                            "request": user_text_for_memory,
+                            "request": delegation_request,
                             **({"agent_name": selected_agent} if selected_agent else {}),
                         },
                         ctx=tool_ctx,
@@ -18573,10 +21251,265 @@ def make_langgraph_chat_processor_from_env(
                     if parts:
                         yield Artifact(name=f"{delegated_response['delegated_agent']}.{artifact_name}", parts=parts)
 
+                if _host_orchestration_should_auto_continue(user_text_for_memory, orchestration_plan):
+                    completed_agents: list[str] = []
+                    delegated_agent_domain = _canonical_host_domain_agent(delegated_response["delegated_agent"])
+                    if delegated_response["delegated_final_state"] == TaskState.completed and delegated_agent_domain:
+                        completed_agents.append(delegated_agent_domain)
+                    completed_sections: list[dict[str, Any]] = [
+                        {
+                            "agent_name": delegated_response["delegated_agent"],
+                            "text": delegated_response["response_text"],
+                            "payload": _insight_response_from_parts(delegated_response["response_parts"])
+                            or _insight_response_from_artifacts(delegated_response["child_artifacts"]),
+                        }
+                    ]
+                    remaining_agents = [
+                        name
+                        for name in (orchestration_plan or [])
+                        if _canonical_host_domain_agent(name) not in completed_agents
+                    ]
+
+                    if delegated_response["delegated_final_state"] == TaskState.completed and remaining_agents:
+                        for next_agent in remaining_agents:
+                            yield TaskStatus(
+                                state=TaskState.working,
+                                message=Message(
+                                    role=Role.agent,
+                                    parts=[
+                                        TextPart(
+                                            text=f"Continuing the review with the {_friendly_agent_label(next_agent)} specialist."
+                                        )
+                                    ],
+                                    context_id=task.context_id,
+                                ),
+                            )
+                            try:
+                                delegated_next = await tool_executor.call_tool(
+                                    name="delegate_to_agent",
+                                    arguments={
+                                        "request": _host_orchestration_next_request(
+                                            {
+                                                "original_request": user_text_for_memory,
+                                                "completed_agents": completed_agents,
+                                                "last_response_text": str(completed_sections[-1].get("text") or "").strip()
+                                                if completed_sections
+                                                else "",
+                                            },
+                                            next_agent,
+                                        ),
+                                        "agent_name": next_agent,
+                                    },
+                                    ctx=tool_ctx,
+                                )
+                            except Exception as exc:
+                                follow_up_text = str(exc).strip() or "Delegation failed."
+                                coerced_follow_up = _coerce_host_failure_into_follow_up(
+                                    query=user_text_for_memory,
+                                    inferred_agent=next_agent,
+                                    failure_text=follow_up_text,
+                                )
+                                if coerced_follow_up is not None:
+                                    follow_up_text, response_state_override = coerced_follow_up
+                                else:
+                                    response_state_override = TaskState.failed
+                                response_text = _host_orchestration_compose_partial_follow_up(
+                                    completed_sections=[
+                                        (str(item.get("agent_name") or "").strip(), str(item.get("text") or "").strip())
+                                        for item in completed_sections
+                                    ],
+                                    follow_up_text=follow_up_text,
+                                )
+                                response_parts = [TextPart(text=response_text)]
+                                yield Artifact(name="result", parts=response_parts)
+                                yield TaskStatus(
+                                    state=response_state_override,
+                                    message=Message(
+                                        role=Role.agent,
+                                        parts=response_parts,
+                                        context_id=task.context_id,
+                                    ),
+                                )
+                                await _maybe_update_memory(
+                                    llm=llm,
+                                    context_id=task.context_id,
+                                    metadata=metadata,
+                                    existing=mem,
+                                    history=history if isinstance(history, list) else None,
+                                    user_text=user_text_for_memory,
+                                    assistant_text=response_text,
+                                    response_parts=response_parts,
+                                )
+                                return
+
+                            delegated_next_response = _coerce_delegated_response(
+                                delegated_next,
+                                fallback_agent_name=next_agent,
+                            )
+                            if delegated_next_response is None:
+                                response_text = _host_orchestration_compose_partial_follow_up(
+                                    completed_sections=[
+                                        (str(item.get("agent_name") or "").strip(), str(item.get("text") or "").strip())
+                                        for item in completed_sections
+                                    ],
+                                    follow_up_text="I could not get a usable result from the next specialist.",
+                                )
+                                response_parts = [TextPart(text=response_text)]
+                                yield Artifact(name="result", parts=response_parts)
+                                yield TaskStatus(
+                                    state=TaskState.failed,
+                                    message=Message(
+                                        role=Role.agent,
+                                        parts=response_parts,
+                                        context_id=task.context_id,
+                                    ),
+                                )
+                                await _maybe_update_memory(
+                                    llm=llm,
+                                    context_id=task.context_id,
+                                    metadata=metadata,
+                                    existing=mem,
+                                    history=history if isinstance(history, list) else None,
+                                    user_text=user_text_for_memory,
+                                    assistant_text=response_text,
+                                    response_parts=response_parts,
+                                )
+                                return
+
+                            yield Artifact(
+                                name="delegation",
+                                parts=[
+                                    DataPart(
+                                        data={
+                                            "selectedAgent": delegated_next_response["delegated_agent"],
+                                            "delegatedTaskId": delegated_next_response["delegated_task_id"],
+                                            "finalState": delegated_next_response["delegated_final_state"].value,
+                                            "statusUpdates": delegated_next_response["status_updates"],
+                                        }
+                                    )
+                                ],
+                            )
+
+                            for update in delegated_next_response["status_updates"]:
+                                if not isinstance(update, dict) or bool(update.get("final")):
+                                    continue
+                                state_value = _coerce_task_state(update.get("state"), default=TaskState.working)
+                                message_text = _format_delegation_status_text(
+                                    agent_name=delegated_next_response["delegated_agent"],
+                                    state=state_value,
+                                    message=str(update.get("message") or "").strip() or None,
+                                )
+                                yield TaskStatus(
+                                    state=state_value,
+                                    message=Message(
+                                        role=Role.agent,
+                                        parts=[TextPart(text=message_text)],
+                                        context_id=task.context_id,
+                                    ),
+                                )
+
+                            for artifact_name, payload in delegated_next_response["child_artifacts"].items():
+                                if not isinstance(artifact_name, str) or not artifact_name.strip():
+                                    continue
+                                parts = _ka2a_parts_from_model_content(payload)
+                                if parts:
+                                    yield Artifact(name=f"{delegated_next_response['delegated_agent']}.{artifact_name}", parts=parts)
+
+                            if delegated_next_response["delegated_final_state"] != TaskState.completed:
+                                orchestration_output = await _update_host_orchestration_state_after_delegation(
+                                    delegated_response=delegated_next_response,
+                                    original_request=user_text_for_memory,
+                                    orchestration_plan=orchestration_plan,
+                                    prior_completed_agents=completed_agents,
+                                )
+                                if isinstance(orchestration_output, dict):
+                                    response_parts = [DataPart(data=orchestration_output)]
+                                    response_text = json.dumps(orchestration_output, ensure_ascii=False)
+                                    yield Artifact(name="result", parts=response_parts)
+                                    yield TaskStatus(
+                                        state=TaskState.input_required,
+                                        message=Message(
+                                            role=Role.agent,
+                                            parts=response_parts,
+                                            context_id=task.context_id,
+                                        ),
+                                    )
+                                else:
+                                    response_parts = delegated_next_response["response_parts"]
+                                    response_text = delegated_next_response["response_text"]
+                                    yield Artifact(name="result", parts=response_parts)
+                                    yield TaskStatus(
+                                        state=delegated_next_response["delegated_final_state"],
+                                        message=Message(
+                                            role=Role.agent,
+                                            parts=response_parts,
+                                            context_id=task.context_id,
+                                        ),
+                                    )
+                                await _maybe_update_memory(
+                                    llm=llm,
+                                    context_id=task.context_id,
+                                    metadata=metadata,
+                                    existing=mem,
+                                    history=history if isinstance(history, list) else None,
+                                    user_text=user_text_for_memory,
+                                    assistant_text=response_text,
+                                    response_parts=response_parts,
+                                )
+                                return
+
+                            delegated_next_agent_domain = _canonical_host_domain_agent(
+                                delegated_next_response["delegated_agent"]
+                            )
+                            if delegated_next_agent_domain and delegated_next_agent_domain not in completed_agents:
+                                completed_agents.append(delegated_next_agent_domain)
+                            completed_sections.append(
+                                {
+                                    "agent_name": delegated_next_response["delegated_agent"],
+                                    "text": delegated_next_response["response_text"],
+                                    "payload": _insight_response_from_parts(delegated_next_response["response_parts"])
+                                    or _insight_response_from_artifacts(delegated_next_response["child_artifacts"]),
+                                }
+                            )
+
+                        if saved_workflow_state is not None:
+                            await _save_workflow_state(
+                                context_id=task.context_id,
+                                metadata=metadata,
+                                workflow_state=None,
+                            )
+                            saved_workflow_state = None
+                        response_payload = _host_orchestration_compose_final_payload(
+                            user_text_for_memory,
+                            completed_sections,
+                        )
+                        response_text = json.dumps(response_payload, ensure_ascii=False)
+                        response_parts = [DataPart(data=response_payload)]
+                        yield Artifact(name="result", parts=response_parts)
+                        yield TaskStatus(
+                            state=TaskState.completed,
+                            message=Message(
+                                role=Role.agent,
+                                parts=response_parts,
+                                context_id=task.context_id,
+                            ),
+                        )
+                        await _maybe_update_memory(
+                            llm=llm,
+                            context_id=task.context_id,
+                            metadata=metadata,
+                            existing=mem,
+                            history=history if isinstance(history, list) else None,
+                            user_text=user_text_for_memory,
+                            assistant_text=response_text,
+                            response_parts=response_parts,
+                        )
+                        return
+
                 orchestration_output = await _update_host_orchestration_state_after_delegation(
                     delegated_response=delegated_response,
                     original_request=user_text_for_memory,
-                    orchestration_plan=_host_orchestration_plan(user_text_for_memory, agent_summaries),
+                    orchestration_plan=orchestration_plan,
                 )
                 if isinstance(orchestration_output, dict):
                     response_parts = [DataPart(data=orchestration_output)]
@@ -18641,6 +21574,15 @@ def make_langgraph_chat_processor_from_env(
                         role=Role.agent,
                         parts=response_parts,
                         context_id=task.context_id,
+                    ),
+                )
+                await _save_workflow_state(
+                    context_id=task.context_id,
+                    metadata=metadata,
+                    workflow_state=_clarification_workflow_state(
+                        original_request=user_text_for_memory,
+                        clarification_prompt=clarification_text,
+                        inferred_agent=inferred_agent,
                     ),
                 )
                 await _maybe_update_memory(

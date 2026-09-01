@@ -482,6 +482,12 @@ class _ConfiguredToolSpec:
         return ToolSpec(name=self.exposed_name, description=self.description, input_schema=self.input_schema)
 
 
+def _is_destructive_mcp_tool_name(name: str) -> bool:
+    """Keep irreversible delete/remove actions out of the conversational agent surface."""
+    normalized = str(name or "").strip().lower()
+    return normalized.startswith(("delete_", "remove_"))
+
+
 async def _run_mcp_session(
     *,
     server_url: str,
@@ -1488,6 +1494,8 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
         out: list[_ConfiguredToolSpec] = []
         for item in remote_tools:
             exposed_name = f"{prefix}{item.name}"
+            if _is_destructive_mcp_tool_name(item.name):
+                continue
             if allowed and item.name not in allowed and exposed_name not in allowed:
                 continue
             out.append(
@@ -1576,6 +1584,8 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
         prefix = self._cfg.tool_name_prefix or ""
         requested = str(name or "").strip()
         remote_name = requested[len(prefix) :] if prefix and requested.startswith(prefix) else requested
+        if _is_destructive_mcp_tool_name(remote_name):
+            return None
         exposed_name = f"{prefix}{remote_name}"
         if requested not in allowed and remote_name not in allowed and exposed_name not in allowed:
             return None

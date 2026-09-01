@@ -27,12 +27,19 @@ def card_public_slug(card: AgentCard) -> str:
     public_slug = runtime.get("publicSlug")
     if isinstance(public_slug, str) and public_slug.strip():
         return public_slug.strip()
+    slug = _card_extra(card, "slug")
+    if isinstance(slug, str) and slug.strip():
+        return slug.strip()
     return (card.name or "").strip()
 
 
 def card_profile_id(card: AgentCard) -> str | None:
     runtime = _runtime_metadata(card)
     profile_id = runtime.get("profileId")
+    if profile_id is None:
+        profile_id = _card_extra(card, "profile")
+    if profile_id is None:
+        profile_id = _card_extra(card, "profile_id")
     if profile_id is None:
         return None
     value = str(profile_id).strip()
@@ -62,7 +69,10 @@ def _matches_slug_allowlist(value: str, allowlist: set[str]) -> bool:
     if normalized in allowlist:
         return True
     return any(
-        normalized.startswith(f"{allowed}_") or normalized.startswith(f"{allowed}-")
+        normalized.startswith(f"{allowed}_")
+        or normalized.startswith(f"{allowed}-")
+        or allowed.startswith(f"{normalized}_")
+        or allowed.startswith(f"{normalized}-")
         for allowed in allowlist
     )
 

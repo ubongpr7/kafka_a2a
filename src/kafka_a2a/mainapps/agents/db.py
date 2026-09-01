@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from threading import RLock
 from typing import Any
 
@@ -21,6 +23,9 @@ from .models import (
     WorkspaceAiSettings,
     WorkspaceToolConnection,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +213,20 @@ class DatabaseAgentControlPlaneStore:
 
         return sa.Table(spec.table_name, metadata, *columns, *table_args)
 
+    @staticmethod
+    def _control_plane_tables_exist(*, sa: Any, engine: Any, table_names: tuple[str, ...]) -> bool:
+        """Avoid per-table schema reflection when the Postgres control plane is ready."""
+        if engine.dialect.name != "postgresql":
+            return False
+
+        query = sa.text(
+            "SELECT tablename FROM pg_catalog.pg_tables "
+            "WHERE schemaname = current_schema() AND tablename IN :table_names"
+        ).bindparams(sa.bindparam("table_names", expanding=True))
+        with engine.connect() as conn:
+            existing = {str(row[0]) for row in conn.execute(query, {"table_names": table_names})}
+        return set(table_names).issubset(existing)
+
     def _ensure_runtime(self) -> None:
         if self._engine is not None and self._tables and self._metadata is not None:
             return
@@ -231,11 +250,73 @@ class DatabaseAgentControlPlaneStore:
             sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
             extend_existing=True,
         )
-        engine = sa.create_engine(self._database_url, future=True, pool_pre_ping=True)
-        metadata.create_all(engine)
+        pool_recycle_s = max(30, int(os.getenv("KA2A_DB_POOL_RECYCLE_S") or "300"))
+        engine_options: dict[str, Any] = {
+            "future": True,
+            "pool_pre_ping": True,
+            "pool_recycle": pool_recycle_s,
+            "pool_use_lifo": True,
+        }
+        if self._database_url.startswith(("postgresql", "postgres")):
+            # The control plane persists JSON payloads. Avoid an hstore
+            # catalog lookup that is particularly slow through PgBouncer.
+            engine_options["use_native_hstore"] = False
+        engine = sa.create_engine(self._database_url, **engine_options)
+        table_names = tuple(table.name for table in metadata.tables.values())
+        if not self._control_plane_tables_exist(sa=sa, engine=engine, table_names=table_names):
+            metadata.create_all(engine)
         self._engine = engine
         self._metadata = metadata
         self._tables = tables
+
+    def _reset_runtime(self) -> None:
+        engine = self._engine
+        self._engine = None
+        self._tables = {}
+        self._metadata = None
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                logger.debug("failed to dispose control-plane database engine", exc_info=True)
+
+    @staticmethod
+    def _is_retryable_db_exception(exc: Exception) -> bool:
+        try:
+            import sqlalchemy as sa
+        except Exception:
+            sa = None
+
+        if sa is not None and isinstance(exc, sa.exc.DBAPIError):
+            if getattr(exc, "connection_invalidated", False):
+                return True
+
+        message = str(exc).strip().lower()
+        return any(
+            phrase in message
+            for phrase in (
+                "consuming input failed",
+                "unexpected eof while reading",
+                "server closed the connection unexpectedly",
+                "connection is closed",
+                "broken pipe",
+                "connection reset by peer",
+            )
+        )
+
+    def _run_with_retry(self, operation):
+        for attempt in range(1, 3):
+            try:
+                return operation()
+            except Exception as exc:
+                if attempt >= 2 or not self._is_retryable_db_exception(exc):
+                    raise
+                logger.warning(
+                    "control-plane database operation failed; resetting engine and retrying",
+                    extra={"attempt": attempt},
+                    exc_info=True,
+                )
+                self._reset_runtime()
 
     def _spec_by_field_name(self, field_name: str) -> _EntitySpec:
         for spec in self._entity_specs():
@@ -321,9 +402,34 @@ class DatabaseAgentControlPlaneStore:
         return query
 
     def _load_relational_state(self, conn: Any) -> AgentControlPlaneState:
-        payload: dict[str, Any] = {}
-        for spec in self._entity_specs():
-            payload[spec.field_name] = self._load_entity_list(conn, spec)
+        import sqlalchemy as sa
+
+        specs = self._entity_specs()
+        payload: dict[str, list[Any]] = {spec.field_name: [] for spec in specs}
+        specs_by_field_name = {spec.field_name: spec for spec in specs}
+        selects = []
+        for spec in specs:
+            table = self._tables[spec.field_name]
+            selects.append(
+                sa.select(
+                    sa.literal(spec.field_name).label("field_name"),
+                    table.c.payload.label("payload"),
+                    table.c.created_at.label("created_at"),
+                    table.c.id.label("id"),
+                )
+            )
+
+        snapshot = sa.union_all(*selects).subquery("control_plane_snapshot")
+        rows = conn.execute(
+            sa.select(snapshot.c.field_name, snapshot.c.payload).order_by(
+                snapshot.c.field_name,
+                snapshot.c.created_at,
+                snapshot.c.id,
+            )
+        ).all()
+        for field_name, record_payload in rows:
+            spec = specs_by_field_name[str(field_name)]
+            payload[spec.field_name].append(spec.model.model_validate(record_payload or {}))
         return AgentControlPlaneState.model_validate(payload)
 
     def _load_legacy_snapshot(self, conn: Any) -> AgentControlPlaneState:
@@ -400,15 +506,18 @@ class DatabaseAgentControlPlaneStore:
         filters: dict[str, object] | None = None,
     ) -> list[object]:
         with self._lock:
-            self._ensure_runtime()
-            spec = self._spec_by_field_name(field_name)
-            query = self._build_filtered_query(spec, ids=ids, filters=filters)
-            if query is None:
-                return []
-            assert self._engine is not None
-            with self._engine.begin() as conn:
-                rows = conn.execute(query).all()
-            return [spec.model.model_validate(row[0] or {}) for row in rows]
+            def _operation() -> list[object]:
+                self._ensure_runtime()
+                spec = self._spec_by_field_name(field_name)
+                query = self._build_filtered_query(spec, ids=ids, filters=filters)
+                if query is None:
+                    return []
+                assert self._engine is not None
+                with self._engine.begin() as conn:
+                    rows = conn.execute(query).all()
+                return [spec.model.model_validate(row[0] or {}) for row in rows]
+
+            return self._run_with_retry(_operation)
 
     def get_record(
         self,
@@ -434,37 +543,44 @@ class DatabaseAgentControlPlaneStore:
 
     def upsert_record(self, field_name: str, record: object) -> object:
         with self._lock:
-            self._ensure_runtime()
-            import sqlalchemy as sa
+            def _operation() -> object:
+                self._ensure_runtime()
+                import sqlalchemy as sa
 
-            spec = self._spec_by_field_name(field_name)
-            table = self._tables[field_name]
-            row = self._row_for_record(spec, record)
-            assert self._engine is not None
-            with self._engine.begin() as conn:
-                updated = conn.execute(
-                    sa.update(table).where(table.c.id == row["id"]).values(**row)
-                )
-                if not updated.rowcount:
-                    conn.execute(sa.insert(table).values(**row))
+                spec = self._spec_by_field_name(field_name)
+                table = self._tables[field_name]
+                row = self._row_for_record(spec, record)
+                assert self._engine is not None
+                with self._engine.begin() as conn:
+                    updated = conn.execute(
+                        sa.update(table).where(table.c.id == row["id"]).values(**row)
+                    )
+                    if not updated.rowcount:
+                        conn.execute(sa.insert(table).values(**row))
+                return record
+
+            self._run_with_retry(_operation)
             return record
 
     def upsert_records(self, field_name: str, records: list[object]) -> list[object]:
         if not records:
             return []
         with self._lock:
-            self._ensure_runtime()
-            import sqlalchemy as sa
+            def _operation() -> list[object]:
+                self._ensure_runtime()
+                import sqlalchemy as sa
 
-            spec = self._spec_by_field_name(field_name)
-            table = self._tables[field_name]
-            rows = [self._row_for_record(spec, record) for record in records]
-            assert self._engine is not None
-            with self._engine.begin() as conn:
-                ids = [row["id"] for row in rows]
-                conn.execute(sa.delete(table).where(table.c.id.in_(ids)))
-                conn.execute(sa.insert(table), rows)
-            return records
+                spec = self._spec_by_field_name(field_name)
+                table = self._tables[field_name]
+                rows = [self._row_for_record(spec, record) for record in records]
+                assert self._engine is not None
+                with self._engine.begin() as conn:
+                    ids = [row["id"] for row in rows]
+                    conn.execute(sa.delete(table).where(table.c.id.in_(ids)))
+                    conn.execute(sa.insert(table), rows)
+                return records
+
+            return self._run_with_retry(_operation)
 
     def delete_records(
         self,
@@ -474,60 +590,70 @@ class DatabaseAgentControlPlaneStore:
         filters: dict[str, object] | None = None,
     ) -> int:
         with self._lock:
-            self._ensure_runtime()
-            import sqlalchemy as sa
+            def _operation() -> int:
+                self._ensure_runtime()
+                import sqlalchemy as sa
 
-            spec = self._spec_by_field_name(field_name)
-            table = self._tables[field_name]
-            query = sa.delete(table)
-            if ids is not None:
-                if not ids:
-                    return 0
-                query = query.where(table.c.id.in_(ids))
-            for key, value in (filters or {}).items():
-                if not hasattr(table.c, key):
-                    continue
-                column = getattr(table.c, key)
-                if isinstance(value, (list, tuple, set, frozenset)):
-                    values = list(value)
-                    if not values:
+                self._spec_by_field_name(field_name)
+                table = self._tables[field_name]
+                query = sa.delete(table)
+                if ids is not None:
+                    if not ids:
                         return 0
-                    query = query.where(column.in_(values))
-                else:
-                    query = query.where(column == value)
-            assert self._engine is not None
-            with self._engine.begin() as conn:
-                result = conn.execute(query)
-            return int(result.rowcount or 0)
+                    query = query.where(table.c.id.in_(ids))
+                for key, value in (filters or {}).items():
+                    if not hasattr(table.c, key):
+                        continue
+                    column = getattr(table.c, key)
+                    if isinstance(value, (list, tuple, set, frozenset)):
+                        values = list(value)
+                        if not values:
+                            return 0
+                        query = query.where(column.in_(values))
+                    else:
+                        query = query.where(column == value)
+                assert self._engine is not None
+                with self._engine.begin() as conn:
+                    result = conn.execute(query)
+                return int(result.rowcount or 0)
+
+            return self._run_with_retry(_operation)
 
     def load(self) -> AgentControlPlaneState:
         with self._lock:
-            self._ensure_runtime()
-            import sqlalchemy as sa
+            def _operation() -> AgentControlPlaneState:
+                self._ensure_runtime()
+                import sqlalchemy as sa
 
-            assert self._engine is not None
-            with self._engine.begin() as conn:
-                state = self._load_relational_state(conn)
-                legacy_state = self._load_legacy_snapshot(conn)
-                if self._state_has_data(legacy_state) and (
-                    not self._state_has_data(state) or self._prefer_legacy_state(state, legacy_state)
-                ):
-                    self._replace_all(conn, legacy_state)
-                    return legacy_state
-                if self._state_has_data(legacy_state):
-                    conn.execute(
-                        sa.delete(self._tables["legacy_snapshot"]).where(
-                            self._tables["legacy_snapshot"].c.namespace == "default"
+                assert self._engine is not None
+                with self._engine.begin() as conn:
+                    state = self._load_relational_state(conn)
+                    legacy_state = self._load_legacy_snapshot(conn)
+                    if self._state_has_data(legacy_state) and (
+                        not self._state_has_data(state) or self._prefer_legacy_state(state, legacy_state)
+                    ):
+                        self._replace_all(conn, legacy_state)
+                        return legacy_state
+                    if self._state_has_data(legacy_state):
+                        conn.execute(
+                            sa.delete(self._tables["legacy_snapshot"]).where(
+                                self._tables["legacy_snapshot"].c.namespace == "default"
+                            )
                         )
-                    )
-                if self._state_has_data(state):
-                    return state
-            return AgentControlPlaneState()
+                    if self._state_has_data(state):
+                        return state
+                return AgentControlPlaneState()
+
+            return self._run_with_retry(_operation)
 
     def save(self, state: AgentControlPlaneState) -> AgentControlPlaneState:
         with self._lock:
-            self._ensure_runtime()
-            assert self._engine is not None
-            with self._engine.begin() as conn:
-                self._replace_all(conn, state)
+            def _operation() -> AgentControlPlaneState:
+                self._ensure_runtime()
+                assert self._engine is not None
+                with self._engine.begin() as conn:
+                    self._replace_all(conn, state)
+                return state
+
+            return self._run_with_retry(_operation)
             return state

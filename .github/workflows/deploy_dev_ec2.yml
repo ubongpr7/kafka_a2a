@@ -1,0 +1,60 @@
+name: Deploy Dev EC2
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-dev-ec2-${{ github.repository }}
+  cancel-in-progress: true
+
+env:
+  DEPLOY_PATH: /srv/interaims/repositories/${{ github.event.repository.name }}
+  COMPOSE_FILE: docker-compose.server.yml
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s' "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 400 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync Repo
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" "mkdir -p '${{ env.DEPLOY_PATH }}'"
+          rsync -az --delete -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            --exclude='.git' --exclude='.github' --exclude='.venv' --exclude='.env' --exclude='.env.dev' --exclude='__pycache__' --exclude='*.pyc' \
+            ./ "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:${{ env.DEPLOY_PATH }}/"
+
+      - name: Write Environment
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" <<'EOF'
+          set -euo pipefail
+          cd "${{ env.DEPLOY_PATH }}"
+          cat > .env <<'__ENV_FILE__'
+          ${{ secrets.ENV_FILE }}
+          __ENV_FILE__
+          chmod 600 .env
+          EOF
+
+      - name: Deploy
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" <<'EOF'
+          set -euo pipefail
+          /usr/local/bin/interaims-host-init
+          cd "${{ env.DEPLOY_PATH }}"
+          docker compose -f "${{ env.COMPOSE_FILE }}" up -d --build --force-recreate --remove-orphans
+          docker image prune -f
+          docker compose -f "${{ env.COMPOSE_FILE }}" ps
+          EOF

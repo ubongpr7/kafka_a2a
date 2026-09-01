@@ -19,6 +19,29 @@ def _card(name: str, *, public_slug: str | None = None, profile_id: str | None =
     return AgentCard(**payload)
 
 
+def _registry_card(
+    name: str,
+    *,
+    slug: str,
+    profile: str | None = None,
+) -> AgentCard:
+    return AgentCard.model_validate(
+        {
+            "name": name,
+            "slug": slug,
+            "profile": profile,
+            "description": f"{name} agent",
+            "url": f"local://{slug}",
+            "version": "0.1.0",
+            "capabilities": {"streaming": True, "pushNotifications": True},
+            "default_input_modes": ["text"],
+            "default_output_modes": ["text"],
+            "security_schemes": {},
+            "security": [],
+        }
+    )
+
+
 def test_filter_agent_cards_respects_allowed_env(monkeypatch) -> None:
     monkeypatch.setenv("KA2A_ALLOWED_DOWNSTREAM_AGENTS", "product")
 
@@ -86,3 +109,61 @@ def test_filter_agent_cards_allow_parent_slug_to_expose_child_specialists() -> N
         "inventory_fulfillment",
         "inventory_visibility",
     ]
+
+
+def test_card_public_slug_falls_back_to_registry_slug() -> None:
+    card = _registry_card("Host", slug="host", profile="4")
+
+    assert card_public_slug(card) == "host"
+
+
+def test_card_profile_id_falls_back_to_registry_profile() -> None:
+    card = _registry_card("Host", slug="host", profile="4")
+
+    assert card_profile_id(card) == "4"
+
+
+def test_filter_agent_cards_can_scope_db_registry_records_by_profile() -> None:
+    cards = filter_agent_cards(
+        [
+            _registry_card("Host", slug="host", profile="4"),
+            _registry_card("POS", slug="pos", profile="4"),
+            _registry_card("Users", slug="users", profile="7"),
+        ],
+        required_profile_id="4",
+    )
+
+    assert [card_public_slug(card) for card in cards] == ["host", "pos"]
+
+
+def test_filter_agent_cards_allow_specific_env_allowlist_to_expose_generic_public_slug(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "KA2A_ALLOWED_DOWNSTREAM_AGENTS",
+        "host,pos_admin,pos_live,product_discovery,product_catalog_admin,inventory_visibility",
+    )
+
+    cards = filter_agent_cards(
+        [
+            _card("wa-p1-pos-live-abc", public_slug="pos", profile_id="1"),
+            _card("wa-p1-product-discovery-abc", public_slug="product", profile_id="1"),
+            _card("wa-p1-inventory-visibility-abc", public_slug="inventory", profile_id="1"),
+            _card("wa-p1-users-abc", public_slug="users", profile_id="1"),
+        ],
+        required_profile_id="1",
+    )
+
+    assert [card_public_slug(card) for card in cards] == ["pos", "product", "inventory"]
+
+
+def test_filter_agent_cards_allow_specific_env_allowlist_to_expose_generic_name(monkeypatch) -> None:
+    monkeypatch.setenv("KA2A_ALLOWED_DOWNSTREAM_AGENTS", "pos_admin,product_discovery")
+
+    cards = filter_agent_cards(
+        [
+            _card("pos"),
+            _card("product"),
+            _card("users"),
+        ],
+    )
+
+    assert [card.name for card in cards] == ["pos", "product"]

@@ -1,0 +1,156 @@
+\documentclass[10pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=0.72in]{geometry}
+\usepackage{array,booktabs,longtable,tabularx}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{titlesec}
+\hypersetup{colorlinks=true,linkcolor=MidnightBlue,urlcolor=MidnightBlue,pdftitle={Kafka A2A End-to-End QA Report}}
+\definecolor{navy}{HTML}{0B1F3A}
+\definecolor{blue}{HTML}{1E5B9E}
+\definecolor{mist}{HTML}{EEF5FC}
+\definecolor{green}{HTML}{176B3A}
+\definecolor{gold}{HTML}{7A4E00}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\renewcommand{\arraystretch}{1.22}
+\titleformat{\section}{\Large\bfseries\color{navy}}{}{0pt}{}[\vspace{-3pt}\color{blue}\titlerule]
+\titleformat{\subsection}{\large\bfseries\color{navy}}{}{0pt}{}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\textcolor{navy}{INTERA AI \textbar\ Kafka A2A QA}}
+\rhead{\textcolor{navy}{28 August 2026}}
+\cfoot{\textcolor{gray}{\thepage}}
+\begin{document}
+
+{\color{navy}\Huge\bfseries Kafka A2A End-to-End QA Report\par}
+\vspace{5pt}
+{\large\color{blue}Test-and-fix execution report for the Intera IMS agentic system\par}
+\vspace{12pt}
+
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}l X}
+Date & 28 August 2026 \\
+Environment & Local KA2A Docker stack and the existing signed-in browser workspace at \texttt{http://localhost:3005}. \\
+Scope & Host routing, specialist delegation, conversation state, MCP-backed data, streamed structured insights, mutation safety, tenant isolation, and the LiveKit voice adapter. This is not a general frontend QA report. \\
+Method & QA defines the acceptance case, runs it, fixes reproducible defects, and reruns the relevant regression coverage. \\
+\end{tabularx}
+
+\section{Release Position}
+\colorbox{mist}{\parbox{0.96\textwidth}{\textbf{Executed automated coverage:} 347 focused A2A tests passed, with one pre-existing warning, in 10.81 seconds. The Product MCP contract also passed separately (2 tests).}}
+
+The signed-in browser integration path was tested against local live services. Sales clarification and continuation, review follow-up, fresh-topic switching into global-catalog import, and a four-domain business review all passed. The system made no real writes during QA: import and all other mutating workflows stopped before confirmation.
+
+\textbf{Manual boundary.} Physical microphone/speaker behavior, call-device mute controls, and external provider billing still require manual acceptance. They are deliberately not presented as automated passes.
+
+\section{Browser Journeys Executed}
+\begin{enumerate}[leftmargin=18pt,itemsep=5pt]
+\item \textbf{Targeted clarification.} ``Can you analyze my sales data?'' asked only for a time range before Point of Sale analysis started.
+\item \textbf{Continuation.} ``The last three weeks.'' merged with the prior request and returned 43 sales totalling \textit{Naira} 2,462,960.25 in formatted widgets.
+\item \textbf{Structured follow-up.} ``Which location needs the most attention from that review?'' retained the three-week review and selected Agric, Ikorodu Store. It did not start a new ``today'' report.
+\item \textbf{Fresh-topic switch.} ``I want to import products.'' exited the sales-review context and opened the global-catalog category/brand selection flow without importing any product.
+\item \textbf{Multi-agent review.} ``Can you analyze my business performance for the last three months?'' completed Point of Sale, Inventory Management, User and Workspace Management, and Product Management. The user-facing output rendered separate typed domain sections in one parent business-review report.
+\end{enumerate}
+
+\section{Defect Found and Fixed}
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}p{0.20\textwidth} X}
+Observed failure & A follow-up containing ``from that review'' was incorrectly classified as a fresh explicit time range. The host converted it into a new sales question and returned an unrelated ``today'' result. \\
+Root cause & The time-range recognizer accepted a bare \texttt{from} or \texttt{between} token without a date, period, or duration. \\
+Correction & The recognizer now accepts ISO date spans, numeric and written durations, and named periods only. Contextual references remain attached to the prior structured review. \\
+Regression evidence & Focused parser and clarification tests passed, then the signed-in browser retest retained the original three-week context and returned the correct location result. \\
+\end{tabularx}
+
+\section{Acceptance Register}
+\footnotesize
+\begin{longtable}{@{}>{\bfseries\color{navy}}p{0.12\textwidth}@{\hspace{0.7em}} p{0.27\textwidth}@{\hspace{0.7em}} p{0.42\textwidth}@{\hspace{0.7em}} p{0.14\textwidth}@{}}
+\toprule
+ID & Scenario & Acceptance requirement & Status \\
+\midrule
+\endfirsthead
+\toprule
+ID & Scenario & Acceptance requirement & Status \\
+\midrule
+\endhead
+HOST-01 & Greeting or plain help & The host answers locally without unnecessary delegation. & Automated pass \\
+HOST-02 & Sales analysis without dates & The host asks for the time range before POS work begins. & Automated and browser pass \\
+HOST-03 & Time-range continuation & A supplied period merges into the earlier sales request. & Automated pass \\
+HOST-04 & Business review without dates & The host asks a targeted business-review time-range question. & Automated pass \\
+HOST-05 & Business review, last three months & The host makes and completes the four-domain plan. & Automated and browser pass \\
+HOST-06 & Named domain requests & Sales, inventory, product, user, and procurement requests reach the correct specialist. & Automated pass \\
+HOST-07 & Stock snapshots & Low-stock and out-of-stock requests route to inventory without a time range. & Automated pass \\
+HOST-08 & Explicit correction & A correction replaces a prior mistaken intent before delegation. & Automated pass \\
+ROUTE-01 & Sales by location & POS Admin returns widget-first location results. & Automated and browser pass \\
+ROUTE-02 & Staff and permissions & Users specialist returns user-facing counts and risk data. & Automated pass \\
+ROUTE-03 & Product health & Product Discovery performs read insights without global import actions. & Automated pass \\
+ROUTE-04 & Workspace setup & Non-import setup goes to onboarding, not catalog import. & Automated pass \\
+ROUTE-05 & Unavailable specialist & The host gives focused guidance instead of cross-domain misrouting. & Automated pass \\
+ROUTE-06 & Directory warming & Concrete profile agents work while Kafka discovery is still warming. & Automated pass \\
+ROUTE-07 & Public labels & Runtime IDs are not exposed in streamed status. & Automated and browser pass \\
+MEMORY-01 & Review follow-up & Follow-up reads the completed structured review. & Automated and browser pass \\
+MEMORY-02 & Structured history & Follow-up uses the previous artifact rather than unsafe text parsing. & Automated pass \\
+MEMORY-03 & Fresh topic after review & A global import request exits review context. & Automated and browser pass \\
+MEMORY-04 & Closed prompt escape & New plain text can exit a stale picker. & Automated pass \\
+MEMORY-05 & Repeated request & The durable previous answer is returned without unintended re-execution. & Automated pass \\
+MEMORY-06 & Clarification storage & Serialized and metadata-backed clarification history both work. & Automated pass \\
+INSIGHT-01 & POS overview & Sales, orders, AOV, payment mix, terminals, and sellers are typed widgets. & Automated pass \\
+INSIGHT-02 & Current location names & Current inventory labels override stale POS snapshots. & Automated and browser pass \\
+INSIGHT-03 & Inventory risk & Risk categories include product, barcode, and available media data. & Automated pass \\
+INSIGHT-04 & Cross-domain composition & Each domain produces a typed section and the host adds a final summary. & Automated and browser pass \\
+INSIGHT-05 & Replenishment & Reorder content is concise and not duplicated. & Automated pass \\
+INSIGHT-06 & Currency semantics & Counts stay numeric and monetary values retain their currency. & Automated pass; live audio manual \\
+SAFETY-01 & Import intent & Import defaults to global-catalog selection. & Automated and browser pass \\
+SAFETY-02 & Import progression & Selection precedes confirmation and import. & Automated and browser pass before confirmation \\
+SAFETY-03 & Duplicate import & Duplicate selections cannot re-import the same item. & Automated pass \\
+SAFETY-04 & Import failure & Authentication and MCP failures receive focused guidance. & Automated pass \\
+SAFETY-05 & Mutating tools & No destructive delete/remove tool is advertised to an agent. & Automated pass \\
+MCP-01 & Tool binding & Read tools bind to the appropriate specialist and host. & Automated pass \\
+MCP-02 & Tool budget & Discovery and POS insight do not own unrelated mutations. & Automated pass \\
+MCP-03 & Credential forwarding & User/workspace runtime connection precedence and bearer forwarding work. & Automated pass \\
+MCP-04 & Structural scope & Unscoped or unauthorized multi-location calls fail safely. & Automated pass \\
+MCP-05 & Audit and tenant isolation & Audit permissions and workspace boundaries are enforced. & Automated pass \\
+MCP-06 & Production alignment & Versioned MCP host and origin configuration aligns with services. & Automated pass \\
+STREAM-01 & Optional timeouts & No timeout waits; explicit overrides still time out. & Automated pass \\
+STREAM-02 & Gateway failures & Permission denials, CORS, final status, and billing failure semantics hold. & Automated pass \\
+STREAM-03 & Protocol integrity & A2A RPC, Kafka scope metadata, and task principals remain valid. & Automated pass \\
+VOICE-01 & Session greeting & Voice begins with short, user-facing language. & Automated pass \\
+VOICE-02 & Utterance buffering & Fragmented requests, fillers, and false farewells are handled. & Automated pass \\
+VOICE-03 & Clarification and cancel & Missing-range, new-request, and cancellation behavior works. & Automated pass \\
+VOICE-04 & Voice sanitization & Spoken summaries hide internal payload data and redact provider errors. & Automated pass \\
+VOICE-05 & Naira pronunciation & The Naira symbol maps to ``Naira,'' not dollars. & Automated pass; live audio manual \\
+\bottomrule
+\end{longtable}
+\normalsize
+\clearpage
+
+\section{Test Evidence}
+\textbf{Automated command}
+\begin{verbatim}
+./.venv/bin/pytest -q --disable-warnings \
+  tests/test_langgraph_processor.py tests/test_local_tools.py \
+  tests/test_livekit_voice_worker.py tests/test_agent_filter.py \
+  tests/test_session_memory.py tests/test_agent_control_plane_store.py \
+  tests/test_agent_http_endpoints.py tests/test_client_timeout.py \
+  tests/test_insight_upgrade_contract.py tests/test_mcp_prod_alignment.py \
+  tests/test_mcp_tools.py tests/test_registry_directory.py \
+  tests/test_protocol_and_envelope.py tests/test_tenant_isolation.py \
+  tests/test_shared_runtime.py
+Result: 347 passed, 1 warning, 10.81 seconds
+\end{verbatim}
+
+The complete, source-controlled test matrix and named test evidence is maintained in the Markdown QA register in the \texttt{docs} directory. The PDF is the printable execution counterpart of that register.
+
+\section{Exit Criteria and Remaining Manual Checks}
+\begin{itemize}[leftmargin=18pt]
+\item All 347 focused automated A2A tests pass.
+\item The five signed-in browser journeys above pass with live local services.
+\item No internal runtime ID, lifecycle message, or raw model object appears in a completed user-facing answer.
+\item No real data mutation is made by QA.
+\item Before release, perform a short manual call using the intended microphone and speaker: greeting, sales clarification, a follow-up, a cancellation, and a Naira-valued result. Confirm both input mute and agent-audio mute on the target device.
+\end{itemize}
+
+\vfill
+{\small\color{gray}Prepared as a QA-that-fixes record. The scope excludes unrelated visual frontend QA, physical audio hardware, and third-party provider account balances.}
+\end{document}

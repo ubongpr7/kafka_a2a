@@ -274,6 +274,13 @@ def test_kafka_delegation_backend_prefers_pos_admin_for_revenue_location_queries
     backend = KafkaDelegationBackend()
     cards = [
         AgentCard(
+            name="pos",
+            description="Point of Sale router agent.",
+            url="kafka://pos",
+            version="0.1.0",
+            metadata={"ka2aRuntime": {"publicSlug": "pos"}},
+        ),
+        AgentCard(
             name="inventory",
             description="Inventory router agent.",
             url="kafka://inventory",
@@ -305,6 +312,14 @@ def test_kafka_delegation_backend_prefers_pos_admin_for_revenue_location_queries
     )
 
     assert selected_with_router_hint.name == "pos_admin"
+
+    selected_with_pos_router_hint = backend._select_agent(
+        cards=cards,
+        request="Show sales by location today",
+        agent_name="pos",
+    )
+
+    assert selected_with_pos_router_hint.name == "pos_admin"
 
 
 def test_kafka_delegation_backend_uses_agent_specific_client_ids(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -477,6 +492,44 @@ async def test_kafka_delegation_backend_falls_back_to_control_plane_when_directo
     assert [card.name for card in cards] == ["wa-p1-inventory_fulfillment-f44699a94c87"]
     visible = backend._visible_downstream_cards(cards)
     assert [card.name for card in visible] == ["wa-p1-inventory_fulfillment-f44699a94c87"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_delegation_uses_control_plane_while_directory_is_still_catching_up() -> None:
+    backend = KafkaDelegationBackend(agent_name="host", workspace_profile_id="4")
+
+    class _EmptyDirectory:
+        def list(self) -> list[AgentCard]:
+            return []
+
+    async def _ensure_started() -> None:
+        return None
+
+    async def _list_control_plane_cards() -> list[AgentCard]:
+        return [
+            AgentCard(
+                name="wa-p4-users-123",
+                description="Workspace controls",
+                url="local://wa-p4-users-123",
+                version="0.1.0",
+                metadata={
+                    "ka2aRuntime": {
+                        "publicSlug": "users",
+                        "profileId": "4",
+                    }
+                },
+            )
+        ]
+
+    backend._ensure_started = _ensure_started  # type: ignore[method-assign]
+    backend._state.directory = _EmptyDirectory()  # type: ignore[assignment]
+    backend._control_plane = type("_ControlPlane", (), {"enabled": True})()
+    backend._list_control_plane_cards = _list_control_plane_cards  # type: ignore[method-assign]
+
+    selected = await backend._wait_for_explicit_agent_card("users")
+
+    assert selected is not None
+    assert selected.name == "wa-p4-users-123"
 
 
 @pytest.mark.asyncio

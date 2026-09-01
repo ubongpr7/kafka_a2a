@@ -154,6 +154,18 @@ def _resolve_env_llm_api_key(provider: str) -> str:
         return _resolve_env_secret("XAI_API_KEY")
     return ""
 
+
+def _resolve_env_tavily_api_key() -> str:
+    direct = _resolve_env_secret("KA2A_TAVILY_API_KEY")
+    if direct:
+        return direct
+    configured_env_name = (os.environ.get("KA2A_TAVILY_API_KEY_ENV") or "").strip()
+    if configured_env_name:
+        configured = _resolve_env_secret(configured_env_name)
+        if configured:
+            return configured
+    return _resolve_env_secret("TAVILY_API_KEY")
+
 def _connection_runtime_headers(connection: WorkspaceToolConnection) -> dict[str, str]:
     payload = _decrypt_json_secret(connection.credential_payload_encrypted)
     headers: dict[str, str] = {}
@@ -243,6 +255,7 @@ class AgentControlPlaneService:
         self._cache_ttl_s = 30.0
         self._cache_lock = RLock()
         self._cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
+        self._internal_runtime_registry_lock = RLock()
 
     def _cache_get(self, key: tuple[Any, ...]) -> Any | None:
         with self._cache_lock:
@@ -1669,7 +1682,9 @@ class AgentControlPlaneService:
     def save_workspace_ai_setup(self, *, profile_id: str, data: dict[str, Any]) -> dict[str, Any]:
         ai = self._get_workspace_ai_settings_record(profile_id=profile_id)
         if ai is None:
-            required = [name for name in ("name", "version", "api_key", "tavily_api_key") if not str(data.get(name) or "").strip()]
+            # Tavily powers optional web-search capabilities; it must not block
+            # the core workspace assistant from being configured.
+            required = [name for name in ("name", "version", "api_key") if not str(data.get(name) or "").strip()]
             if required:
                 raise AgentControlPlaneError(", ".join(required) + " is required.")
             ai = WorkspaceAiSettings(
@@ -1950,7 +1965,7 @@ class AgentControlPlaneService:
             llm_claim["baseUrl"] = base_url
         api_key = _decrypt_secret(ai.api_key)
         if not api_key or api_key.startswith("gAAAA"):
-            api_key = ""
+            api_key = _resolve_env_llm_api_key(version.provider)
         if api_key:
             llm_claim["apiKey"] = _secret_for_claim(api_key)
         payload: dict[str, Any] = {
@@ -1960,7 +1975,9 @@ class AgentControlPlaneService:
             }
         }
         tavily_api_key = _decrypt_secret(ai.tavily_api_key)
-        if tavily_api_key and not tavily_api_key.startswith("gAAAA"):
+        if not tavily_api_key or tavily_api_key.startswith("gAAAA"):
+            tavily_api_key = _resolve_env_tavily_api_key()
+        if tavily_api_key:
             payload[KA2A_JWT_CLAIM_KEY]["tavily"] = {
                 "apiKey": _secret_for_claim(tavily_api_key)
             }
@@ -1972,7 +1989,7 @@ class AgentControlPlaneService:
             api_key = _decrypt_secret(ai.tavily_api_key)
             if api_key and not api_key.startswith("gAAAA"):
                 return api_key
-        return ""
+        return _resolve_env_tavily_api_key()
 
     def _workspace_agent_payloads(self, agents: list[WorkspaceAgent]) -> list[dict[str, Any]]:
         if not agents:
@@ -2435,10 +2452,24 @@ class AgentControlPlaneService:
         return self._cache_set(cache_key, read_payload)
 
     def internal_runtime_registry(self) -> dict[str, Any]:
-        agents = self._runtime_config_payloads_for_agents(
-            sorted(self._list_workspace_agent_records(enabled_only=True), key=lambda item: (item.profile, item.name.lower()))
-        )
-        return {
-            "agent_count": len(agents),
-            "agents": agents,
-        }
+        cache_key = ("internal_runtime_registry",)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        # Runtime reconciliation can retry while the first registry request is
+        # still reading a remote control plane. Compute that snapshot once.
+        with self._internal_runtime_registry_lock:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached
+            agents = self._runtime_config_payloads_for_agents(
+                sorted(self._list_workspace_agent_records(enabled_only=True), key=lambda item: (item.profile, item.name.lower()))
+            )
+            return self._cache_set(
+                cache_key,
+                {
+                    "agent_count": len(agents),
+                    "agents": agents,
+                },
+            )

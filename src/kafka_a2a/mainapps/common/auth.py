@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from http.cookies import SimpleCookie
+from dataclasses import dataclass, replace
 from typing import Any
 
 from fastapi import HTTPException, Request, WebSocket
@@ -38,22 +37,6 @@ def _normalize_id(value: Any) -> str | None:
     return normalized or None
 
 
-def _parse_cookie_token(cookie_header: str | None) -> str | None:
-    if not cookie_header:
-        return None
-    cookie = SimpleCookie()
-    try:
-        cookie.load(cookie_header)
-    except Exception:
-        return None
-    for name, morsel in cookie.items():
-        if name == "accessToken" or name.endswith("accessToken"):
-            value = morsel.value.strip()
-            if value:
-                return value
-    return None
-
-
 def get_bearer_token_from_request(request: Request) -> str:
     authorization = request.headers.get("authorization")
     if authorization:
@@ -64,20 +47,7 @@ def get_bearer_token_from_request(request: Request) -> str:
     raise HTTPException(status_code=401, detail="Missing Authorization header.")
 
 
-def get_bearer_token_from_websocket(websocket: WebSocket) -> str | None:
-    authorization = websocket.headers.get("authorization")
-    if authorization:
-        try:
-            return parse_authorization_header(authorization)
-        except JwtVerificationError:
-            return None
-    query_token = (websocket.query_params.get("token") or "").strip()
-    if query_token:
-        return query_token
-    return _parse_cookie_token(websocket.headers.get("cookie"))
-
-
-def build_agent_auth_context(*, token: str, jwt: JwtBearerConfig | None) -> AgentAuthContext:
+def build_agent_auth_context(*, token: str, jwt: JwtBearerConfig | None, context_token: str | None = None) -> AgentAuthContext:
     if jwt is None:
         raise HTTPException(status_code=501, detail="JWT auth must be enabled.")
     try:
@@ -87,7 +57,26 @@ def build_agent_auth_context(*, token: str, jwt: JwtBearerConfig | None) -> Agen
     except RuntimeError as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    claims = principal.claims or {}
+    claims = dict(principal.claims or {})
+    if context_token:
+        try:
+            context_principal = verify_bearer_jwt(
+                token=context_token,
+                config=replace(jwt, include_claims=True),
+            )
+        except (JwtVerificationError, RuntimeError) as exc:
+            raise HTTPException(status_code=401, detail="Invalid authorization context.") from exc
+        context_claims = dict(context_principal.claims or {})
+        if (
+            context_claims.get("token_type") not in {"intera_authorization_context", "intera_websocket_ticket"}
+            or str(context_claims.get("user_id") or "") != str(principal.user_id)
+            or str(context_claims.get("profile_id") or "") != str(claims.get("profile_id") or "")
+        ):
+            raise HTTPException(status_code=401, detail="Authorization context does not match the access token.")
+        permissions = set(claims.get("permissions") or []) | set(context_claims.get("permissions") or [])
+        for wildcard in context_claims.get("wildcards") or []:
+            permissions.update((context_claims.get("wildcard_permissions") or {}).get(wildcard) or [])
+        claims = {**claims, "permissions": sorted(str(item) for item in permissions if str(item).strip())}
     profile_id = _normalize_id(
         claims.get("profile_id")
         or ((claims.get("profile_context") or {}).get("id") if isinstance(claims.get("profile_context"), dict) else None)

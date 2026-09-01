@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -27,6 +28,9 @@ from kafka_a2a.registry.directory import KafkaAgentDirectory, KafkaAgentDirector
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
 from kafka_a2a.tools import ToolContext, ToolExecutor, ToolSpec
 from kafka_a2a.transport.kafka import KafkaConfig, KafkaTransport
+
+
+logger = logging.getLogger(__name__)
 
 
 UTILITY_MODULES: tuple[str, ...] = (
@@ -311,6 +315,21 @@ def _is_generic_router_card(card: AgentCard) -> bool:
     return _normalize_agent_lookup(card_public_slug(card)) in GENERIC_ROUTER_PUBLIC_SLUG_LOOKUPS
 
 
+def _match_requested_agent_family(cards: list[AgentCard], requested: str | None) -> AgentCard | None:
+    normalized_requested = _normalize_agent_lookup(requested)
+    if not normalized_requested:
+        return None
+
+    for card in cards:
+        for candidate in (card_public_slug(card), card.name):
+            normalized_candidate = _normalize_agent_lookup(candidate)
+            if not normalized_candidate:
+                continue
+            if normalized_candidate.startswith(normalized_requested):
+                return card
+    return None
+
+
 def _part_to_payload(part: Any) -> dict[str, Any]:
     if isinstance(part, TextPart):
         return {"kind": "text", "text": part.text}
@@ -503,7 +522,7 @@ class KafkaDelegationBackend:
         self._directory_offset_reset = (os.getenv("KA2A_DIRECTORY_AUTO_OFFSET_RESET") or "earliest").strip().lower()
         self._directory_warmup_timeout_s = float(os.getenv("KA2A_DIRECTORY_WARMUP_TIMEOUT_S") or "3.0")
         self._directory_warmup_settle_s = float(os.getenv("KA2A_DIRECTORY_WARMUP_SETTLE_S") or "0.5")
-        self._explicit_agent_wait_timeout_s = float(os.getenv("KA2A_EXPLICIT_AGENT_WAIT_TIMEOUT_S") or "12.0")
+        self._explicit_agent_wait_timeout_s = float(os.getenv("KA2A_EXPLICIT_AGENT_WAIT_TIMEOUT_S") or "30.0")
         try:
             self._max_delegation_depth = max(1, int(os.getenv("KA2A_DELEGATION_MAX_DEPTH") or "4"))
         except Exception:
@@ -637,7 +656,13 @@ class KafkaDelegationBackend:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, self._explicit_agent_wait_timeout_s)
-        best_match: AgentCard | None = None
+        next_control_plane_check_at = loop.time()
+
+        def _match(cards: list[AgentCard]) -> AgentCard | None:
+            for card in self._visible_downstream_cards(cards):
+                if card.name == requested or _card_matches_requested_agent(card, requested):
+                    return card
+            return None
 
         while True:
             registered_cards = [
@@ -647,12 +672,24 @@ class KafkaDelegationBackend:
                 and card.name != self._runtime_agent_name
                 and card_public_slug(card) != self._agent_name
             ]
-            visible_cards = self._visible_downstream_cards(registered_cards)
-            for card in visible_cards:
-                if card.name == requested or _card_matches_requested_agent(card, requested):
-                    return card
+            directory_match = _match(registered_cards)
+            if directory_match is not None:
+                return directory_match
+
+            # A shared runtime can load a local worker before this temporary
+            # directory consumer receives its agent-card event. The control
+            # plane is the authoritative fallback during that short window.
+            if self._control_plane.enabled and loop.time() >= next_control_plane_check_at:
+                try:
+                    control_plane_match = _match(await self._list_control_plane_cards())
+                except Exception as exc:
+                    logger.debug("explicit delegation control-plane lookup failed agent=%s error=%s", requested, exc)
+                else:
+                    if control_plane_match is not None:
+                        return control_plane_match
+                next_control_plane_check_at = loop.time() + 0.5
             if loop.time() >= deadline:
-                return best_match
+                return None
             await asyncio.sleep(0.1)
 
     async def list_agents(self) -> dict[str, Any]:
@@ -668,6 +705,7 @@ class KafkaDelegationBackend:
 
     def _select_agent(self, *, cards: list[AgentCard], request: str, agent_name: str | None) -> AgentCard:
         if agent_name:
+            normalized_agent_name = _normalize_agent_lookup(agent_name)
             matched_requested: AgentCard | None = None
             for card in cards:
                 if card.name == agent_name or _card_matches_requested_agent(card, agent_name):
@@ -678,6 +716,19 @@ class KafkaDelegationBackend:
                 if preferred is not None and preferred.name != matched_requested.name and _is_generic_router_card(matched_requested):
                     return preferred
                 return matched_requested
+            preferred = _match_preferred_agent(cards, request)
+            if preferred is not None:
+                preferred_slug = _normalize_agent_lookup(card_public_slug(preferred))
+                preferred_name = _normalize_agent_lookup(preferred.name)
+                if (
+                    normalized_agent_name in GENERIC_ROUTER_PUBLIC_SLUG_LOOKUPS
+                    or preferred_slug.startswith(normalized_agent_name)
+                    or preferred_name.startswith(normalized_agent_name)
+                ):
+                    return preferred
+            family_match = _match_requested_agent_family(cards, agent_name)
+            if family_match is not None:
+                return family_match
             raise RuntimeError(f"Requested agent '{agent_name}' is not registered.")
 
         if not cards:
@@ -726,11 +777,19 @@ class KafkaDelegationBackend:
     ) -> dict[str, Any]:
         selected: AgentCard
         if agent_name:
-            selected = await self._wait_for_explicit_agent_card(agent_name) or self._select_agent(
-                cards=await self._list_downstream_cards(),
-                request=request,
-                agent_name=agent_name,
-            )
+            explicit_card = await self._wait_for_explicit_agent_card(agent_name)
+            # A public router slug (for example ``pos``) is a routing hint, not
+            # a reason to add another hop when its concrete specialist is ready.
+            # Re-score the visible workspace cards so business-review planning
+            # reaches ``pos_admin``/``inventory_visibility`` directly.
+            if explicit_card is not None and not _is_generic_router_card(explicit_card):
+                selected = explicit_card
+            else:
+                selected = self._select_agent(
+                    cards=await self._list_downstream_cards(),
+                    request=request,
+                    agent_name=agent_name,
+                )
         else:
             registered_cards = await self._list_registered_cards()
             visible_cards = self._visible_downstream_cards(registered_cards)

@@ -9,6 +9,72 @@ from typing import TYPE_CHECKING, Literal, cast
 CredentialsSource = Literal["env", "jwt", "auto"]
 
 
+def _profile_id_from_metadata(metadata: dict[str, object] | None) -> str | None:
+    from kafka_a2a.tenancy import extract_principal
+
+    principal = extract_principal(metadata or {})
+    if principal is not None:
+        for candidate in (
+            principal.tenant_id,
+            principal.claims.get("profile_id") if isinstance(principal.claims, dict) else None,
+            principal.claims.get("tenant_id") if isinstance(principal.claims, dict) else None,
+        ):
+            value = str(candidate or "").strip()
+            if value:
+                return value
+
+    for key in ("profile_id", "tenant_id"):
+        value = str((metadata or {}).get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _resolve_llm_credentials_from_control_plane(
+    *,
+    metadata: dict[str, object] | None,
+    env: Mapping[str, str] | None = None,
+) -> ResolvedLlmCredentials | None:
+    from kafka_a2a.control_plane import ControlPlaneClient
+    from kafka_a2a.credentials import ResolvedLlmCredentials
+
+    env_map = env or os.environ
+    profile_id = _profile_id_from_metadata(metadata)
+    if profile_id is None:
+        profile_id = str(env_map.get("KA2A_WORKSPACE_PROFILE_ID") or "").strip() or None
+    if not profile_id:
+        return None
+
+    client = ControlPlaneClient()
+    if not client.enabled:
+        return None
+
+    try:
+        payload = client.get_internal_workspace_ai_setup(profile_id=profile_id)
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict) or not payload.get("configured"):
+        return None
+    agent_payload = payload.get("agent")
+    if not isinstance(agent_payload, dict):
+        return None
+
+    provider = str(agent_payload.get("provider") or env_map.get("KA2A_LLM_PROVIDER") or "").strip()
+    api_key = str(agent_payload.get("api_key") or "").strip()
+    if not provider or not api_key:
+        return None
+
+    model = str(agent_payload.get("model_name") or agent_payload.get("version") or env_map.get("KA2A_LLM_MODEL") or "").strip() or None
+    base_url = str(agent_payload.get("effective_base_url") or "").strip() or None
+    return ResolvedLlmCredentials(
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+    )
+
+
 def _parse_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None:
         return default
@@ -145,7 +211,13 @@ class Ka2aSettings:
         if self.llm_credentials_source == "jwt":
             if decrypt is None:
                 raise ValueError("decrypt is required when KA2A_LLM_CREDENTIALS_SOURCE=jwt")
-            return resolve_llm_credentials_from_metadata(metadata=metadata, decrypt=decrypt)
+            try:
+                resolved = resolve_llm_credentials_from_metadata(metadata=metadata, decrypt=decrypt)
+            except Exception:
+                resolved = None
+            if resolved is not None:
+                return resolved
+            return _resolve_llm_credentials_from_control_plane(metadata=metadata, env=env)
         if self.llm_credentials_source == "auto":
             if decrypt is not None:
                 try:
@@ -154,6 +226,9 @@ class Ka2aSettings:
                     resolved = None
                 if resolved is not None:
                     return resolved
+            resolved = _resolve_llm_credentials_from_control_plane(metadata=metadata, env=env)
+            if resolved is not None:
+                return resolved
             return resolve_llm_credentials_from_env(env=env)
 
         raise AssertionError(f"Unhandled credentials source: {self.llm_credentials_source}")

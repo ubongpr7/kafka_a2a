@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import logging
+import random
 import re
 import sys
 import threading
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
 from typing import Any
+from uuid import uuid4
 
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.control_plane import ControlPlaneClient, ControlPlaneError
@@ -55,6 +57,38 @@ def _parse_bool(value: str | None, *, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def _voice_chat_speech_command_text(packet: Any, *, expected_participant_identity: str) -> str:
+    """Return a safe browser-chat speech command from the active caller only."""
+    participant = getattr(packet, "participant", None)
+    participant_identity = str(getattr(participant, "identity", "") or "").strip()
+    participant_name = str(getattr(participant, "name", "") or "").strip()
+    if expected_participant_identity and participant_identity and participant_identity != expected_participant_identity:
+        return ""
+    if (
+        expected_participant_identity
+        and not participant_identity
+        and participant_name
+        and participant_name != expected_participant_identity
+    ):
+        return ""
+    if str(getattr(packet, "topic", "") or "").strip() != "ka2a.voice.control":
+        return ""
+
+    raw_data = getattr(packet, "data", b"")
+    try:
+        decoded = raw_data.decode("utf-8") if isinstance(raw_data, bytes) else str(raw_data)
+        payload = json.loads(decoded)
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    if payload.get("source") != "intera_a2a_chat" or payload.get("type") != "speak_chat_update":
+        return ""
+
+    text = _sanitize_voice_text(str(payload.get("text") or ""), reject_generic=False)
+    return text[:4000]
 
 
 def _env_float(name: str, default: float) -> float:
@@ -401,6 +435,36 @@ def _collapse_repeated_phrase(text: str) -> str:
     return normalized
 
 
+def _voice_is_cancellation_request(transcript: str) -> bool:
+    """Return true only for an explicit attempt to stop the current voice task."""
+    normalized = _transcript_comparison_key(transcript)
+    if not normalized:
+        return False
+    if re.search(r"\b(cancel|stop|nevermind|never mind|forget that|ignore that|scratch that)\b", normalized):
+        return True
+    if re.search(
+        r"\b(don'?t|do not)(?:\s+(?:don'?t|do not|no))*\s+"
+        r"(do|send|run|continue|proceed|submit|want|need|worry|mind|bother)\s+"
+        r"(?:about\s+)?(that|it|this)\b",
+        normalized,
+    ):
+        return True
+    return normalized.startswith(("sorry not that", "no not that", "not that"))
+
+
+_VOICE_SESSION_GREETINGS = (
+    "Hello. How can I help you today?",
+    "Hello there. What would you like to check?",
+    "Hi. What can I help you with today?",
+    "Welcome back. What would you like me to look into?",
+)
+
+
+def _voice_session_greeting() -> str:
+    """Choose a concise, natural opening for a ready voice session."""
+    return random.choice(_VOICE_SESSION_GREETINGS)
+
+
 _VOICE_PROVIDER_KEY_ERROR_MESSAGE = (
     "I could not complete that request because the workspace AI provider key is invalid. "
     "Update the workspace AI settings, then retry."
@@ -473,6 +537,14 @@ def _sanitize_voice_text(text: str, *, reject_generic: bool = False) -> str:
     return cleaned
 
 
+def _voice_tts_text(text: str) -> str:
+    """Make currency symbols unambiguous to the speech synthesizer."""
+    cleaned = str(text or "")
+    cleaned = re.sub(r"₦\s*(?=[0-9])", "Nigerian naira ", cleaned)
+    cleaned = re.sub(r"\bNGN\s*(?=[0-9])", "Nigerian naira ", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
 def _humanize_voice_agent_label(value: str) -> str:
     normalized = re.sub(r"[_-]+", " ", value.strip())
     normalized = re.sub(r"\bwa p\d+\b", "", normalized, flags=re.IGNORECASE)
@@ -481,30 +553,53 @@ def _humanize_voice_agent_label(value: str) -> str:
     return normalized or "workspace"
 
 
+def _humanize_voice_specialist_label(value: str) -> str:
+    label = _humanize_voice_agent_label(value)
+    label = re.sub(r"\b(?:specialist|agent)\b", "", label, flags=re.IGNORECASE)
+    label = re.sub(r"\s+", " ", label).strip(" .,-")
+    aliases = {
+        "product catalog admin": "product catalog",
+        "product catalog administrator": "product catalog",
+    }
+    return aliases.get(label.lower(), label or "workspace")
+
+
 def _humanize_voice_progress_text(text: str) -> str:
     cleaned = _sanitize_voice_text(text)
     if not cleaned:
         return ""
 
+    # A2A status messages may include runtime identifiers or internal agent headings.
+    cleaned = re.sub(
+        r"^(?:wa[-_ ]p\d+(?:[-_ ][a-z0-9]+)+|(?:the\s+)?(?:[a-z][a-z0-9_-]*\s+){1,4}agent)\s*:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     lowered = cleaned.lower()
-    delegating_match = re.match(r"delegating this request to the (.+?) specialist agent\.?$", lowered, flags=re.IGNORECASE)
+    if lowered in {"working", "processing", "submitted", "accepted", "pending"}:
+        return ""
+    delegating_match = re.match(
+        r"delegating this request to (?:the )?(.+?)(?:\s+specialist(?:\s+agent)?)?\.?$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     if delegating_match:
-        agent_label = _humanize_voice_agent_label(delegating_match.group(1))
-        return f"I’ve handed this to the {agent_label} specialist."
+        specialist_label = _humanize_voice_specialist_label(delegating_match.group(1))
+        return f"I'm handing this to the {specialist_label} specialist."
 
-    accepted_match = re.match(r"(.+?) agent accepted the delegated task\.?$", cleaned, flags=re.IGNORECASE)
-    if accepted_match:
-        agent_label = _humanize_voice_agent_label(accepted_match.group(1))
-        return f"The {agent_label} specialist has accepted the task."
-
-    processing_match = re.match(r"(.+?) agent is processing the delegated task\.?$", cleaned, flags=re.IGNORECASE)
-    if processing_match:
-        agent_label = _humanize_voice_agent_label(processing_match.group(1))
-        return f"The {agent_label} specialist is working on it now."
+    if re.match(
+        r"(?:the )?.+?(?:\s+specialist)?\s+(?:has accepted (?:the )?(?:delegated )?task|"
+        r"is (?:working on it now|processing (?:the )?delegated task))\.?$",
+        cleaned,
+        flags=re.IGNORECASE,
+    ):
+        # A handoff is useful; internal queue acknowledgements are repetitive noise.
+        return ""
 
     working_match = re.match(r"delegating this request to the appropriate specialist agent\.?$", lowered, flags=re.IGNORECASE)
     if working_match:
-        return "I’ve handed this to the right specialist."
+        return "I'm handing this to the right specialist."
 
     if "task state: failed" in lowered or "current task state: failed" in lowered:
         return "That task ran into a problem. I’m checking what detail is missing."
@@ -875,6 +970,24 @@ _VOICE_BUSINESS_TERMS = {
     "week",
     "year",
 }
+
+_VOICE_BUSINESS_CONTEXT_TERMS = {
+    term
+    for term in _VOICE_BUSINESS_TERMS
+    if term
+    not in {
+        "day",
+        "days",
+        "month",
+        "months",
+        "quarter",
+        "quarters",
+        "week",
+        "weeks",
+        "year",
+        "years",
+    }
+}
 _VOICE_BUSINESS_PHRASES = (
     "best performing",
     "best-performing",
@@ -909,6 +1022,43 @@ _VOICE_REPEAT_PHRASES = (
     "i didn't catch",
 )
 
+_VOICE_FAREWELL_PHRASES = (
+    "bye",
+    "bye bye",
+    "goodbye",
+    "see you",
+    "see you later",
+    "talk to you later",
+)
+
+_VOICE_CONFIRM_YES_PHRASES = (
+    "correct",
+    "exactly",
+    "go ahead",
+    "that's right",
+    "that is right",
+    "that is correct",
+    "that is what i mean",
+    "that's what i mean",
+    "yes",
+    "yes please",
+    "yes that is it",
+    "yes that's it",
+    "yes that is right",
+    "yes that's right",
+)
+
+_VOICE_CONFIRM_NO_PHRASES = (
+    "don't do that",
+    "no",
+    "no don't",
+    "no that is not it",
+    "no that's not it",
+    "not that",
+    "that is not it",
+    "that's not it",
+)
+
 _VOICE_STATUS_REQUEST_PHRASES = (
     "any update",
     "are you done",
@@ -931,9 +1081,124 @@ _VOICE_STATUS_REQUEST_PHRASES = (
     "where are we on that",
 )
 
+_VOICE_FILLER_PREFIX_PATTERNS = (
+    r"^(?:ok|okay|alright|all right|right|so|well|please)[,.\s]+",
+    r"^(?:ok|okay|alright|all right|right|so|well|please)\s+(?:that'?s\s+nice|thanks?)[,.\s]+",
+    r"^(?:thanks?|thank you|bye|bye bye|goodbye|see you|see you later|talk to you later)[,.\s]+",
+)
+
 
 def _normalize_voice_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _strip_voice_filler_prefix(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+    if not cleaned:
+        return ""
+    previous = None
+    while cleaned and cleaned != previous:
+        previous = cleaned
+        for pattern in _VOICE_FILLER_PREFIX_PATTERNS:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
+
+
+def _sentence_case_voice_request(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    return cleaned[0].upper() + cleaned[1:]
+
+
+def _canonicalize_voice_request(original: str, answer: str, merged: str, pending: dict[str, Any]) -> str:
+    kind = str(pending.get("kind") or "").strip()
+    original_clean = _strip_voice_filler_prefix(_collapse_repeated_phrase(original.strip()))
+    answer_clean = _strip_voice_filler_prefix(_collapse_repeated_phrase(answer.strip()))
+    merged_clean = _strip_voice_filler_prefix(_collapse_repeated_phrase(merged.strip()))
+    if not merged_clean:
+        return ""
+
+    original_normalized = _normalize_voice_text(original_clean)
+    answer_normalized = _normalize_voice_text(answer_clean)
+    merged_normalized = _normalize_voice_text(merged_clean)
+
+    if kind == "time_range":
+        if "analyze my sales data" in original_normalized or "analyse my sales data" in original_normalized:
+            if (
+                answer_clean
+                and _voice_has_time_range(answer_clean)
+                and ("analyze my sales data" in answer_normalized or "analyse my sales data" in answer_normalized)
+            ):
+                canonical_answer = re.sub(
+                    r"^can you help me(?: to)?\s+",
+                    "",
+                    answer_clean,
+                    flags=re.IGNORECASE,
+                ).strip()
+                return _sentence_case_voice_request(canonical_answer)
+            if answer_clean:
+                return _sentence_case_voice_request(f"Analyze my sales data {answer_clean}".strip())
+        if "analyze my inventory" in original_normalized or "analyse my inventory" in original_normalized:
+            if (
+                answer_clean
+                and _voice_has_time_range(answer_clean)
+                and ("analyze my inventory" in answer_normalized or "analyse my inventory" in answer_normalized)
+            ):
+                canonical_answer = re.sub(
+                    r"^can you help me(?: to)?\s+",
+                    "",
+                    answer_clean,
+                    flags=re.IGNORECASE,
+                ).strip()
+                return _sentence_case_voice_request(canonical_answer)
+            if answer_clean:
+                return _sentence_case_voice_request(f"Analyze my inventory {answer_clean}".strip())
+        if "inventory history" in original_normalized and answer_clean:
+            return _sentence_case_voice_request(f"Show me the inventory history {answer_clean}".strip())
+
+    if kind == "continuation":
+        if _voice_has_time_range(original_normalized) and not _voice_has_business_context(original_normalized):
+            if answer_clean and _voice_has_business_context(answer_normalized):
+                if "analyze my sales data" in answer_normalized or "analyse my sales data" in answer_normalized:
+                    return _sentence_case_voice_request(f"Analyze my sales data {original_clean}".strip())
+                if "analyze my inventory" in answer_normalized or "analyse my inventory" in answer_normalized:
+                    return _sentence_case_voice_request(f"Analyze my inventory {original_clean}".strip())
+                return _sentence_case_voice_request(f"{answer_clean} {original_clean}".strip())
+        if "how many products" in original_normalized and "inventory" in answer_normalized:
+            return "How many products are in my inventory?"
+        if "how many products" in original_normalized and "sold" in answer_normalized:
+            return "How many products were sold?"
+
+    if merged_normalized.startswith("can you help me to "):
+        merged_clean = re.sub(r"^can you help me to\s+", "", merged_clean, flags=re.IGNORECASE)
+    elif merged_normalized.startswith("can you help me "):
+        merged_clean = re.sub(r"^can you help me\s+", "", merged_clean, flags=re.IGNORECASE)
+
+    return _sentence_case_voice_request(merged_clean)
+
+
+def _voice_corrected_inventory_request(transcript: str) -> str | None:
+    """Return the corrected stock intent when the caller repairs an STT mistake."""
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return None
+    correction_signal = bool(
+        re.search(
+            r"\b(?:i\s+(?:did(?: not|n't)|do(?: not|n't))\s+(?:say|mean)|"
+            r"i\s+said|not\s+(?:new|low|out[\s-]*of)\s+stock|instead)\b",
+            normalized,
+        )
+    )
+    if not correction_signal:
+        return None
+    if "low stock" in normalized or "low-stock" in normalized:
+        return "Show low-stock products."
+    if "out of stock" in normalized or "out-of-stock" in normalized:
+        return "Show out-of-stock products."
+    if "reorder" in normalized:
+        return "Show reorder candidates."
+    return None
 
 
 def _voice_log_preview(text: str, *, max_chars: int = 160) -> str:
@@ -943,6 +1208,46 @@ def _voice_log_preview(text: str, *, max_chars: int = 160) -> str:
     return f"{preview[: max_chars - 1].rstrip()}…"
 
 
+def _voice_is_general_help_intent(transcript: str) -> bool:
+    normalized = _normalize_voice_text(transcript)
+    if "inventory" not in normalized:
+        return False
+    generic_help_signals = (
+        "hope you can help",
+        "help with that",
+        "help me with that",
+        "help with my inventory",
+        "help me with my inventory",
+        "help with inventory",
+        "help me with inventory",
+        "need to do some things",
+        "want to do some things",
+    )
+    if not any(signal in normalized for signal in generic_help_signals):
+        return False
+    concrete_action_signals = (
+        "analy",
+        "audit",
+        "check",
+        "compare",
+        "create",
+        "delete",
+        "find",
+        "import",
+        "list",
+        "purchase",
+        "receive",
+        "reorder",
+        "report",
+        "restock",
+        "sell",
+        "show",
+        "tell me",
+        "update",
+    )
+    return not any(signal in normalized for signal in concrete_action_signals)
+
+
 def _voice_direct_reply(transcript: str) -> str | None:
     normalized = _normalize_voice_text(transcript)
     compact = re.sub(r"[^a-z0-9\s']", " ", normalized)
@@ -950,6 +1255,10 @@ def _voice_direct_reply(transcript: str) -> str | None:
     if not tokens:
         return None
     joined = " ".join(tokens)
+    if _voice_is_general_help_intent(joined):
+        return "Absolutely. Tell me the specific inventory task you want help with."
+    if len(tokens) <= 8 and any(phrase in joined for phrase in _VOICE_FAREWELL_PHRASES):
+        return "Alright. I’ll be here when you need me again."
     if len(tokens) <= 10 and any(
         phrase in joined
         for phrase in (
@@ -962,7 +1271,7 @@ def _voice_direct_reply(transcript: str) -> str | None:
             "still there",
         )
     ):
-        return "I’m here and listening. Ask me what you want checked in your inventory."
+        return "Hello. I’m here and listening. Tell me what you want me to analyze or check."
     if len(tokens) <= 8 and any(phrase in joined for phrase in ("thank you", "thanks", "okay", "ok")):
         return "You’re welcome."
     if len(tokens) <= 12 and any(phrase in joined for phrase in ("who are you", "what is your name", "your name")):
@@ -985,6 +1294,21 @@ def _voice_direct_reply(transcript: str) -> str | None:
     return None
 
 
+def _voice_has_actionable_business_request(transcript: str) -> bool:
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return False
+    if _voice_direct_reply(normalized) is not None:
+        return False
+    if _voice_confirmation_reply(normalized) is not None:
+        return False
+    return (
+        _should_delegate_voice_transcript(normalized)
+        and not _voice_is_likely_incomplete_fragment(normalized)
+        and _voice_clarification_requirement(normalized) is None
+    )
+
+
 def _voice_repeat_requested(transcript: str) -> bool:
     normalized = _normalize_voice_text(transcript)
     if not normalized:
@@ -997,6 +1321,17 @@ def _voice_status_requested(transcript: str) -> bool:
     if not normalized:
         return False
     return any(phrase in normalized for phrase in _VOICE_STATUS_REQUEST_PHRASES)
+
+
+def _voice_confirmation_reply(transcript: str) -> str | None:
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return None
+    if any(phrase in normalized for phrase in _VOICE_CONFIRM_YES_PHRASES):
+        return "yes"
+    if any(phrase in normalized for phrase in _VOICE_CONFIRM_NO_PHRASES):
+        return "no"
+    return None
 
 
 _VOICE_TIME_RANGE_HINTS = (
@@ -1012,8 +1347,10 @@ _VOICE_TIME_RANGE_HINTS = (
     "last year",
     "past week",
     "past month",
+    "past one month",
     "past quarter",
     "past year",
+    "past one year",
     "past 7 days",
     "past 30 days",
     "past 90 days",
@@ -1026,12 +1363,16 @@ _VOICE_TIME_RANGE_HINTS = (
     "in the past",
     "over the last",
     "over the past",
+    "over the past one",
     "between ",
     "from ",
     "since ",
 )
 
 _VOICE_TIME_RANGE_REQUIRED_HINTS = (
+    "business data",
+    "business performance",
+    "business review",
     "sales data",
     "sales report",
     "sales analysis",
@@ -1074,12 +1415,100 @@ _VOICE_FRAGMENT_ENDINGS = (
     "look at",
 )
 
+_VOICE_TIME_RANGE_ONLY_TERMS = {
+    "a",
+    "an",
+    "around",
+    "between",
+    "day",
+    "days",
+    "during",
+    "eight",
+    "eighteen",
+    "eighty",
+    "eleven",
+    "fifteen",
+    "fifty",
+    "five",
+    "for",
+    "forty",
+    "four",
+    "from",
+    "hundred",
+    "in",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "last",
+    "month",
+    "months",
+    "nine",
+    "nineteen",
+    "ninety",
+    "of",
+    "on",
+    "one",
+    "over",
+    "past",
+    "previous",
+    "quarter",
+    "quarters",
+    "seven",
+    "seventeen",
+    "seventy",
+    "since",
+    "six",
+    "sixteen",
+    "sixty",
+    "ten",
+    "the",
+    "thirty",
+    "this",
+    "three",
+    "through",
+    "to",
+    "today",
+    "tomorrow",
+    "twelve",
+    "twenty",
+    "two",
+    "until",
+    "week",
+    "weeks",
+    "year",
+    "years",
+    "yesterday",
+    "zero",
+}
+
 
 def _voice_has_time_range(transcript: str) -> bool:
     normalized = _normalize_voice_text(transcript)
     if not normalized:
         return False
     if any(hint in normalized for hint in _VOICE_TIME_RANGE_HINTS):
+        return True
+    if re.search(
+        r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"(day|days|week|weeks|month|months|quarter|quarters|year|years)\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        r"\b(last|past|for the past|for past|in the past|over the past)\s+"
+        r"(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"(day|days|week|weeks|month|months|quarter|quarters|year|years)\b",
+        normalized,
+    ):
         return True
     if re.search(r"\b\d+\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)\b", normalized):
         return True
@@ -1095,6 +1524,20 @@ def _voice_needs_time_range(transcript: str) -> bool:
     if not normalized:
         return False
     if _voice_has_time_range(normalized):
+        return False
+    if any(
+        phrase in normalized
+        for phrase in (
+            "low stock",
+            "low-stock",
+            "out of stock",
+            "out-of-stock",
+            "stock risk",
+            "stock posture",
+            "reorder candidates",
+            "expiry risk",
+        )
+    ):
         return False
     return any(hint in normalized for hint in _VOICE_TIME_RANGE_REQUIRED_HINTS)
 
@@ -1113,22 +1556,80 @@ def _voice_is_likely_incomplete_fragment(transcript: str) -> bool:
     return False
 
 
+def _voice_is_clean_time_range_followup(transcript: str) -> bool:
+    normalized = _normalize_voice_text(transcript)
+    if not normalized or not _voice_has_time_range(normalized):
+        return False
+    tokens = [token for token in re.split(r"[^a-z0-9']+", normalized) if token]
+    if not tokens:
+        return False
+    for token in tokens:
+        if token in _VOICE_TIME_RANGE_ONLY_TERMS:
+            continue
+        if re.fullmatch(r"\d{1,4}", token):
+            continue
+        return False
+    return True
+
+
 def _voice_clarification_requirement(transcript: str) -> dict[str, str] | None:
     normalized = _normalize_voice_text(transcript)
     if not normalized:
         return {
             "kind": "continuation",
-            "question": "I did not catch the full request. Please say the full question.",
+            "question": "I didn’t catch the full request. Please say the full question.",
+        }
+    if _voice_has_time_range(normalized) and not _voice_has_business_context(normalized):
+        return {
+            "kind": "continuation",
+            "question": "I heard a time range, but I still need the full request. What should I analyze with that range?",
         }
     if _voice_needs_time_range(normalized):
         return {
             "kind": "time_range",
             "question": "What time range should I use for that analysis?",
         }
+    if "how many products" in normalized and not any(
+        hint in normalized
+        for hint in (
+            "active product",
+            "active products",
+            "in inventory",
+            "inventory item",
+            "inventory items",
+            "product count",
+            "products do i have",
+            "products i have",
+            "products sold",
+            "products were sold",
+            "sales",
+            "sku",
+            "skus",
+            "stock",
+            "tracked product",
+            "tracked products",
+            "variant",
+            "variants",
+        )
+    ):
+        return {
+            "kind": "continuation",
+            "question": (
+                "When you say how many products, do you mean products in inventory, "
+                "products sold, or another product metric?"
+            ),
+        }
+    if not _voice_has_business_context(normalized):
+        tokens = [token for token in re.split(r"[^a-z0-9']+", normalized) if token]
+        if len(tokens) <= 8:
+            return {
+                "kind": "continuation",
+                "question": "Tell me what you want me to analyze or check, and I’ll send it through.",
+            }
     if _voice_is_likely_incomplete_fragment(normalized):
         return {
             "kind": "continuation",
-            "question": "That request sounds incomplete. Please finish the question and I will send it through.",
+            "question": "I only caught part of that. Please finish the question and I’ll send it through.",
         }
     return None
 
@@ -1138,20 +1639,191 @@ def _voice_response_satisfies_clarification(transcript: str, pending: dict[str, 
     normalized = _normalize_voice_text(transcript)
     if not normalized:
         return False
+    if kind == "confirm":
+        return _voice_confirmation_reply(normalized) == "yes"
     if kind == "time_range":
-        return _voice_has_time_range(normalized)
+        merged = _voice_merge_clarification_answer(str(pending.get("original") or ""), transcript, pending)
+        return (
+            _voice_has_time_range(normalized)
+            and not _voice_is_likely_incomplete_fragment(merged)
+            and _voice_clarification_requirement(merged) is None
+        )
     if kind == "continuation":
-        return len([token for token in re.split(r"[^a-z0-9']+", normalized) if token]) >= 2 or _voice_has_time_range(normalized)
+        merged = _voice_merge_clarification_answer(str(pending.get("original") or ""), transcript, pending)
+        return (
+            _should_delegate_voice_transcript(merged)
+            and not _voice_is_likely_incomplete_fragment(merged)
+            and _voice_clarification_requirement(merged) is None
+        )
     return False
+
+
+def _voice_supersedes_pending_clarification(transcript: str, pending: dict[str, Any]) -> bool:
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return False
+    kind = str(pending.get("kind") or "").strip()
+    if kind == "confirm" and _voice_confirmation_reply(normalized) is not None:
+        return False
+    if kind == "time_range" and _voice_is_clean_time_range_followup(normalized):
+        return False
+    if _voice_direct_reply(normalized) is not None:
+        return True
+    if kind == "continuation":
+        clarification = _voice_clarification_requirement(normalized)
+        if (
+            _voice_has_business_context(normalized)
+            and not _voice_is_likely_incomplete_fragment(normalized)
+            and clarification is not None
+            and clarification.get("kind") in {"time_range", "continuation"}
+        ):
+            return True
+    if _voice_has_actionable_business_request(normalized):
+        return True
+    return False
+
+
+def _voice_progress_clarification(
+    transcript: str,
+    pending: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    merged = _voice_merge_clarification_answer(
+        str(pending.get("original") or ""),
+        transcript,
+        pending,
+    )
+    if not merged:
+        return "", None
+    next_clarification = _voice_clarification_requirement(merged)
+    if next_clarification is None:
+        return merged, None
+    return merged, {
+        "kind": next_clarification["kind"],
+        "question": next_clarification["question"],
+        "original": merged,
+    }
+
+
+def _voice_should_defer_fragment_clarification(
+    transcript: str,
+    clarification: dict[str, str] | None,
+) -> bool:
+    if not clarification or str(clarification.get("kind") or "").strip() != "continuation":
+        return False
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return False
+    if _voice_direct_reply(normalized) is not None or _voice_confirmation_reply(normalized) is not None:
+        return False
+    tokens = [token for token in re.split(r"[^a-z0-9']+", normalized) if token]
+    request_openers = (
+        "can you help me",
+        "help me",
+        "analyze my",
+        "analyse my",
+        "show me",
+        "tell me",
+        "check my",
+        "i need",
+        "i want",
+        "please analyze",
+        "please analyse",
+        "please check",
+    )
+    if any(normalized.startswith(prefix) for prefix in request_openers):
+        return True
+    if _voice_is_likely_incomplete_fragment(normalized):
+        return True
+    return bool(tokens) and len(tokens) <= 6 and _voice_has_business_context(normalized)
 
 
 def _voice_merge_clarification_answer(original: str, answer: str, pending: dict[str, Any]) -> str:
     kind = str(pending.get("kind") or "").strip()
+    original_clean = _strip_voice_filler_prefix(_collapse_repeated_phrase(original.strip()))
+    answer_clean = _strip_voice_filler_prefix(_collapse_repeated_phrase(answer.strip()))
+    if not original_clean:
+        return answer_clean
+    if not answer_clean:
+        return original_clean
+    merged = ""
     if kind == "time_range":
-        return _collapse_repeated_phrase(f"{original.strip()} {answer.strip()}")
-    if kind == "continuation":
-        return _collapse_repeated_phrase(f"{original.strip()} {answer.strip()}")
-    return _collapse_repeated_phrase(answer.strip())
+        merged = _collapse_repeated_phrase(f"{original_clean} {answer_clean}")
+    elif kind == "continuation":
+        original_has_time_range = _voice_has_time_range(original_clean)
+        answer_has_time_range = _voice_has_time_range(answer_clean)
+        original_has_business_context = _voice_has_business_context(original_clean)
+        answer_has_business_context = _voice_has_business_context(answer_clean)
+        if original_has_time_range and answer_has_business_context and not original_has_business_context:
+            merged = _collapse_repeated_phrase(f"{answer_clean} {original_clean}")
+        elif answer_has_time_range and original_has_business_context:
+            merged = _collapse_repeated_phrase(f"{original_clean} {answer_clean}")
+        else:
+            merged = _collapse_repeated_phrase(f"{original_clean} {answer_clean}")
+    elif kind == "confirm":
+        merged = str(pending.get("candidate_request") or "").strip() or answer_clean
+    else:
+        merged = answer_clean
+    return _canonicalize_voice_request(original_clean, answer_clean, merged, pending)
+
+
+def _voice_should_confirm_clarification_merge(original: str, answer: str, merged: str, pending: dict[str, Any]) -> bool:
+    kind = str(pending.get("kind") or "").strip()
+    if kind != "continuation":
+        return False
+    original_clean = _normalize_voice_text(original)
+    answer_clean = _normalize_voice_text(answer)
+    merged_clean = _normalize_voice_text(merged)
+    if not merged_clean:
+        return False
+    if original_clean and answer_clean and merged_clean != f"{original_clean} {answer_clean}".strip():
+        return True
+    if _voice_has_time_range(original_clean) != _voice_has_time_range(answer_clean):
+        return True
+    if not _voice_has_business_context(original_clean) or not _voice_has_business_context(answer_clean):
+        return True
+    return False
+
+
+def _voice_has_business_context(transcript: str) -> bool:
+    normalized = _normalize_voice_text(transcript)
+    if not normalized:
+        return False
+    if any(phrase in normalized for phrase in _VOICE_BUSINESS_PHRASES):
+        return True
+    tokens = {token for token in re.split(r"[^a-z0-9-]+", normalized) if token}
+    return bool(tokens & _VOICE_BUSINESS_CONTEXT_TERMS)
+
+
+def _voice_fragment_completes_current_request(current: str, fragment: str) -> bool:
+    current_normalized = _normalize_voice_text(current)
+    fragment_normalized = _normalize_voice_text(fragment)
+    if not current_normalized or not fragment_normalized:
+        return False
+
+    clarification = _voice_clarification_requirement(current_normalized)
+    if clarification is not None:
+        kind = clarification["kind"]
+        if kind == "time_range":
+            return _voice_is_clean_time_range_followup(fragment_normalized)
+        if kind == "continuation":
+            if _voice_has_time_range(current_normalized) and not _voice_has_business_context(current_normalized):
+                return _voice_has_business_context(fragment_normalized) and not _voice_is_likely_incomplete_fragment(
+                    fragment_normalized
+                )
+            if "how many products" in current_normalized:
+                return _voice_has_business_context(fragment_normalized) and not _voice_is_clean_time_range_followup(
+                    fragment_normalized
+                )
+            if _voice_has_business_context(fragment_normalized):
+                return not _voice_is_likely_incomplete_fragment(fragment_normalized)
+            return _voice_is_clean_time_range_followup(fragment_normalized)
+
+    if _voice_is_likely_incomplete_fragment(current_normalized):
+        if _voice_has_business_context(fragment_normalized):
+            return True
+        return _voice_is_clean_time_range_followup(fragment_normalized)
+
+    return False
 
 
 def _should_delegate_voice_transcript(transcript: str) -> bool:
@@ -1160,10 +1832,7 @@ def _should_delegate_voice_transcript(transcript: str) -> bool:
         return False
     if _voice_direct_reply(normalized):
         return False
-    if any(phrase in normalized for phrase in _VOICE_BUSINESS_PHRASES):
-        return True
-    tokens = {token for token in re.split(r"[^a-z0-9-]+", normalized) if token}
-    if tokens & _VOICE_BUSINESS_TERMS:
+    if _voice_has_business_context(normalized):
         return True
     contextual_followup = (
         "what about",
@@ -1181,10 +1850,125 @@ def _should_delegate_voice_transcript(transcript: str) -> bool:
     )
     if any(normalized.startswith(prefix) for prefix in contextual_followup):
         return True
-    tokens = [token for token in re.split(r"[^a-z0-9-]+", normalized) if token]
-    if len(tokens) >= 3:
-        return True
     return False
+
+
+def _word_overlap_size(left: str, right: str) -> int:
+    left_words = [word for word in left.split() if word]
+    right_words = [word for word in right.split() if word]
+    max_overlap = min(len(left_words), len(right_words))
+    for size in range(max_overlap, 1, -1):
+        left_tail = _transcript_comparison_key(" ".join(left_words[-size:]))
+        right_head = _transcript_comparison_key(" ".join(right_words[:size]))
+        if left_tail and left_tail == right_head:
+            return size
+    return 0
+
+
+def _merge_voice_transcript_fragments(fragments: list[str]) -> str:
+    merged_text = ""
+    for fragment in fragments:
+        cleaned = _collapse_repeated_phrase(re.sub(r"\s+", " ", fragment.strip()))
+        if not cleaned:
+            continue
+        if not merged_text:
+            merged_text = cleaned
+            continue
+        previous_key = _transcript_comparison_key(merged_text)
+        cleaned_key = _transcript_comparison_key(cleaned)
+        if not cleaned_key or cleaned_key == previous_key:
+            continue
+        if previous_key and previous_key in cleaned_key:
+            merged_text = cleaned
+            continue
+        if cleaned_key in previous_key:
+            continue
+        overlap = _word_overlap_size(merged_text, cleaned)
+        if overlap:
+            previous_words = merged_text.split()
+            cleaned_words = cleaned.split()
+            merged_text = " ".join(previous_words + cleaned_words[overlap:])
+            continue
+        merged_text = f"{merged_text} {cleaned}".strip()
+    return _collapse_repeated_phrase(merged_text)
+
+
+def _voice_should_ignore_fragment_in_batch(fragment: str, *, has_following: bool) -> bool:
+    if not has_following:
+        return False
+    normalized = _normalize_voice_text(fragment)
+    if not normalized:
+        return True
+    if _voice_has_business_context(normalized) or _voice_has_time_range(normalized):
+        return False
+    if _voice_direct_reply(normalized) is not None:
+        return True
+    return normalized in {
+        "ok",
+        "okay",
+        "alright",
+        "all right",
+        "right",
+        "sure",
+        "thanks",
+        "thank you",
+        "please",
+    }
+
+
+def _select_voice_transcript_batch(fragments: list[str]) -> tuple[str, list[str]]:
+    cleaned_fragments = [
+        _collapse_repeated_phrase(re.sub(r"\s+", " ", fragment.strip()))
+        for fragment in fragments
+        if str(fragment or "").strip()
+    ]
+    cleaned_fragments = [fragment for fragment in cleaned_fragments if fragment]
+    if not cleaned_fragments:
+        return "", []
+
+    # A caller may correct a previous STT fragment before the silence window
+    # expires. Send only the repaired intent so the stale request is never
+    # delegated to the host.
+    for fragment in reversed(cleaned_fragments):
+        corrected_request = _voice_corrected_inventory_request(fragment)
+        if corrected_request:
+            return corrected_request, []
+
+    current = ""
+    remaining: list[str] = []
+    for index, fragment in enumerate(cleaned_fragments):
+        has_following = index < len(cleaned_fragments) - 1
+        if not current and _voice_should_ignore_fragment_in_batch(fragment, has_following=has_following):
+            continue
+        if not current:
+            current = fragment
+            continue
+
+        current_needs_more = (
+            _voice_clarification_requirement(current) is not None
+            or _voice_is_likely_incomplete_fragment(current)
+        )
+        if current_needs_more:
+            if _voice_fragment_completes_current_request(current, fragment):
+                current = _merge_voice_transcript_fragments([current, fragment])
+                continue
+            remaining = cleaned_fragments[index:]
+            break
+
+        if (
+            _voice_has_business_context(current)
+            and not _voice_has_time_range(current)
+            and _voice_is_clean_time_range_followup(fragment)
+        ):
+            current = _merge_voice_transcript_fragments([current, fragment])
+            continue
+
+        remaining = cleaned_fragments[index:]
+        break
+
+    if not current:
+        current = cleaned_fragments[-1]
+    return _collapse_repeated_phrase(current), remaining
 
 
 @dataclass(slots=True)
@@ -1208,6 +1992,21 @@ def _voice_request_metadata(runtime: VoiceRuntimeContext) -> dict[str, Any]:
             "userEmail": runtime.user_email,
         },
         runtime.principal,
+    )
+
+
+def _voice_host_message(
+    *,
+    runtime: VoiceRuntimeContext,
+    transcript: str,
+    context_id: str,
+) -> Message:
+    """Keep every turn in one A2A context for the duration of a voice call."""
+    return Message(
+        role=Role.user,
+        parts=[TextPart(text=transcript)],
+        metadata=_voice_request_metadata(runtime),
+        context_id=context_id,
     )
 
 
@@ -1402,7 +2201,6 @@ async def _voice_entrypoint(ctx: Any) -> None:
     room_name_for_log = _context_room_name(ctx)
     logger.info("voice entrypoint starting", extra={"room": room_name_for_log})
     try:
-        from livekit import agents as lk_agents
         from livekit.agents import Agent, AgentSession, InterruptionOptions, TurnHandlingOptions, inference, room_io
         from livekit.agents.llm import StopResponse
         from livekit.plugins import openai
@@ -1412,7 +2210,6 @@ async def _voice_entrypoint(ctx: Any) -> None:
         ) from exc
     logger.info("voice optional dependencies loaded", extra={"room": room_name_for_log})
 
-    runtime_shared_token = (os.getenv("KA2A_RUNTIME_SHARED_TOKEN") or "").strip() or None
     control_plane = ControlPlaneClient()
     jwt_cfg = _jwt_from_env()
     default_host_agent_name = (os.getenv("KA2A_VOICE_HOST_AGENT_NAME") or "host").strip() or "host"
@@ -1430,18 +2227,26 @@ async def _voice_entrypoint(ctx: Any) -> None:
             self._delegation_lock = asyncio.Lock()
             self._client_start_lock = asyncio.Lock()
             self._last_spoken_response = ""
+            # A new context per call lets the host reuse the preceding voice
+            # turns without leaking conversation state into another call.
+            self._voice_context_id = f"voice-{runtime.profile_id}-{uuid4()}"
             self._closing = False
             self._caller_watch_task: asyncio.Task[None] | None = None
             self._active_delegation_task: asyncio.Task[str] | None = None
+            self._active_delegation_turn_id: str | None = None
+            self._active_delegation_transcript = ""
             self._transcript_buffer: list[str] = []
             self._transcript_flush_task: asyncio.Task[None] | None = None
             self._recent_transcript_keys: dict[str, float] = {}
+            self._deferred_fragment_attempts: dict[str, int] = {}
             self._pending_clarification: dict[str, Any] | None = None
             self._client = Ka2aClient(
                 transport=KafkaTransport(KafkaConfig.from_env()),
                 config=Ka2aClientConfig(
                     client_id=f"ka2a-voice-{runtime.profile_id}",
-                    request_timeout_s=float(os.getenv("KA2A_VOICE_REQUEST_TIMEOUT_S") or "60"),
+                    # Voice requests can legitimately run for several minutes
+                    # while the host coordinates specialist agents.
+                    request_timeout_s=None,
                 ),
             )
             self._client_started = False
@@ -1490,12 +2295,22 @@ async def _voice_entrypoint(ctx: Any) -> None:
             session = getattr(self, "session", None)
             if session is None or not text.strip():
                 return
-            handle = session.say(text, allow_interruptions=allow_interruptions)
+            handle = session.say(_voice_tts_text(text), allow_interruptions=allow_interruptions)
             wait_for_playout = getattr(handle, "wait_for_playout", None)
             if callable(wait_for_playout):
                 await wait_for_playout()
             elif asyncio.iscoroutine(handle):
                 await handle
+
+        async def handle_chat_speech_command(self, packet: Any) -> None:
+            text = _voice_chat_speech_command_text(
+                packet,
+                expected_participant_identity=self._runtime.participant_name,
+            )
+            if not text or self._closing:
+                return
+            self._last_spoken_response = text
+            await self._say(text, allow_interruptions=True)
 
         async def _publish_voice_event(
             self,
@@ -1601,11 +2416,64 @@ async def _voice_entrypoint(ctx: Any) -> None:
             if clear_buffer:
                 self._transcript_buffer.clear()
 
+        def _schedule_transcript_flush(self, *, delay_s: float | None = None) -> None:
+            self._cancel_pending_transcript_flush(clear_buffer=False)
+            if self._closing:
+                return
+            self._transcript_flush_task = asyncio.create_task(
+                self._flush_buffered_user_transcript(delay_s=delay_s),
+                name="ka2a_voice_flush_buffered_transcript",
+            )
+
+        async def _cancel_voice_request(self, cancellation_transcript: str) -> str:
+            """Cancel buffered or active work before it can produce a stale response."""
+            self._cancel_pending_transcript_flush(clear_buffer=True)
+            self._pending_clarification = None
+            active_task = self._active_delegation_task
+            active_turn_id = self._active_delegation_turn_id
+            if active_task is not None and not active_task.done():
+                active_task.cancel()
+
+            session = getattr(self, "session", None)
+            interrupt = getattr(session, "interrupt", None) if session is not None else None
+            if callable(interrupt):
+                try:
+                    interrupted = interrupt()
+                    if asyncio.iscoroutine(interrupted):
+                        await interrupted
+                except Exception:
+                    logger.debug("voice response interruption failed", exc_info=True)
+
+            response = "Okay, I cancelled that request. Please tell me what you want me to do instead."
+            self._last_progress_update = ""
+            self._last_spoken_response = response
+            await self._publish_visible_user_transcript(cancellation_transcript)
+            if active_turn_id:
+                await self._publish_voice_event(
+                    "result",
+                    response,
+                    payload={
+                        "turnId": active_turn_id,
+                        "voiceLocalResult": True,
+                        "cancelled": True,
+                    },
+                )
+            else:
+                await self._publish_voice_event("result", response, payload={"voiceLocalResult": True, "cancelled": True})
+            await self._say(response, allow_interruptions=True)
+            return response
+
         def queue_final_user_transcript(self, transcript: str) -> None:
             if self._closing:
                 return
             cleaned = _collapse_repeated_phrase(re.sub(r"\s+", " ", transcript.strip()))
             if not cleaned:
+                return
+            if _voice_is_cancellation_request(cleaned):
+                asyncio.create_task(
+                    self._cancel_voice_request(cleaned),
+                    name="ka2a_voice_cancel_request",
+                )
                 return
             if self._transcript_buffer and self._transcript_key(self._transcript_buffer[-1]) == self._transcript_key(cleaned):
                 return
@@ -1617,15 +2485,13 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 },
             )
             self._transcript_buffer.append(cleaned)
-            self._cancel_pending_transcript_flush(clear_buffer=False)
-            self._transcript_flush_task = asyncio.create_task(
-                self._flush_buffered_user_transcript(),
-                name="ka2a_voice_flush_buffered_transcript",
-            )
+            self._schedule_transcript_flush()
 
-        async def _flush_buffered_user_transcript(self) -> None:
+        async def _flush_buffered_user_transcript(self, *, delay_s: float | None = None) -> None:
             try:
-                await asyncio.sleep(max(0.4, _env_float("KA2A_VOICE_TRANSCRIPT_FLUSH_DELAY_S", 1.6)))
+                await asyncio.sleep(
+                    max(0.4, delay_s if delay_s is not None else _env_float("KA2A_VOICE_TRANSCRIPT_FLUSH_DELAY_S", 1.6))
+                )
             except asyncio.CancelledError:
                 return
             if self._closing:
@@ -1643,10 +2509,13 @@ async def _voice_entrypoint(ctx: Any) -> None:
                     continue
                 seen_fragment_keys.add(key)
                 unique_fragments.append(fragment)
-            transcript = _collapse_repeated_phrase(" ".join(unique_fragments))
+            transcript, remaining_fragments = _select_voice_transcript_batch(unique_fragments)
             if not transcript:
                 return
             await self._handle_voice_transcript(transcript, source="transcript_event")
+            if remaining_fragments and not self._closing:
+                self._transcript_buffer.extend(remaining_fragments)
+                self._schedule_transcript_flush()
 
         async def _watch_caller_presence(self) -> None:
             room_name = str(self._runtime.metadata.get("roomName") or self._runtime.metadata.get("room_name") or "").strip()
@@ -1701,7 +2570,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                     session.shutdown(drain=False)
                 return
             self._caller_watch_task = asyncio.create_task(self._watch_caller_presence())
-            greeting = "Voice session connected. I’m listening now."
+            greeting = _voice_session_greeting()
             await self._publish_voice_event("result", greeting)
             await self._say(greeting, allow_interruptions=False)
 
@@ -1712,7 +2581,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
             await self._publish_voice_event(
                 "status",
                 initial_status,
-                payload={"syncChat": True, "turnId": turn_id},
+                payload={"turnId": turn_id},
             )
             self._remember_progress_update(initial_status)
             await self._speak_progress_update(initial_status)
@@ -1733,7 +2602,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 await self._publish_voice_event(
                     "result",
                     final_text,
-                    payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
+                    payload={"turnId": turn_id, "voiceLocalResult": True},
                 )
                 return final_text
             except Exception:
@@ -1749,7 +2618,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 await self._publish_voice_event(
                     "result",
                     final_text,
-                    payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
+                    payload={"turnId": turn_id, "voiceLocalResult": True},
                 )
                 return final_text
             if self._closing:
@@ -1763,94 +2632,72 @@ async def _voice_entrypoint(ctx: Any) -> None:
                     "host_agent_name": self._host_agent_name,
                 },
             )
-            user_message = Message(
-                role=Role.user,
-                parts=[TextPart(text=transcript)],
-                metadata=_voice_request_metadata(self._runtime),
+            user_message = _voice_host_message(
+                runtime=self._runtime,
+                transcript=transcript,
+                context_id=self._voice_context_id,
             )
             request_metadata = _voice_request_metadata(self._runtime)
             response_candidates: list[str] = []
-            host_timeout_s = float(os.getenv("KA2A_VOICE_HOST_TIMEOUT_S") or "120")
-            first_event_timeout_s = float(os.getenv("KA2A_VOICE_HOST_FIRST_EVENT_TIMEOUT_S") or "20")
-            next_event_timeout_s = float(os.getenv("KA2A_VOICE_HOST_NEXT_EVENT_TIMEOUT_S") or "45")
             event_count = 0
             try:
-                async with asyncio.timeout(host_timeout_s):
-                    stream = await self._client.stream_message(
-                        agent_name=self._host_agent_name,
-                        message=user_message,
-                        metadata=request_metadata,
-                        timeout_s=host_timeout_s,
+                stream = await self._client.stream_message(
+                    agent_name=self._host_agent_name,
+                    message=user_message,
+                    metadata=request_metadata,
+                    timeout_s=None,
+                )
+                stream_iter = stream.__aiter__()
+                while True:
+                    # A business review may coordinate several specialists and
+                    # legitimately take minutes. Wait for the stream rather than
+                    # turning a healthy long-running task into a false failure.
+                    try:
+                        event = await anext(stream_iter)
+                    except StopAsyncIteration:
+                        break
+                    event_count += 1
+                    logger.info(
+                        "voice delegation received host stream event",
+                        extra={
+                            "profile_id": self._runtime.profile_id,
+                            "host_agent_name": self._host_agent_name,
+                            "turn_id": turn_id,
+                            "event_count": event_count,
+                            "event_type": type(event).__name__,
+                        },
                     )
-                    stream_iter = stream.__aiter__()
-                    while True:
-                        per_event_timeout_s = first_event_timeout_s if event_count == 0 else next_event_timeout_s
-                        try:
-                            event = await asyncio.wait_for(anext(stream_iter), timeout=per_event_timeout_s)
-                        except StopAsyncIteration:
-                            break
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "voice delegation stalled waiting for host stream event",
-                                extra={
-                                    "profile_id": self._runtime.profile_id,
-                                    "host_agent_name": self._host_agent_name,
-                                    "turn_id": turn_id,
-                                    "event_count": event_count,
-                                    "per_event_timeout_s": per_event_timeout_s,
-                                    "transcript_preview": _voice_log_preview(transcript),
-                                },
-                            )
-                            await self._publish_voice_event(
-                                "error",
-                                "The workspace agent is taking too long to respond.",
-                                payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
-                            )
-                            return (
-                                "The workspace agent is taking too long to respond. Please try again, or ask me to run it again."
-                            )
-                        event_count += 1
-                        logger.info(
-                            "voice delegation received host stream event",
-                            extra={
-                                "profile_id": self._runtime.profile_id,
-                                "host_agent_name": self._host_agent_name,
-                                "turn_id": turn_id,
-                                "event_count": event_count,
-                                "event_type": type(event).__name__,
-                            },
+                    if self._closing:
+                        raise asyncio.CancelledError()
+                    stream_payload = _stream_payload_from_event(event)
+                    if stream_payload.get("kind"):
+                        await self._publish_voice_event(
+                            "a2a_event",
+                            "",
+                            payload={"syncChat": True, "turnId": turn_id, "userText": transcript, "event": stream_payload},
                         )
-                        if self._closing:
-                            raise asyncio.CancelledError()
-                        stream_payload = _stream_payload_from_event(event)
-                        if stream_payload.get("kind"):
-                            await self._publish_voice_event(
-                                "a2a_event",
-                                "",
-                                payload={"syncChat": True, "turnId": turn_id, "event": stream_payload},
-                            )
-                        if isinstance(event, TaskStatusUpdateEvent):
-                            interim_status_text = _sanitize_voice_text(_assistant_message_text(event.status.message))
-                            if interim_status_text and not event.final:
-                                spoken_status_text = self._remember_progress_update(interim_status_text)
-                                if spoken_status_text:
-                                    await self._publish_voice_event("status", spoken_status_text, payload={"turnId": turn_id})
-                                    await self._speak_progress_update(spoken_status_text)
-                            status_text = _artifact_speakable_text(event)
-                            if event.final and status_text:
-                                response_candidates.append(status_text)
-                        elif isinstance(event, Task):
-                            task_text = _artifact_speakable_text(event)
-                            if task_text:
-                                response_candidates.append(task_text)
-                        elif isinstance(event, TaskArtifactUpdateEvent):
-                            artifact_text = _artifact_speakable_text(event)
-                            if artifact_text:
-                                response_candidates.append(artifact_text)
-                        else:
-                            event_text = _artifact_speakable_text(event)
-                            if event_text:
-                                response_candidates.append(event_text)
+                    if isinstance(event, TaskStatusUpdateEvent):
+                        interim_status_text = _sanitize_voice_text(_assistant_message_text(event.status.message))
+                        if interim_status_text and not event.final:
+                            spoken_status_text = self._remember_progress_update(interim_status_text)
+                            if spoken_status_text:
+                                await self._publish_voice_event("status", spoken_status_text, payload={"turnId": turn_id})
+                                await self._speak_progress_update(spoken_status_text)
+                        status_text = _artifact_speakable_text(event)
+                        if event.final and status_text:
+                            response_candidates.append(status_text)
+                    elif isinstance(event, Task):
+                        task_text = _artifact_speakable_text(event)
+                        if task_text:
+                            response_candidates.append(task_text)
+                    elif isinstance(event, TaskArtifactUpdateEvent):
+                        artifact_text = _artifact_speakable_text(event)
+                        if artifact_text:
+                            response_candidates.append(artifact_text)
+                    else:
+                        event_text = _artifact_speakable_text(event)
+                        if event_text:
+                            response_candidates.append(event_text)
             except asyncio.CancelledError:
                 logger.info(
                     "voice delegation cancelled before host stream started",
@@ -1862,7 +2709,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 raise
             except TimeoutError:
                 logger.warning(
-                    "voice delegation timed out waiting for host response",
+                    "voice delegation transport interrupted while waiting for host response",
                     extra={
                         "profile_id": self._runtime.profile_id,
                         "host_agent_name": self._host_agent_name,
@@ -1870,11 +2717,11 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 )
                 await self._publish_voice_event(
                     "error",
-                    "The analysis service is taking longer than expected.",
-                    payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
+                    "The workspace agent connection was interrupted before the result arrived.",
+                    payload={"turnId": turn_id, "voiceLocalResult": True},
                 )
                 return (
-                    "The analysis service is taking longer than expected. Please try again, or ask me to regenerate the analysis."
+                    "The workspace agent connection was interrupted before the result arrived. Please try again."
                 )
             except Exception as exc:
                 logger.warning(
@@ -1889,7 +2736,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 await self._publish_voice_event(
                     "error",
                     "I could not reach the analysis service right now.",
-                    payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
+                    payload={"turnId": turn_id, "voiceLocalResult": True},
                 )
                 return (
                     "I could not reach the analysis service right now. Please try again in a moment."
@@ -1914,13 +2761,26 @@ async def _voice_entrypoint(ctx: Any) -> None:
             )
             self._last_completed_result = final_text.strip()
             self._last_progress_update = ""
-            await self._publish_voice_event("result", final_text, payload={"syncChat": True, "turnId": turn_id})
+            await self._publish_voice_event(
+                "result",
+                final_text,
+                payload={"turnId": turn_id},
+            )
             return final_text.strip()
 
         async def _handle_voice_transcript(self, transcript: str, *, source: str, turn_ctx: Any | None = None) -> str | None:
             transcript = _collapse_repeated_phrase(re.sub(r"\s+", " ", transcript.strip()))
             if not transcript:
                 return None
+            if _voice_is_cancellation_request(transcript):
+                return await self._cancel_voice_request(transcript)
+            corrected_inventory_request = _voice_corrected_inventory_request(transcript)
+            if corrected_inventory_request:
+                active_task = self._active_delegation_task
+                if active_task is not None and not active_task.done():
+                    active_task.cancel()
+                self._pending_clarification = None
+                transcript = corrected_inventory_request
             if not self._mark_transcript_for_processing(transcript, source=source):
                 return None
             if _voice_status_requested(transcript):
@@ -1959,18 +2819,130 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 return repeat_text
 
             pending_clarification = self._pending_clarification
+            if pending_clarification is not None and _voice_supersedes_pending_clarification(transcript, pending_clarification):
+                logger.info(
+                    "voice transcript superseded pending clarification",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "source": source,
+                        "transcript_preview": _voice_log_preview(transcript),
+                        "clarification_kind": str(pending_clarification.get("kind") or ""),
+                    },
+                )
+                self._pending_clarification = None
+                pending_clarification = None
+
+            direct_reply = _voice_direct_reply(transcript)
+            if direct_reply and pending_clarification is None:
+                logger.info(
+                    "voice transcript handled as direct reply",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "source": source,
+                        "transcript_preview": _voice_log_preview(transcript),
+                    },
+                )
+                await self._publish_visible_user_transcript(transcript)
+                self._last_spoken_response = direct_reply
+                if turn_ctx is not None:
+                    turn_ctx.add_message(role="assistant", content=direct_reply)
+                await self._publish_voice_event("result", direct_reply)
+                await self._say(direct_reply, allow_interruptions=True)
+                return direct_reply
+
             if pending_clarification is not None:
                 await self._publish_visible_user_transcript(transcript)
-                if _voice_response_satisfies_clarification(transcript, pending_clarification):
+                clarification_kind = str(pending_clarification.get("kind") or "").strip()
+                if clarification_kind == "confirm":
+                    confirmation = _voice_confirmation_reply(transcript)
+                    candidate_request = str(pending_clarification.get("candidate_request") or "").strip()
+                    if confirmation == "yes" and candidate_request:
+                        transcript = candidate_request
+                        self._pending_clarification = None
+                    elif confirmation == "no":
+                        follow_up_prompt = (
+                            "Please restate the full request in one sentence and I will check it before I send it."
+                        )
+                        self._pending_clarification = {
+                            "kind": "continuation",
+                            "question": follow_up_prompt,
+                            "original": "",
+                        }
+                        self._last_spoken_response = follow_up_prompt
+                        if turn_ctx is not None:
+                            turn_ctx.add_message(role="assistant", content=follow_up_prompt)
+                        await self._publish_voice_event("result", follow_up_prompt)
+                        await self._say(follow_up_prompt, allow_interruptions=True)
+                        return follow_up_prompt
+                    elif _should_delegate_voice_transcript(transcript) and not _voice_is_likely_incomplete_fragment(transcript):
+                        self._pending_clarification = None
+                    else:
+                        confirm_prompt = str(
+                            pending_clarification.get("question")
+                            or "Please say yes if that summary is correct, or restate the request."
+                        )
+                        self._last_spoken_response = confirm_prompt
+                        if turn_ctx is not None:
+                            turn_ctx.add_message(role="assistant", content=confirm_prompt)
+                        await self._publish_voice_event("result", confirm_prompt)
+                        await self._say(confirm_prompt, allow_interruptions=True)
+                        return confirm_prompt
+                elif _voice_response_satisfies_clarification(transcript, pending_clarification):
+                    clarification_answer = transcript
                     transcript = _voice_merge_clarification_answer(
                         str(pending_clarification.get("original") or ""),
-                        transcript,
+                        clarification_answer,
                         pending_clarification,
                     )
-                    self._pending_clarification = None
-                elif _should_delegate_voice_transcript(transcript) and not _voice_is_likely_incomplete_fragment(transcript):
+                    if _voice_should_confirm_clarification_merge(
+                        str(pending_clarification.get("original") or ""),
+                        clarification_answer,
+                        transcript,
+                        pending_clarification,
+                    ):
+                        confirm_prompt = (
+                            "Just to confirm, do you want me to send this request: "
+                            f"{transcript}? Say yes to continue, or restate it."
+                        )
+                        self._pending_clarification = {
+                            "kind": "confirm",
+                            "question": confirm_prompt,
+                            "candidate_request": transcript,
+                        }
+                        self._last_spoken_response = confirm_prompt
+                        if turn_ctx is not None:
+                            turn_ctx.add_message(role="assistant", content=confirm_prompt)
+                        await self._publish_voice_event("result", confirm_prompt)
+                        await self._say(confirm_prompt, allow_interruptions=True)
+                        return confirm_prompt
                     self._pending_clarification = None
                 else:
+                    progressed_transcript = ""
+                    progressed_pending: dict[str, Any] | None = None
+                    if clarification_kind in {"continuation", "time_range"}:
+                        progressed_transcript, progressed_pending = _voice_progress_clarification(
+                            transcript,
+                            pending_clarification,
+                        )
+                    if progressed_pending is not None:
+                        logger.info(
+                            "voice clarification advanced to a more specific follow-up",
+                            extra={
+                                "profile_id": self._runtime.profile_id,
+                                "source": source,
+                                "transcript_preview": _voice_log_preview(progressed_transcript or transcript),
+                                "previous_clarification_kind": clarification_kind,
+                                "next_clarification_kind": str(progressed_pending.get("kind") or ""),
+                            },
+                        )
+                        self._pending_clarification = progressed_pending
+                        follow_up_prompt = str(progressed_pending.get("question") or "Please give me the missing detail.")
+                        self._last_spoken_response = follow_up_prompt
+                        if turn_ctx is not None:
+                            turn_ctx.add_message(role="assistant", content=follow_up_prompt)
+                        await self._publish_voice_event("result", follow_up_prompt)
+                        await self._say(follow_up_prompt, allow_interruptions=True)
+                        return follow_up_prompt
                     logger.info(
                         "voice transcript still waiting on clarification",
                         extra={
@@ -1990,6 +2962,29 @@ async def _voice_entrypoint(ctx: Any) -> None:
 
             clarification = _voice_clarification_requirement(transcript)
             if clarification:
+                if source == "transcript_event" and _voice_should_defer_fragment_clarification(transcript, clarification):
+                    key = self._transcript_key(transcript)
+                    max_attempts = max(1, int(os.getenv("KA2A_VOICE_DEFERRED_FRAGMENT_MAX_ATTEMPTS") or "2"))
+                    attempts = self._deferred_fragment_attempts.get(key, 0) + 1
+                    self._deferred_fragment_attempts[key] = attempts
+                    if attempts <= max_attempts:
+                        logger.info(
+                            "voice transcript clarification deferred while waiting for more speech",
+                            extra={
+                                "profile_id": self._runtime.profile_id,
+                                "source": source,
+                                "transcript_preview": _voice_log_preview(transcript),
+                                "clarification_kind": clarification["kind"],
+                                "attempt": attempts,
+                            },
+                        )
+                        self._transcript_buffer.insert(0, transcript)
+                        hold_delay_s = max(
+                            _env_float("KA2A_VOICE_TRANSCRIPT_FLUSH_DELAY_S", 1.6),
+                            _env_float("KA2A_VOICE_DEFERRED_FRAGMENT_DELAY_S", 2.8),
+                        )
+                        self._schedule_transcript_flush(delay_s=hold_delay_s)
+                        return None
                 logger.info(
                     "voice transcript needs clarification",
                     extra={
@@ -2012,23 +3007,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 await self._publish_voice_event("result", question)
                 await self._say(question, allow_interruptions=True)
                 return question
-            direct_reply = _voice_direct_reply(transcript)
-            if direct_reply:
-                logger.info(
-                    "voice transcript handled as direct reply",
-                    extra={
-                        "profile_id": self._runtime.profile_id,
-                        "source": source,
-                        "transcript_preview": _voice_log_preview(transcript),
-                    },
-                )
-                await self._publish_visible_user_transcript(transcript)
-                self._last_spoken_response = direct_reply
-                if turn_ctx is not None:
-                    turn_ctx.add_message(role="assistant", content=direct_reply)
-                await self._publish_voice_event("result", direct_reply)
-                await self._say(direct_reply, allow_interruptions=True)
-                return direct_reply
+            self._deferred_fragment_attempts.pop(self._transcript_key(transcript), None)
             if not _should_delegate_voice_transcript(transcript):
                 logger.info(
                     "voice transcript ignored as non-business audio",
@@ -2064,7 +3043,7 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 await self._publish_voice_event(
                     "result",
                     acknowledgement,
-                    payload={"syncChat": True, "turnId": turn_id, "voiceLocalResult": True},
+                    payload={"syncChat": True, "turnId": turn_id, "userText": transcript, "voiceLocalResult": True},
                 )
                 await self._say(acknowledgement, allow_interruptions=True)
                 return acknowledgement
@@ -2074,11 +3053,15 @@ async def _voice_entrypoint(ctx: Any) -> None:
                         raise asyncio.CancelledError()
                     delegation_task = asyncio.create_task(self._delegate_to_host(transcript, turn_id=turn_id))
                     self._active_delegation_task = delegation_task
+                    self._active_delegation_turn_id = turn_id
+                    self._active_delegation_transcript = transcript
                     try:
                         final_text = await delegation_task
                     finally:
                         if self._active_delegation_task is delegation_task:
                             self._active_delegation_task = None
+                            self._active_delegation_turn_id = None
+                            self._active_delegation_transcript = ""
             except asyncio.CancelledError:
                 return None
             if self._closing:
@@ -2095,6 +3078,9 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 raise StopResponse()
             self._cancel_pending_transcript_flush(clear_buffer=False)
             transcript = _collapse_repeated_phrase(_message_text(new_message))
+            if _voice_is_cancellation_request(transcript):
+                await self._cancel_voice_request(transcript)
+                raise StopResponse()
             # LiveKit can endpoint a user's sentence into multiple completed turns when
             # they pause mid-thought. Buffer completed turns and send one consolidated
             # prompt to A2A after a short silence window instead of delegating fragments.
@@ -2156,7 +3142,6 @@ async def _voice_entrypoint(ctx: Any) -> None:
     logger.info("voice room connect starting", extra={"profile_id": profile_id, "room": room_name})
     await ctx.connect()
     logger.info("voice room connected", extra={"profile_id": profile_id, "room": room_name})
-    await _publish_voice_room_event(ctx.room, "status", "Voice room connected. I’m preparing your workspace assistant.")
     principal = Principal(
         user_id=auth.user_id,
         tenant_id=auth.profile_id,
@@ -2253,6 +3238,16 @@ async def _voice_entrypoint(ctx: Any) -> None:
     logger.info("voice vad initializing", extra={"profile_id": profile_id, "room": room_name})
     vad = inference.VAD(model="silero", min_speech_duration=0.1, min_silence_duration=0.35)
     logger.info("voice vad initialized", extra={"profile_id": profile_id, "room": room_name})
+    endpoint_min_delay_s = max(0.5, _env_float("KA2A_VOICE_ENDPOINT_MIN_DELAY_S", 1.2))
+    endpoint_max_delay_s = max(endpoint_min_delay_s + 0.2, _env_float("KA2A_VOICE_ENDPOINT_MAX_DELAY_S", 2.6))
+    endpoint_alpha = min(0.99, max(0.1, _env_float("KA2A_VOICE_ENDPOINT_ALPHA", 0.9)))
+    tts_component = openai.TTS(
+        base_url=tts_base_url,
+        model=tts_model,
+        voice=tts_voice,
+        api_key=tts_api_key,
+    )
+
     session = AgentSession(
         stt=openai.STT(
             base_url=voice_base_url,
@@ -2265,19 +3260,20 @@ async def _voice_entrypoint(ctx: Any) -> None:
             model=llm_model,
             api_key=llm_api_key,
         ),
-        tts=openai.TTS(
-            base_url=tts_base_url,
-            model=tts_model,
-            voice=tts_voice,
-            api_key=tts_api_key,
-        ),
+        tts=tts_component,
         turn_handling=TurnHandlingOptions(
-            endpointing={"mode": "dynamic", "min_delay": 0.9, "max_delay": 2.0, "alpha": 0.85},
+            endpointing={"mode": "dynamic", "min_delay": endpoint_min_delay_s, "max_delay": endpoint_max_delay_s, "alpha": endpoint_alpha},
             interruption=InterruptionOptions(enabled=True, min_duration=0.1, min_words=1, resume_false_interruption=False),
             preemptive_generation={"enabled": False},
         ),
     )
     agent = Ka2aVoiceAgent(runtime=runtime, ai_setup=ai_setup, room=ctx.room)
+
+    def _on_chat_speech_command(packet: Any) -> None:
+        task = asyncio.create_task(agent.handle_chat_speech_command(packet))
+        task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
+
+    ctx.room.on("data_received", _on_chat_speech_command)
 
     def _on_user_input_transcribed(event: Any) -> None:
         if not bool(getattr(event, "is_final", False)):

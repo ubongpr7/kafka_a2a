@@ -212,7 +212,11 @@ def build_agents_router(
 
     def _auth_context(request: Request):
         token = get_bearer_token_from_request(request)
-        return build_agent_auth_context(token=token, jwt=jwt)
+        return build_agent_auth_context(
+            token=token,
+            jwt=jwt,
+            context_token=request.headers.get("x-intera-authorization-context"),
+        )
 
     def _runtime_access(request: Request) -> AgentRuntimeAccessContext:
         auth = _auth_context(request)

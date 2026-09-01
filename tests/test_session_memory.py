@@ -55,3 +55,34 @@ async def test_agent_builds_conversation_history_from_context() -> None:
         {"role": "assistant", "content": "your name is ubong"},
     ]
 
+
+@pytest.mark.asyncio
+async def test_agent_preserves_direct_structured_history_over_text_only_task_history() -> None:
+    store = InMemoryTaskStore()
+    transport = KafkaTransport(KafkaConfig(bootstrap_servers="localhost:9092"))
+    agent = Ka2aAgent(config=Ka2aAgentConfig(agent_name="t", context_history_turns=2), transport=transport, task_store=store)
+
+    context_id = "ctx-structured-history"
+    prior_message = Message(role="user", parts=[TextPart(text="analyze sales")], context_id=context_id)
+    prior_task = await store.create_task(initial_message=prior_message, context_id=context_id)
+    await store.append_artifact(task_id=prior_task.id, artifact=Artifact(name="result", parts=[TextPart(text="Sales summary")]))
+    current_message = Message(role="user", parts=[TextPart(text="group it by location")], context_id=context_id)
+    current_task = await store.create_task(initial_message=current_message, context_id=context_id)
+    direct_history = [
+        {"role": "user", "content": "analyze sales"},
+        {
+            "role": "assistant",
+            "content": "Sales summary",
+            "structured_payload": {"kind": "insight_response", "widgets": []},
+        },
+        {"role": "user", "content": "group it by location"},
+    ]
+
+    metadata = await agent._processor_metadata_for_request(  # type: ignore[attr-defined]
+        task=current_task,
+        configuration=None,
+        request_metadata={KA2A_CONVERSATION_HISTORY_METADATA_KEY: direct_history},
+    )
+
+    assert metadata is not None
+    assert metadata[KA2A_CONVERSATION_HISTORY_METADATA_KEY] == direct_history

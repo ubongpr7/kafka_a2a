@@ -877,6 +877,18 @@ class Ka2aAgent:
         configuration: TaskConfiguration | None,
         request_metadata: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
+        # The browser/voice gateway can supply a richer transcript than the
+        # task store: notably, completed insight widgets live on assistant
+        # history entries.  Do not replace that payload with the task-store's
+        # text-only reconstruction or follow-up routing loses its domain.
+        direct_history = (request_metadata or {}).get(KA2A_CONVERSATION_HISTORY_METADATA_KEY)
+        if isinstance(direct_history, list) and any(
+            isinstance(item, dict)
+            and isinstance(item.get("structured_payload") or item.get("structuredPayload"), dict)
+            for item in direct_history
+        ):
+            return request_metadata
+
         history_turns = self._history_turns(configuration)
         if history_turns <= 0:
             return request_metadata

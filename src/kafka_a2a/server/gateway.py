@@ -9,7 +9,7 @@ from typing import Any
 from typing import NoReturn
 from uuid import uuid4
 
-from kafka_a2a.agent_filter import filter_agent_cards
+from kafka_a2a.agent_filter import card_public_slug, card_profile_id, filter_agent_cards
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.core.config import A2AAppSettings
 from kafka_a2a.errors import A2AError, A2AErrorCode
@@ -56,6 +56,10 @@ class GatewayConfig:
 
 _DEFAULT_CORS_ALLOW_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 _LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_agent_lookup(value: str | None) -> str:
+    return "".join(ch for ch in str(value or "").strip().lower() if ch.isalnum())
 
 
 def _parse_csv_env(name: str) -> list[str]:
@@ -285,14 +289,22 @@ def create_gateway_app(config: GatewayConfig):
             payload["contextId"] = context_id
         return payload
 
-    async def _principal_from_token(token: str):
-        auth_context = build_agent_auth_context(token=token, jwt=config.jwt)
+    async def _principal_from_token(token: str, context_token: str | None = None):
+        auth_context = build_agent_auth_context(token=token, jwt=config.jwt, context_token=context_token)
         principal = verify_bearer_jwt(token=token, config=config.jwt)  # type: ignore[arg-type]
         claims = dict(principal.claims or {})
-        overrides = await run_in_threadpool(
-            agent_control_plane.build_principal_claim_overrides,
-            profile_id=auth_context.profile_id,
-        )
+        try:
+            overrides = await run_in_threadpool(
+                agent_control_plane.build_principal_claim_overrides,
+                profile_id=auth_context.profile_id,
+            )
+        except Exception:
+            _LOGGER.warning(
+                "failed to load principal claim overrides; continuing with verified JWT claims only",
+                extra={"profile_id": auth_context.profile_id},
+                exc_info=True,
+            )
+            overrides = {}
         claims.update(overrides)
         principal.claims = claims
         return principal
@@ -317,7 +329,7 @@ def create_gateway_app(config: GatewayConfig):
         if not token:
             raise HTTPException(status_code=401, detail="Authentication required")
 
-        principal = await _principal_from_token(token)
+        principal = await _principal_from_token(token, request.headers.get("x-intera-authorization-context"))
         metadata = with_principal({}, principal)
         return ensure_trace_metadata(metadata, headers=request.headers)
 
@@ -325,7 +337,7 @@ def create_gateway_app(config: GatewayConfig):
         metadata: dict[str, Any] | None = None
         token = _token_from_request(request)
         if token and config.jwt is not None:
-            principal = await _principal_from_token(token)
+            principal = await _principal_from_token(token, request.headers.get("x-intera-authorization-context"))
             metadata = with_principal({}, principal)
         return ensure_trace_metadata(metadata, headers=request.headers)
 
@@ -384,13 +396,59 @@ def create_gateway_app(config: GatewayConfig):
             return None
         return await _workspace_agent_card_from_authorization(authorization, public_agent_name)
 
+    def _profile_id_from_request(request: Request) -> str | None:
+        authorization = _authorization_from_request(request)
+        if not authorization or config.jwt is None:
+            return None
+        try:
+            return _runtime_access_from_authorization(authorization).profile_id
+        except HTTPException:
+            return None
+
+    def _resolve_runtime_name_from_directory(request: Request, public_agent_name: str) -> str | None:
+        requested = _normalize_agent_lookup(public_agent_name)
+        if not requested:
+            return None
+        cards = filter_agent_cards(
+            directory.list(),
+            required_profile_id=_profile_id_from_request(request),
+        )
+        fallback: str | None = None
+        for card in cards:
+            candidates = (card_public_slug(card), card.name)
+            for candidate in candidates:
+                normalized_candidate = _normalize_agent_lookup(candidate)
+                if not normalized_candidate:
+                    continue
+                if normalized_candidate == requested:
+                    return card.name
+                if (
+                    fallback is None
+                    and (normalized_candidate.startswith(requested) or requested.startswith(normalized_candidate))
+                ):
+                    fallback = card.name
+        return fallback
+
     async def _resolve_runtime_agent_name(request: Request, public_agent_name: str | None) -> str:
         requested = (public_agent_name or config.default_agent).strip()
-        agent_config = await _workspace_agent_config(request, requested)
+        try:
+            agent_config = await _workspace_agent_config(request, requested)
+        except HTTPException as exc:
+            fallback = _resolve_runtime_name_from_directory(request, requested)
+            if fallback:
+                _LOGGER.warning(
+                    "failed to resolve runtime agent config from control plane; using registry fallback",
+                    extra={"requested_agent": requested, "fallback_agent": fallback, "status_code": exc.status_code},
+                    exc_info=True,
+                )
+                return fallback
+            raise
         if agent_config is None:
-            return requested
+            return _resolve_runtime_name_from_directory(request, requested) or requested
         runtime_name = str(agent_config.get("runtime_name") or "").strip()
-        return runtime_name or requested
+        if runtime_name:
+            return runtime_name
+        return _resolve_runtime_name_from_directory(request, requested) or requested
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -566,7 +624,11 @@ def create_gateway_app(config: GatewayConfig):
             metadata = await _require_request_metadata(request)
             metadata = _attach_direct_stream_history(metadata, body)
             auth_context = (
-                build_agent_auth_context(token=_token_from_request(request) or "", jwt=config.jwt)
+                build_agent_auth_context(
+                    token=_token_from_request(request) or "",
+                    jwt=config.jwt,
+                    context_token=request.headers.get("x-intera-authorization-context"),
+                )
                 if config.jwt is not None
                 else None
             )
@@ -649,7 +711,11 @@ def create_gateway_app(config: GatewayConfig):
             metadata = await _require_request_metadata(request)
             metadata = _attach_direct_stream_history(metadata, body)
             auth_context = (
-                build_agent_auth_context(token=_token_from_request(request) or "", jwt=config.jwt)
+                build_agent_auth_context(
+                    token=_token_from_request(request) or "",
+                    jwt=config.jwt,
+                    context_token=request.headers.get("x-intera-authorization-context"),
+                )
                 if config.jwt is not None
                 else None
             )

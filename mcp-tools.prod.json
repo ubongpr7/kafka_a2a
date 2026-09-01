@@ -107,7 +107,6 @@
             "revoke_company_invitation",
             "accept_company_invitation",
             "decline_company_invitation",
-            "remove_company_staff",
             "list_company_roles",
             "list_company_groups",
             "get_staff_profile",
@@ -163,7 +162,8 @@
             "get_product_dashboard_stats",
             "get_product_stock_alerts",
             "get_variant_lookup",
-            "get_top_catalog_matches"
+            "get_top_catalog_matches",
+            "list_global_catalog_products"
           ]
         },
         {
@@ -208,8 +208,7 @@
             "search_products",
           "get_product_details",
           "get_product_categories",
-          "update_product",
-          "search_product_variants",
+            "search_product_variants",
           "get_product_analytics",
           "get_product_variant_details",
           "get_product_attributes",
@@ -217,7 +216,8 @@
           "get_product_dashboard_stats",
           "get_product_stock_alerts",
           "get_variant_lookup",
-          "get_top_catalog_matches"
+          "get_top_catalog_matches",
+          "list_global_catalog_products"
         ]
       },
       {
@@ -243,8 +243,6 @@
             "update_product",
             "create_product_variant",
             "update_product_variant",
-            "delete_product",
-            "delete_product_variant",
             "export_product_catalog_csv",
             "export_product_variant_csv",
             "trigger_ai_bulk_product_create",
@@ -270,16 +268,12 @@
             "list_product_attribute_links",
             "create_product_attribute_link",
             "update_product_attribute_link",
-            "delete_product_attribute_link",
             "create_product_attribute_value",
             "update_product_attribute_value",
-            "delete_product_attribute_value",
             "toggle_product_attribute_value_active",
             "list_variant_media",
             "add_variant_media",
-            "remove_variant_media",
-            "set_attachment_primary",
-            "remove_attachment"
+            "set_attachment_primary"
           ]
         }
       ]
@@ -299,10 +293,8 @@
             "get_product_price_trends",
             "create_pricing_strategy",
             "update_pricing_strategy",
-            "delete_pricing_strategy",
             "create_pricing_rule",
             "update_pricing_rule",
-            "delete_pricing_rule",
             "toggle_pricing_rule_active",
             "approve_price_change",
             "reject_price_change",
@@ -405,7 +397,6 @@
             "list_purchase_order_line_items",
             "add_purchase_order_line_item",
             "update_purchase_order_line_item",
-            "remove_purchase_order_line_item",
             "download_purchase_order_pdf",
             "resend_purchase_order_email"
           ]
@@ -458,8 +449,7 @@
             "list_sales_order_line_items",
             "get_sales_order_shipments",
             "add_sales_order_line_item",
-            "update_sales_order_line_item",
-            "remove_sales_order_line_item"
+            "update_sales_order_line_item"
           ]
         }
       ]
@@ -478,7 +468,6 @@
             "get_or_create_pos_draft_order",
             "add_item_to_pos_order",
             "update_pos_order_item",
-            "remove_item_from_pos_order",
             "apply_discount_to_pos_order",
             "add_tip_to_pos_order",
             "get_pos_order_inventory_summary",
@@ -531,7 +520,6 @@
             "create_pos_customer",
             "update_pos_customer",
             "create_pos_table",
-            "update_pos_table",
             "create_pos_discount",
             "update_pos_discount"
           ]

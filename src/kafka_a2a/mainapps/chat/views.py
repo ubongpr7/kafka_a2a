@@ -48,8 +48,8 @@ class ChatRouterDependencies:
 def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
     router = APIRouter(tags=["chat"])
 
-    async def _principal_from_token(token: str):
-        auth_context = build_agent_auth_context(token=token, jwt=deps.jwt)
+    async def _principal_from_token(token: str, context_token: str | None = None):
+        auth_context = build_agent_auth_context(token=token, jwt=deps.jwt, context_token=context_token)
         principal = verify_bearer_jwt(token=token, config=deps.jwt)  # type: ignore[arg-type]
         claims = dict(principal.claims or {})
         overrides = await run_in_threadpool(
@@ -60,12 +60,12 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         principal.claims = claims
         return principal
 
-    def _auth_context_from_authorization(authorization: str):
+    def _auth_context_from_authorization(authorization: str, context_token: str | None = None):
         try:
             token = parse_authorization_header(authorization)
         except JwtVerificationError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
-        return build_agent_auth_context(token=token, jwt=deps.jwt)
+        return build_agent_auth_context(token=token, jwt=deps.jwt, context_token=context_token)
 
     def _authorization_from_request(request: Request) -> str | None:
         value = request.headers.get("authorization")
@@ -89,16 +89,10 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         return None
 
     def _token_from_websocket(websocket: WebSocket) -> str | None:
-        auth_header = websocket.headers.get("authorization")
-        if auth_header:
-            try:
-                return parse_authorization_header(auth_header)
-            except JwtVerificationError:
-                return None
-        query_token = (websocket.query_params.get("token") or "").strip()
+        query_token = (websocket.query_params.get("ws_ticket") or "").strip()
         if query_token:
             return query_token
-        return _parse_access_token_cookie(websocket.headers.get("cookie"))
+        return None
 
     def _runtime_access_from_authorization(authorization: str):
         auth = _auth_context_from_authorization(authorization)
@@ -338,7 +332,7 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         authorization = _authorization_from_request(request)
         if not authorization:
             raise HTTPException(status_code=401, detail="Authorization header is required.")
-        auth = _auth_context_from_authorization(authorization)
+        auth = _auth_context_from_authorization(authorization, request.headers.get("x-intera-authorization-context"))
         status = request.query_params.get("status")
         limit_raw = request.query_params.get("limit")
         limit = int(limit_raw) if limit_raw and limit_raw.isdigit() else None
@@ -355,7 +349,7 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         authorization = _authorization_from_request(request)
         if not authorization:
             raise HTTPException(status_code=401, detail="Authorization header is required.")
-        auth = _auth_context_from_authorization(authorization)
+        auth = _auth_context_from_authorization(authorization, request.headers.get("x-intera-authorization-context"))
         agent_config = await _workspace_agent_config_from_authorization(authorization, body.agent_slug)
         agent_slug = str(agent_config.get("slug") or body.agent_slug).strip()
         agent_name = str(agent_config.get("name") or agent_slug).strip() or agent_slug
@@ -385,7 +379,7 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         authorization = _authorization_from_request(request)
         if not authorization:
             raise HTTPException(status_code=401, detail="Authorization header is required.")
-        auth = _auth_context_from_authorization(authorization)
+        auth = _auth_context_from_authorization(authorization, request.headers.get("x-intera-authorization-context"))
         detail = await deps.chat_store.get_conversation_detail(
             conversation_id=conversation_id,
             profile_id=auth.profile_id,
@@ -400,7 +394,7 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         authorization = _authorization_from_request(request)
         if not authorization:
             raise HTTPException(status_code=401, detail="Authorization header is required.")
-        auth = _auth_context_from_authorization(authorization)
+        auth = _auth_context_from_authorization(authorization, request.headers.get("x-intera-authorization-context"))
         conversation = await deps.chat_store.get_conversation(
             conversation_id=conversation_id,
             profile_id=auth.profile_id,
@@ -425,7 +419,7 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
         authorization = _authorization_from_request(request)
         if not authorization:
             raise HTTPException(status_code=401, detail="Authorization header is required.")
-        auth = _auth_context_from_authorization(authorization)
+        auth = _auth_context_from_authorization(authorization, request.headers.get("x-intera-authorization-context"))
         deleted = await deps.chat_store.delete_conversation(
             conversation_id=conversation_id,
             profile_id=auth.profile_id,
@@ -722,7 +716,11 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
             return
         try:
             authorization = f"Bearer {token}"
-            auth = _auth_context_from_authorization(authorization)
+            auth = _auth_context_from_authorization(
+                authorization,
+                websocket.headers.get("x-intera-authorization-context")
+                or websocket.query_params.get("ws_ticket"),
+            )
             detail = await deps.chat_store.get_conversation_detail(
                 conversation_id=conversation_id,
                 profile_id=auth.profile_id,
@@ -771,7 +769,11 @@ def build_chat_router(*, deps: ChatRouterDependencies) -> APIRouter:
                     if conversation is None:
                         await websocket.send_json({"type": "error", "message": "Conversation not found."})
                         continue
-                    principal = await _principal_from_token(token)
+                    principal = await _principal_from_token(
+                        token,
+                        websocket.headers.get("x-intera-authorization-context")
+                        or websocket.query_params.get("ws_ticket"),
+                    )
                     await _run_conversation_stream(
                         websocket=websocket,
                         authorization=authorization,

@@ -872,50 +872,6 @@ class FakeToolExecutor(ToolExecutor):
             agent_name = str(arguments.get("agent_name") or "product")
             delegated_task_id = str(arguments.get("delegated_task_id") or "")
             if agent_name == "onboarding":
-                normalized_request = request.lower()
-                if (
-                    "import" in normalized_request
-                    and "product" in normalized_request
-                    and ("inventory" in normalized_request or "catalog" in normalized_request)
-                ):
-                    return {
-                        "selected_agent": "onboarding",
-                        "delegated_task_id": "delegated-onboarding-product-import",
-                        "response_text": "",
-                        "result_parts": [
-                            {
-                                "kind": "data",
-                                "data": {
-                                    "interaction_type": "multiple_choice",
-                                    "title": "Choose Catalog Filters",
-                                    "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
-                                    "options": [
-                                        {"value": "category", "label": "Product Category"},
-                                        {"value": "brand", "label": "Brand"},
-                                        {"value": "both", "label": "Both Category and Brand"},
-                                    ],
-                                    "multiple": False,
-                                    "allow_input": True,
-                                    "workflow": "product_import",
-                                    "workflow_stage": "catalog_scope_prompt",
-                                    "onboarding_scope": "product_onboarding",
-                                },
-                            }
-                        ],
-                        "artifacts": {},
-                        "status_updates": [
-                            {
-                                "state": "submitted",
-                                "message": "delegated task submitted",
-                                "final": False,
-                            },
-                            {
-                                "state": "input-required",
-                                "message": "Do you want to browse products by category, by brand, or by both?",
-                                "final": True,
-                            },
-                        ],
-                    }
                 if "Collected onboarding data JSON" in request:
                     return {
                         "selected_agent": "onboarding",
@@ -942,6 +898,49 @@ class FakeToolExecutor(ToolExecutor):
                             {
                                 "state": "completed",
                                 "message": "Created 3 stock locations, 2 inventory categories, and 1 inventory item for onboarding.",
+                                "final": True,
+                            },
+                        ],
+                    }
+                normalized_request = request.lower()
+                if (
+                    "import" in normalized_request
+                    and "product" in normalized_request
+                    and ("inventory" in normalized_request or "catalog" in normalized_request)
+                ):
+                    return {
+                        "selected_agent": "onboarding",
+                        "delegated_task_id": "delegated-onboarding-product-import",
+                        "response_text": "",
+                        "result_parts": [
+                            {
+                                "kind": "data",
+                                "data": {
+                                    "interaction_type": "multiple_choice",
+                                    "title": "Choose Catalog Filters",
+                                    "description": "I can import products from the global catalog. Do you want to browse by category or by brand?",
+                                    "options": [
+                                        {"value": "category", "label": "Product Category"},
+                                        {"value": "brand", "label": "Brand"},
+                                    ],
+                                    "multiple": False,
+                                    "allow_input": True,
+                                    "workflow": "product_import",
+                                    "workflow_stage": "catalog_scope_prompt",
+                                    "onboarding_scope": "product_onboarding",
+                                },
+                            }
+                        ],
+                        "artifacts": {},
+                        "status_updates": [
+                            {
+                                "state": "submitted",
+                                "message": "delegated task submitted",
+                                "final": False,
+                            },
+                            {
+                                "state": "input-required",
+                                "message": "Do you want to browse by category or by brand?",
                                 "final": True,
                             },
                         ],
@@ -1023,6 +1022,66 @@ class FakeToolExecutor(ToolExecutor):
                         },
                     ],
                 }
+            if agent_name == "pos" and "analyze my business performance for the last quarter" in request.lower():
+                return {
+                    "selected_agent": "pos",
+                    "delegated_task_id": "delegated-pos-business-review",
+                    "response_text": "Sales performance for the last quarter is ready. Revenue was strongest in the final month and repeat purchasing improved.",
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": "Sales performance for the last quarter is ready. Revenue was strongest in the final month and repeat purchasing improved.",
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "working",
+                            "message": "reviewing quarterly sales performance",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Sales performance for the last quarter is ready. Revenue was strongest in the final month and repeat purchasing improved.",
+                            "final": True,
+                        },
+                    ],
+                }
+            if agent_name == "pos" and "continue the user's multi-domain business review" in request.lower():
+                return {
+                    "selected_agent": "pos",
+                    "delegated_task_id": "delegated-pos-business-review-generic",
+                    "response_text": "Sales performance for the requested review period is ready. Revenue stayed resilient, order frequency was uneven across locations, and repeat purchasing remained a key growth lever.",
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": "Sales performance for the requested review period is ready. Revenue stayed resilient, order frequency was uneven across locations, and repeat purchasing remained a key growth lever.",
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "working",
+                            "message": "reviewing sales performance for the requested period",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Sales performance for the requested review period is ready. Revenue stayed resilient, order frequency was uneven across locations, and repeat purchasing remained a key growth lever.",
+                            "final": True,
+                        },
+                    ],
+                }
             if agent_name == "inventory" and "Collected onboarding data JSON" in request:
                 return {
                     "selected_agent": "inventory",
@@ -1049,6 +1108,39 @@ class FakeToolExecutor(ToolExecutor):
                         {
                             "state": "completed",
                             "message": "Created 1 stock location, 3 inventory categories, and 1 inventory item for onboarding.",
+                            "final": True,
+                        },
+                    ],
+                }
+            if (
+                agent_name == "inventory"
+                and "continue the user's multi-domain business review" in request.lower()
+            ):
+                return {
+                    "selected_agent": "inventory",
+                    "delegated_task_id": "delegated-inventory-business-review",
+                    "response_text": "Inventory health for the requested review period is ready. Stock posture was stable overall, slow movers tied up capital, several reorder candidates emerged, and fulfillment delays were concentrated in a small set of locations.",
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": "Inventory health for the requested review period is ready. Stock posture was stable overall, slow movers tied up capital, several reorder candidates emerged, and fulfillment delays were concentrated in a small set of locations.",
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "working",
+                            "message": "reviewing full inventory health for the requested period",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Inventory health for the requested review period is ready. Stock posture was stable overall, slow movers tied up capital, several reorder candidates emerged, and fulfillment delays were concentrated in a small set of locations.",
                             "final": True,
                         },
                     ],
@@ -1162,6 +1254,31 @@ class FakeToolExecutor(ToolExecutor):
                         },
                     ],
                 }
+            if agent_name == "product" and "continue the user's multi-domain business review" in request.lower():
+                return {
+                    "selected_agent": "product",
+                    "delegated_task_id": "delegated-product-business-review",
+                    "response_text": "Product catalog health for the requested review period is ready. Top-selling demand clustered in a few families, several assortment gaps were visible, and a small set of duplicate-code risks should be cleaned up.",
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": "Product catalog health for the requested review period is ready. Top-selling demand clustered in a few families, several assortment gaps were visible, and a small set of duplicate-code risks should be cleaned up.",
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Product catalog health for the requested review period is ready. Top-selling demand clustered in a few families, several assortment gaps were visible, and a small set of duplicate-code risks should be cleaned up.",
+                            "final": True,
+                        },
+                    ],
+                }
             if agent_name == "product" and "continue the user's multi-domain workflow" in request.lower():
                 return {
                     "selected_agent": "product",
@@ -1202,7 +1319,62 @@ class FakeToolExecutor(ToolExecutor):
                         },
                     ],
                 }
+            if agent_name == "inventory_visibility" and "comprehensive inventory health review" in request.lower():
+                return {
+                    "selected_agent": "inventory_visibility",
+                    "delegated_task_id": "delegated-inventory-visibility-business-review",
+                    "response_text": "Comprehensive inventory health is ready. Stock posture stayed stable overall, reorder pressure was concentrated in a few SKUs, slow movers tied up capital, and receiving delays added localized fulfillment risk.",
+                    "result_parts": [
+                        {
+                            "kind": "text",
+                            "text": "Comprehensive inventory health is ready. Stock posture stayed stable overall, reorder pressure was concentrated in a few SKUs, slow movers tied up capital, and receiving delays added localized fulfillment risk.",
+                        }
+                    ],
+                    "artifacts": {},
+                    "status_updates": [
+                        {
+                            "state": "submitted",
+                            "message": "delegated task submitted",
+                            "final": False,
+                        },
+                        {
+                            "state": "working",
+                            "message": "reviewing comprehensive inventory health",
+                            "final": False,
+                        },
+                        {
+                            "state": "completed",
+                            "message": "Comprehensive inventory health is ready. Stock posture stayed stable overall, reorder pressure was concentrated in a few SKUs, slow movers tied up capital, and receiving delays added localized fulfillment risk.",
+                            "final": True,
+                        },
+                    ],
+                }
             if agent_name == "users":
+                if "continue the user's multi-domain business review" in request.lower():
+                    return {
+                        "selected_agent": "users",
+                        "delegated_task_id": "delegated-users-business-review",
+                        "response_text": "Workspace controls for the requested review period are ready. Staff activity was concentrated in a few operators, audit activity stayed normal overall, and there was no immediate subscription-capacity pressure.",
+                        "result_parts": [
+                            {
+                                "kind": "text",
+                                "text": "Workspace controls for the requested review period are ready. Staff activity was concentrated in a few operators, audit activity stayed normal overall, and there was no immediate subscription-capacity pressure.",
+                            }
+                        ],
+                        "artifacts": {},
+                        "status_updates": [
+                            {
+                                "state": "submitted",
+                                "message": "delegated task submitted",
+                                "final": False,
+                            },
+                            {
+                                "state": "completed",
+                                "message": "Workspace controls for the requested review period are ready. Staff activity was concentrated in a few operators, audit activity stayed normal overall, and there was no immediate subscription-capacity pressure.",
+                                "final": True,
+                            },
+                        ],
+                    }
                 if "how many staff" in request.lower():
                     return {
                         "selected_agent": "users",
@@ -1668,6 +1840,18 @@ class FakeToolExecutorWithCategoryFailures(FakeToolExecutor):
         super().__init__(agent_name=agent_name, failing_tools={"inventory.create_inventory_category"})
 
 
+class FakeToolExecutorWithGlobalImportFailure(FakeToolExecutor):
+    async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
+        result = await super().call_tool(name=name, arguments=arguments, ctx=ctx)
+        if name != "product.import_global_catalog_products":
+            return result
+        return {
+            "isError": True,
+            "error": "401 Unauthorized from product catalog MCP",
+            "content": [{"type": "text", "text": "401 Unauthorized from product catalog MCP"}],
+        }
+
+
 class FakeWrappedLookupToolExecutor(FakeToolExecutor):
     async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
         result = await super().call_tool(name=name, arguments=arguments, ctx=ctx)
@@ -1741,6 +1925,10 @@ def build_fake_tool_executor_without_users_or_onboarding(*, agent_name: str | No
 
 def build_fake_tool_executor_with_category_failures(*, agent_name: str | None = None) -> ToolExecutor:
     return FakeToolExecutorWithCategoryFailures(agent_name=agent_name)
+
+
+def build_fake_tool_executor_with_global_import_failure(*, agent_name: str | None = None) -> ToolExecutor:
+    return FakeToolExecutorWithGlobalImportFailure(agent_name=agent_name)
 
 
 def build_fake_wrapped_lookup_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:

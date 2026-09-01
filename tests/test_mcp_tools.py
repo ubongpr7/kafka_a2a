@@ -314,6 +314,25 @@ def test_prod_config_splits_heavy_domains_into_focused_subagents() -> None:
         assert tool_count > 0
 
 
+def test_mcp_configs_do_not_advertise_destructive_agent_tools() -> None:
+    config_dir = Path(__file__).resolve().parents[1]
+    for filename in ("mcp-tools.local.json", "mcp-tools.dev.json", "mcp-tools.prod.json"):
+        raw = json.loads((config_dir / filename).read_text(encoding="utf-8"))
+        configured_tools = [
+            tool_name
+            for agent in (raw.get("agents") or {}).values()
+            if isinstance(agent, dict)
+            for server in (agent.get("servers") or [])
+            if isinstance(server, dict)
+            for tool_name in (server.get("tools") or [])
+        ]
+        assert not [
+            tool_name
+            for tool_name in configured_tools
+            if str(tool_name).startswith(("delete_", "remove_"))
+        ]
+
+
 @pytest.mark.asyncio
 async def test_multi_mcp_executor_routes_tools_and_forwards_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
     from kafka_a2a import mcp_tools
@@ -407,6 +426,61 @@ async def test_multi_mcp_executor_routes_tools_and_forwards_bearer(monkeypatch: 
     assert inventory_call["op"] == "call_tool"
     assert inventory_call["tool_name"] == "reserve_stock"
     assert inventory_call["headers"]["authorization"] == "Bearer jwt-abc"
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_hides_and_rejects_destructive_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    from kafka_a2a import mcp_tools
+
+    remote_calls: list[str] = []
+
+    async def fake_run_mcp_session(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        operation: str,
+        callback: Any,
+        remote_tool: str | None = None,
+        argument_keys: list[str] | None = None,
+    ) -> Any:
+        _ = server_url, headers, timeout_s, operation, remote_tool, argument_keys
+
+        class _Session:
+            async def list_tools(self) -> Any:
+                return {
+                    "tools": [
+                        {"name": "search_products", "description": "Search products"},
+                        {"name": "delete_product", "description": "Delete product"},
+                    ]
+                }
+
+            async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+                _ = arguments
+                remote_calls.append(name)
+                return {"tool": name}
+
+        return await callback(_Session())
+
+    monkeypatch.setattr(mcp_tools, "_run_mcp_session", fake_run_mcp_session)
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            servers=[
+                McpServerConfig(
+                    id="products",
+                    server_url="http://products-mcp:8000/mcp",
+                    tool_name_prefix="product.",
+                    tools=["search_products", "delete_product"],
+                    auth=McpServerAuthConfig(mode="none"),
+                )
+            ]
+        )
+    )
+
+    assert [tool.name for tool in await executor.list_tools(ctx=ToolContext())] == ["product.search_products"]
+    with pytest.raises(RuntimeError, match="Unknown tool"):
+        await executor.call_tool(name="product.delete_product", arguments={"product_id": "p-1"}, ctx=ToolContext())
+    assert remote_calls == []
 
 
 @pytest.mark.asyncio

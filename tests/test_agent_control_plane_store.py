@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+import sqlalchemy as sa
+
 from kafka_a2a.core.config import A2AAppSettings
 from kafka_a2a.mainapps.agents.db import DatabaseAgentControlPlaneStore
-from kafka_a2a.mainapps.agents.models import WorkspaceAgent, WorkspaceAiSettings, WorkspaceToolConnection
+from kafka_a2a.mainapps.agents.models import AgentControlPlaneState, AgentSkill, WorkspaceAgent, WorkspaceAiSettings, WorkspaceToolConnection
 from kafka_a2a.mainapps.agents.services import AgentControlPlaneService, AgentRuntimeAccessContext
 from kafka_a2a.mainapps.agents.storage import JsonAgentControlPlaneStore
 
@@ -64,6 +67,150 @@ def test_database_store_supports_record_upsert_and_delete(tmp_path: Path) -> Non
 
     assert deleted == 1
     assert store.get_record("workspace_agents", record_id=record.id) is None
+
+
+def test_database_store_loads_a_complete_relational_snapshot(tmp_path: Path) -> None:
+    store = DatabaseAgentControlPlaneStore(f"sqlite:///{tmp_path / 'control-plane.sqlite3'}")
+    agent = WorkspaceAgent(
+        profile="7",
+        slug="ops-helper",
+        name="Ops Helper",
+        description="Operations agent.",
+        origin="custom",
+    )
+    skill = AgentSkill(key="ops", name="Operations", description="Operations support.")
+    store.save(AgentControlPlaneState(workspace_agents=[agent], skills=[skill]))
+
+    loaded = store.load()
+
+    assert [item.slug for item in loaded.workspace_agents] == ["ops-helper"]
+    assert [item.key for item in loaded.skills] == ["ops"]
+
+
+def test_internal_runtime_registry_reuses_its_snapshot_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    service = AgentControlPlaneService(store=JsonAgentControlPlaneStore(settings.control_plane_store_path), settings=settings)
+    agent = WorkspaceAgent(profile="7", slug="ops-helper", name="Ops Helper", description="Operations agent.")
+    calls: list[str] = []
+
+    monkeypatch.setattr(service, "_list_workspace_agent_records", lambda **kwargs: [agent])
+
+    def _runtime_payloads(received_agents):
+        calls.append("payload")
+        assert received_agents == [agent]
+        return [{"slug": agent.slug}]
+
+    monkeypatch.setattr(service, "_runtime_config_payloads_for_agents", _runtime_payloads)
+
+    first = service.internal_runtime_registry()
+    second = service.internal_runtime_registry()
+
+    assert first == {"agent_count": 1, "agents": [{"slug": "ops-helper"}]}
+    assert second == first
+    assert calls == ["payload"]
+
+
+def test_database_store_skips_postgres_schema_reflection_when_tables_exist(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = DatabaseAgentControlPlaneStore("postgresql://user:password@example.test/control_plane")
+    create_all_calls: list[object] = []
+
+    class _FakeDialect:
+        name = "postgresql"
+
+    class _FakeEngine:
+        dialect = _FakeDialect()
+
+    engine = _FakeEngine()
+    create_engine_kwargs: dict[str, object] = {}
+
+    def _create_engine(*args, **kwargs):
+        create_engine_kwargs.update(kwargs)
+        return engine
+
+    monkeypatch.setattr(sa, "create_engine", _create_engine)
+    monkeypatch.setattr(
+        store,
+        "_control_plane_tables_exist",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(sa.MetaData, "create_all", lambda self, received_engine: create_all_calls.append(received_engine))
+
+    store._ensure_runtime()  # type: ignore[attr-defined]
+
+    assert store._engine is engine  # type: ignore[attr-defined]
+    assert create_all_calls == []
+    assert create_engine_kwargs["use_native_hstore"] is False
+
+
+def test_database_store_retries_list_records_after_retryable_connection_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = DatabaseAgentControlPlaneStore("sqlite:////tmp/ignored.sqlite3")
+    spec = next(item for item in store._entity_specs() if item.field_name == "workspace_ai_settings")  # type: ignore[attr-defined]
+    query = object()
+    payload = WorkspaceAiSettings(profile="1", name="Recovered", version="gpt-5-mini").model_dump(mode="json")
+    reset_calls: list[str] = []
+
+    class _FakeResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _FakeConnection:
+        def __init__(self) -> None:
+            self._calls = 0
+
+        def execute(self, received_query):
+            assert received_query is query
+            self._calls += 1
+            if self._calls == 1:
+                raise RuntimeError("consuming input failed: SSL error: unexpected eof while reading")
+            return _FakeResult([(payload,)])
+
+    class _FakeBegin:
+        def __init__(self, connection: _FakeConnection) -> None:
+            self._connection = connection
+
+        def __enter__(self):
+            return self._connection
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.connection = _FakeConnection()
+            self.disposed = 0
+
+        def begin(self):
+            return _FakeBegin(self.connection)
+
+        def dispose(self) -> None:
+            self.disposed += 1
+
+    engine = _FakeEngine()
+    monkeypatch.setattr(store, "_ensure_runtime", lambda: setattr(store, "_engine", engine))
+    monkeypatch.setattr(store, "_spec_by_field_name", lambda field_name: spec)
+    monkeypatch.setattr(store, "_build_filtered_query", lambda *args, **kwargs: query)
+
+    def _wrapped_reset() -> None:
+        reset_calls.append("reset")
+        store._engine = None
+        store._tables = {}
+        store._metadata = None
+        engine.dispose()
+
+    monkeypatch.setattr(store, "_reset_runtime", _wrapped_reset)
+
+    loaded = store.list_records("workspace_ai_settings", filters={"profile": "1"})
+
+    assert len(loaded) == 1
+    assert loaded[0].name == "Recovered"
+    assert reset_calls == ["reset"]
+    assert engine.disposed == 1
 
 
 def test_service_import_payload_uses_repository_writes(tmp_path: Path) -> None:
@@ -143,6 +290,25 @@ def test_service_import_payload_uses_repository_writes(tmp_path: Path) -> None:
     assert registry["agent_count"] == 1
     assert registry["agents"][0]["slug"] == "workspace-host"
     assert service.get_workspace_ai_setup(profile_id="1")["configured"] is True
+
+
+def test_workspace_ai_setup_does_not_require_optional_tavily_key(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = JsonAgentControlPlaneStore(settings.control_plane_store_path)
+    service = AgentControlPlaneService(store=store, settings=settings)
+
+    setup = service.save_workspace_ai_setup(
+        profile_id="4",
+        data={
+            "name": "Workspace Assistant",
+            "version": "gpt-5-mini",
+            "api_key": "sk-test-openai",
+        },
+    )
+
+    assert setup["configured"] is True
+    assert setup["agent"]["has_api_key"] is True
+    assert setup["agent"]["has_tavily_api_key"] is False
 
 
 def test_service_imports_workspace_tool_connections_into_runtime_payload(tmp_path: Path) -> None:
@@ -382,7 +548,7 @@ def test_build_principal_claim_overrides_falls_back_to_env_key_when_saved_secret
     payload = service.build_principal_claim_overrides(profile_id="1")
 
     assert payload["ka2a"]["llm"]["apiKey"] == {"ciphertext": "sk-env-fallback", "alg": "plain"}
-    assert "tavily" not in payload["ka2a"]
+    assert payload["ka2a"]["tavily"]["apiKey"] == {"ciphertext": "tvly-env-fallback", "alg": "plain"}
 
 
 def test_sync_seed_catalog_updates_template_runtime_and_adds_missing_template_bindings_to_installed_agents(

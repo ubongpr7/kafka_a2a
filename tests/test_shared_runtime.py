@@ -1,9 +1,27 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from kafka_a2a.control_plane import ControlPlaneError
-from kafka_a2a.runtime.shared_runtime import SharedRuntimeService
+from kafka_a2a.runtime.shared_runtime import SharedRuntimeService, _workspace_instruction
+
+
+def test_workspace_instruction_composes_all_saved_instruction_layers() -> None:
+    prompt = _workspace_instruction(
+        {
+            "system_instruction": "Operate as the workspace host.",
+            "special_instruction": "This is a provision store.",
+            "assistant_instruction": "Use Naira and do not invent stock.",
+        }
+    )
+
+    assert prompt == (
+        "Operate as the workspace host.\n\n"
+        "This is a provision store.\n\n"
+        "Use Naira and do not invent stock."
+    )
 
 
 @pytest.mark.asyncio
@@ -68,3 +86,35 @@ async def test_shared_runtime_reuses_last_registry_when_control_plane_refresh_ti
 
     assert first == [{"runtime_name": "wa-p1-host-123", "slug": "host"}]
     assert second == first
+
+
+@pytest.mark.asyncio
+async def test_shared_runtime_starts_pending_workers_concurrently() -> None:
+    service = SharedRuntimeService(bootstrap_servers="localhost:9092", poll_interval_s=5.0)
+    worker_started = asyncio.Event()
+    release_workers = asyncio.Event()
+    started: list[str] = []
+
+    async def fake_load_registry() -> list[dict[str, object]]:
+        return [
+            {"runtime_name": "agent-a", "runtime_card_payload": {}},
+            {"runtime_name": "agent-b", "runtime_card_payload": {}},
+            {"runtime_name": "agent-c", "runtime_card_payload": {}},
+        ]
+
+    async def fake_start_agent(*, runtime_name: str, fingerprint: str, agent_payload: dict[str, object]) -> None:
+        _ = fingerprint, agent_payload
+        started.append(runtime_name)
+        if len(started) == 3:
+            worker_started.set()
+        await release_workers.wait()
+
+    service._load_registry = fake_load_registry  # type: ignore[method-assign]
+    service._start_agent = fake_start_agent  # type: ignore[method-assign]
+    reconcile_task = asyncio.create_task(service._reconcile())
+
+    await asyncio.wait_for(worker_started.wait(), timeout=0.5)
+    release_workers.set()
+    await reconcile_task
+
+    assert set(started) == {"agent-a", "agent-b", "agent-c"}

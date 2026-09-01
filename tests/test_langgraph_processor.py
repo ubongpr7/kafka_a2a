@@ -11,6 +11,7 @@ from kafka_a2a.langgraph_processor import (
     _build_inventory_stock_risk_insight,
     _build_pos_best_sales_day_insight,
     _build_host_business_analyst_insight,
+    _build_pos_product_comparison_insight,
     _build_pos_sales_by_location_insight,
     _build_pos_sales_overview_insight,
     _build_pos_top_sellers_insight,
@@ -19,15 +20,27 @@ from kafka_a2a.langgraph_processor import (
     _build_stock_location_operation,
     _build_realtime_dashboard_snapshot_insight,
     _build_product_operation,
+    _build_product_import_opportunities_insight,
     _build_staff_activity_insight,
     _build_permission_security_insight,
     _build_subscription_usage_insight,
+    _business_review_specialist_payload,
+    _compact_business_review_reorder_payload,
+    _business_review_specialist_domain,
     _classify_failed_operation,
     _coerce_delegated_response,
     _created_result_ref,
+    _corrected_inventory_request,
     _extract_created_result_value,
+    _format_delegation_status_text,
+    _fresh_host_request_clarification,
+    _friendly_agent_label,
+    _strong_domain_agent_override,
     _host_named_insight_payload,
     _host_named_insight_from_text,
+    _host_orchestration_compose_final_payload,
+    _latest_host_clarification_merge,
+    _latest_host_clarification_target,
     _latest_insight_follow_up_answer,
     _latest_repeated_question_response_parts,
     _inventory_procurement_named_insight_from_text,
@@ -45,7 +58,10 @@ from kafka_a2a.langgraph_processor import (
     _inventory_visibility_named_insight_from_text,
     _pos_admin_named_insight_from_text,
     _pos_admin_named_insight_payload,
+    _request_explicitly_mentions_time_range,
     _resolve_insight_time_window,
+    _refresh_sales_location_labels,
+    _normalize_sales_location_payload,
     _render_tool_prompt_block,
     _select_host_delegation_agent,
     _select_router_handoff_agent,
@@ -127,6 +143,188 @@ def test_pos_admin_named_insight_from_text_detects_priority_flows() -> None:
     assert _pos_admin_named_insight_from_text("Create a new discount") is None
 
 
+def test_business_review_context_does_not_trigger_product_comparison() -> None:
+    context = (
+        "Continue the user's multi-domain business review. "
+        "The business performance review includes an open cashier session at terminal Sofire."
+    )
+
+    assert _pos_admin_named_insight_from_text(context) != "product_comparison"
+
+
+def test_product_comparison_does_not_turn_unresolved_query_into_product() -> None:
+    payload = _build_pos_product_comparison_insight(
+        [
+            {
+                "query": "Sofire",
+                "totals": {"quantity_sold": 0, "sales_total": 0, "order_count": 0},
+                "products": [],
+                "trend": [],
+            },
+            {
+                "query": "Eva Premium Water",
+                "totals": {"quantity_sold": 4, "sales_total": 1200, "order_count": 2},
+                "products": [
+                    {
+                        "product_name": "Eva Premium Water",
+                        "variant_name": "Eva Premium Water 75cl",
+                        "barcode_snapshot": "6151100030011",
+                    }
+                ],
+                "trend": [],
+            },
+        ],
+        window={"label": "last 3 months"},
+    )
+
+    rows = payload["widgets"][6]["rows"]
+    assert [row["product"] for row in rows] == ["Eva Premium Water 75cl"]
+    assert "Sofire" in payload["warnings"][0]
+
+
+def test_latest_host_clarification_merge_reads_metadata_history_content_strings() -> None:
+    history = [
+        {"role": "user", "content": "Can you analyze my sales data?"},
+        {"role": "assistant", "content": "What time range should I use for the sales analysis?"},
+    ]
+
+    assert _latest_host_clarification_merge("for the last one year or so", history) == (
+        "Analyze my sales data for the last one year or so"
+    )
+
+
+def test_latest_host_clarification_merge_reads_serialized_message_parts() -> None:
+    history = [
+        {"role": "user", "parts": [{"kind": "text", "text": "Can you analyze my sales data?"}]},
+        {"role": "agent", "parts": [{"kind": "text", "text": "What time range should I use for the sales analysis?"}]},
+    ]
+
+    assert _latest_host_clarification_merge("For the last one year.", history) == (
+        "Analyze my sales data For the last one year"
+    )
+    assert _latest_host_clarification_target("For the last one year.", history) == "pos"
+
+
+def test_time_range_detection_does_not_treat_contextual_from_as_a_time_range() -> None:
+    history = [
+        {"role": "user", "content": "Can you analyze my sales data?"},
+        {"role": "assistant", "content": "What time range should I use for the sales analysis?"},
+        {"role": "user", "content": "The last three weeks."},
+        {"role": "assistant", "content": "Sales overview for last 3 weeks."},
+    ]
+
+    assert not _request_explicitly_mentions_time_range("Which location needs the most attention from that review?")
+    assert _request_explicitly_mentions_time_range("from 2026-08-01 to 2026-08-21")
+    assert _latest_host_clarification_merge("Which location needs the most attention from that review?", history) is None
+
+
+def test_business_review_drops_contradictory_empty_pos_section() -> None:
+    payload = _host_orchestration_compose_final_payload(
+        "Analyze my business performance for the last 1 year",
+        [
+            {
+                "agent_name": "pos_admin",
+                "payload": {
+                    "kind": "insight_response",
+                    "summary": "9 sales were recorded for last 1 year, totaling 73400.",
+                    "widgets": [{"type": "metric_grid", "data": [{"label": "Sales Count", "value": 9}]}],
+                },
+            },
+            {
+                "agent_name": "pos_admin-1D62F6C47Bd0",
+                "payload": {
+                    "kind": "insight_response",
+                    "summary": "No completed sales were found for last 1 year.",
+                    "widgets": [{"type": "metric_grid", "data": [{"label": "Sales Count", "value": 0}]}],
+                },
+            },
+        ],
+    )
+
+    sections = payload["widgets"][1]["sections"]
+    assert len(sections) == 1
+    assert sections[0]["summary"].startswith("9 sales were recorded")
+
+
+def test_business_review_drops_empty_variant_sales_section() -> None:
+    payload = _host_orchestration_compose_final_payload(
+        "Analyze my business performance for the last 1 year",
+        [
+            {
+                "agent_name": "pos_admin",
+                "payload": {
+                    "kind": "insight_response",
+                    "summary": "1789 sales were recorded for last 1 year, totaling 103192970.",
+                    "widgets": [{"type": "metric_grid", "data": [{"label": "Sales Count", "value": 1789}]}],
+                },
+            },
+            {
+                "agent_name": "pos_admin-1D62F6C47Bd0",
+                "payload": {
+                    "kind": "insight_response",
+                    "summary": "No variant sales were found for all time.",
+                    "widgets": [{"type": "metric_grid", "data": [{"label": "Sales Count", "value": 0}]}],
+                },
+            },
+        ],
+    )
+
+    sections = payload["widgets"][1]["sections"]
+    assert len(sections) == 1
+    assert sections[0]["summary"].startswith("1789 sales were recorded")
+
+
+def test_host_routes_stock_snapshot_questions_to_inventory_without_a_time_range() -> None:
+    assert _strong_domain_agent_override("Analyze my low-stock products") == "inventory"
+    assert _fresh_host_request_clarification("Analyze my low-stock products", "inventory") is None
+    assert _host_orchestration_plan(
+        "Analyze my low-stock products",
+        [{"name": "product"}, {"name": "inventory"}],
+    ) == ["inventory"]
+
+
+def test_host_disambiguates_stock_loss_and_product_risk_without_delegating() -> None:
+    assert _fresh_host_request_clarification("We lose stock", "inventory") == (
+        "Do you mean a current low-stock check, or stock loss and shrinkage over a time range?"
+    )
+    assert _fresh_host_request_clarification("I need to assess risk for my products", "inventory") == (
+        "Do you want a current inventory-risk check (out of stock, low stock, reorder, and expiry), "
+        "or a catalog data-quality review?"
+    )
+
+
+def test_host_rewrites_explicit_stock_transcript_correction() -> None:
+    assert _corrected_inventory_request(
+        "I did not say new stock. I said low stock products."
+    ) == "Show low-stock products."
+
+
+@pytest.mark.asyncio
+async def test_host_executes_the_corrected_low_stock_request_without_a_workflow_prompt() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    request = "I did not say new stock. I said low stock products."
+    task = Task(
+        id="task-host-low-stock-correction",
+        context_id="ctx-host-low-stock-correction",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request)]),
+        ),
+    )
+
+    events = [event async for event in processor(task, task.status.message, None, None)]
+
+    assert ("inventory.get_stock_risk", {"limit": 25, "expiring_days": 30}) in fake_langgraph_components.FAKE_TOOL_CALLS
+    delegation_calls = [
+        arguments
+        for name, arguments in fake_langgraph_components.FAKE_TOOL_CALLS
+        if name == "delegate_to_agent"
+    ]
+    assert delegation_calls == [{"request": "Show low-stock products.", "agent_name": "inventory"}]
+    result = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert "Continue Workflow" not in _text_from_parts(result.parts)
+
+
 def test_build_pos_sales_by_location_insight_returns_widget_first_payload() -> None:
     payload = _build_pos_sales_by_location_insight(
         {
@@ -148,6 +346,30 @@ def test_build_pos_sales_by_location_insight_returns_widget_first_payload() -> N
     assert payload["widgets"][0]["data"][2]["label"] == "Avg Basket"
 
 
+def test_sales_location_labels_prefer_current_inventory_name_over_pos_snapshot() -> None:
+    payload = {
+        "groups": [
+            {
+                "label": "Gberigbe Store",
+                "location_id": "loc-1",
+                "order_count": 2,
+                "total_sales": 1200.0,
+            }
+        ]
+    }
+
+    normalized = _normalize_sales_location_payload(payload, {"loc-1": "Renamed Store"})
+
+    assert normalized["groups"] == [
+        {
+            "label": "Renamed Store",
+            "location": "Renamed Store",
+            "location_name": "Renamed Store",
+            "location_id": "loc-1",
+            "order_count": 2,
+            "total_sales": 1200.0,
+        }
+    ]
 def test_build_pos_sales_overview_insight_returns_widget_first_payload() -> None:
     payload = _build_pos_sales_overview_insight(
         {
@@ -451,6 +673,22 @@ class _RecordingToolExecutor:
                         "image_url": "https://example.com/navy-m.png",
                     }
                 ]
+            }
+        if name == "product.list_global_catalog_products":
+            return {
+                "count": 1,
+                "results": [
+                    {
+                        "id": "global-prod-1",
+                        "name": "Global Biscuit 200g",
+                        "brand": "Global",
+                        "category_name": "Snacks",
+                        "variant_count": 2,
+                        "already_imported": False,
+                        "display_image": "https://example.com/global-biscuit.png",
+                        "primary_barcode": "8800000000999",
+                    }
+                ],
             }
         if name == "pos.get_terminal_activity":
             return {
@@ -926,10 +1164,12 @@ def test_build_inventory_stock_risk_insight_returns_risk_widgets() -> None:
                     {
                         "name": "Cabin Biscuit 200g",
                         "quantity_available": 0,
-                        "location_name": "Lekki",
-                        "sku": "CAB-200",
-                    }
-                ]
+                    "location_name": "Lekki",
+                    "sku": "CAB-200",
+                    "barcode": "1234567890123",
+                    "product_variant_image_url": "https://cdn.example.com/cabin-biscuit.jpg",
+                }
+            ]
             },
         },
         focus="out_of_stock",
@@ -939,7 +1179,100 @@ def test_build_inventory_stock_risk_insight_returns_risk_widgets() -> None:
     assert payload["widgets"][0]["type"] == "metric_grid"
     assert payload["widgets"][1]["type"] == "risk_panel"
     assert payload["widgets"][2]["type"] == "ranked_list"
+    assert payload["widgets"][2]["items"][0]["image_url"] == "https://cdn.example.com/cabin-biscuit.jpg"
+    assert payload["widgets"][3]["type"] == "comparison_table"
+    assert payload["widgets"][3]["rows"] == [
+        {
+            "risk": "Out of Stock",
+            "product": "Cabin Biscuit 200g",
+            "barcode": "1234567890123",
+            "sku": "CAB-200",
+            "location": "Lekki",
+            "available": 0.0,
+            "minimum_stock": 0.0,
+            "reorder_point": 0.0,
+        }
+    ]
     assert payload["data_sources"][0]["endpoint_or_topic"] == "get_stock_risk"
+
+
+def test_business_review_reorder_section_is_compact() -> None:
+    payload = _compact_business_review_reorder_payload(
+        _build_inventory_stock_risk_insight(
+            {
+                "summary": {"out_of_stock_count": 0, "reorder_count": 2, "low_stock_count": 0, "expiring_count": 0},
+                "risk_items": {
+                    "needs_reorder": [
+                        {"name": "Cabin Biscuit 200g", "quantity_available": 1, "location_name": "Lekki"},
+                    ]
+                },
+            },
+            focus="needs_reorder",
+        )
+    )
+
+    assert payload is not None
+    assert payload["summary"] == "Replenishment candidates are ready."
+    assert [widget["type"] for widget in payload["widgets"]] == ["metric_grid", "ranked_list"]
+    assert payload["widgets"][0]["data"] == [{"label": "Products to replenish", "value": 2, "format": "number"}]
+    assert payload["widgets"][1]["title"] == "Products to replenish"
+
+
+def test_build_product_import_opportunities_preserves_catalog_media() -> None:
+    payload = _build_product_import_opportunities_insight(
+        {
+            "count": 1,
+            "results": [
+                {
+                    "name": "Eva Premium Water 75cl",
+                    "brand": "Eva",
+                    "category_name": "Beverages",
+                    "variant_count": 1,
+                    "already_imported": False,
+                    "display_image": "https://example.com/eva.png",
+                    "barcode": "8800000001001",
+                    "sku": "EVA-75CL",
+                }
+            ],
+        }
+    )
+
+    ranked_item = payload["widgets"][1]["items"][0]
+    assert ranked_item["image_url"] == "https://example.com/eva.png"
+    assert ranked_item["barcode"] == "8800000001001"
+    assert ranked_item["sku"] == "EVA-75CL"
+
+
+def test_low_stock_summary_surfaces_out_of_stock_items() -> None:
+    payload = _build_inventory_stock_risk_insight(
+        {
+            "summary": {
+                "out_of_stock_count": 12,
+                "reorder_count": 0,
+                "low_stock_count": 0,
+                "expiring_count": 0,
+            },
+            "risk_items": {
+                "low_stock": [],
+                "out_of_stock": [
+                    {
+                        "name": "Cabin Biscuit 200g",
+                        "barcode": "1234567890123",
+                        "sku": "CAB-200",
+                        "location_name": "Lekki",
+                        "quantity_available": 0,
+                    }
+                ],
+            },
+        },
+        focus="low_stock",
+    )
+
+    assert payload["summary"] == (
+        "No products are below their low-stock threshold, but 12 products are out of stock and need attention."
+    )
+    assert payload["widgets"][3]["rows"][0]["risk"] == "Out of Stock"
+    assert payload["widgets"][3]["rows"][0]["barcode"] == "1234567890123"
 
 
 def test_users_named_insight_from_text_detects_priority_flows() -> None:
@@ -957,24 +1290,46 @@ def test_host_named_insight_from_text_detects_cross_domain_flows() -> None:
     assert _host_named_insight_from_text("Act as my business analyst and tell me what I am not seeing.") == "business_analyst_review"
     assert _host_named_insight_from_text("Can you analyze the entire data as a data analyst?") == "business_analyst_review"
     assert _host_named_insight_from_text("Give me a strategic business review for the past year.") == "business_analyst_review"
+    assert _host_named_insight_from_text("Analyze my business performance for the last quarter.") == "business_analyst_review"
+    assert _host_named_insight_from_text("Analyze my business data.") == "business_analyst_review"
+    assert _host_named_insight_from_text("Analyze my business for the last quarter.") == "business_analyst_review"
+    assert _host_named_insight_from_text("Give me a quarterly business performance review.") == "business_analyst_review"
     assert _host_named_insight_from_text("analyse my entire system for the past 1 year") == "business_analyst_review"
     assert _host_named_insight_from_text("review the whole system for the past year") == "business_analyst_review"
     assert _host_named_insight_from_text("How many sales was made last month?") == "pos::sales_overview"
     assert _host_named_insight_from_text("Give me the sales analysis for last month.") == "pos::sales_overview"
     assert _host_named_insight_from_text("can you analyse my sales data for the past 1 year?") == "pos::sales_overview"
+    assert _host_named_insight_from_text("how many goods has been sold today") == "pos::top_sellers_seven_days"
+    assert _host_named_insight_from_text("how many products did we sell today") == "pos::top_sellers_seven_days"
+    assert _host_named_insight_from_text("How many units were sold today?") == "pos::top_sellers_seven_days"
+    assert _host_named_insight_from_text("what is my revenue today") == "pos::sales_overview"
+    assert _host_named_insight_from_text("which terminal sold the most today") == "pos::terminal_cashier_activity"
+    assert _host_named_insight_from_text("which location sold the most this month") == "pos::sales_by_location_today"
+    assert _host_named_insight_from_text("show failed POS payments today") == "pos::pos_exceptions"
+    assert _host_named_insight_from_text("show refunds today") == "pos::pos_exceptions"
     assert _host_named_insight_from_text("Show sales trend for barcode 8800000001501 over the past year") == "pos::product_sales_trend"
     assert _host_named_insight_from_text("Show out-of-stock products.") == "inventory_visibility::stock_risk_out_of_stock"
+    assert _host_named_insight_from_text("what should I reorder today") == "inventory_visibility::reorder_candidates"
+    assert _host_named_insight_from_text("which products are expiring soon") == "inventory_visibility::stock_risk"
+    assert _host_named_insight_from_text("show stock transfer activity") == "inventory_visibility::stock_movements"
     assert _host_named_insight_from_text("Show purchase order lifecycle for the past month") == "inventory_procurement::po_lifecycle"
     assert _host_named_insight_from_text("Show PO receiving lifecycle for the past 1 year") == "inventory_procurement::receiving_lifecycle"
     assert _host_named_insight_from_text("Show purchase order receiving timeline last year") == "inventory_procurement::receiving_lifecycle"
+    assert _host_named_insight_from_text("analyze my purchase orders for last quarter") == "inventory_procurement::po_lifecycle"
+    assert _host_named_insight_from_text("which suppliers have delayed deliveries") == "inventory_procurement::delay_exceptions"
     assert _host_named_insight_from_text("Show staff activity from audit events") == "users::staff_activity"
     assert _host_named_insight_from_text("Show staff activity in June 2026.") == "users::staff_activity"
+    assert _host_named_insight_from_text("who accessed support last month") == "users::support_access_audit"
     assert _host_named_insight_from_text("Show global catalog import opportunities") == "product_discovery::import_opportunities"
+    assert _host_named_insight_from_text("show products with no image") == "product_discovery::media_category"
+    assert _host_named_insight_from_text("show duplicate barcodes") == "product_discovery::duplicate_codes"
+    assert _host_named_insight_from_text("show products not visible in POS") == "product_discovery::media_category"
     assert _host_named_insight_from_text("Show subscription usage and limits") == "users::subscription_usage_limits"
     assert _host_named_insight_from_text("Give me a one-screen operational summary for today.") == "cross_domain_ops"
     assert _host_named_insight_from_text("Which areas are strong and weak across inventory and POS?") == "cross_domain_ops"
     assert _host_named_insight_from_text("Show side-by-side location performance for today.") == "location_comparison"
     assert _host_named_insight_from_text("Compare branches by top sellers and stockouts.") == "location_comparison"
+    assert _host_named_insight_from_text("Compare Maitama and Agric sales this year") is None
     assert _host_named_insight_from_text("What are the top three actions I should take next?") == "recommendations"
 
 
@@ -1109,15 +1464,74 @@ def test_latest_insight_follow_up_answer_uses_previous_structured_payload() -> N
     assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location led?", frontend_history) or "")
     assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location was far behind in terms of revenue in that period?", wrapped_history) or "")
     assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location led?", direct_stream_history) or "")
+    assert (_latest_insight_follow_up_answer("So these are my sales reports, right?", frontend_history) or "").startswith("Yes.")
+    grouped_locations = _latest_insight_follow_up_answer("Okay, group it by location.", frontend_history) or ""
+    assert "already grouped by location" in grouped_locations
+    assert "Gberigbe Store" in grouped_locations
     assert "Prioritize replenishment" in (_latest_insight_follow_up_answer("What should I do first?", history) or "")
     assert "Prioritize replenishment" in (
         _latest_insight_follow_up_answer("What should I do first?", frontend_history) or ""
     )
+    decisions = _latest_insight_follow_up_answer("What decisions should I be making with this information?", frontend_history) or ""
+    assert "Prioritize replenishment" in decisions
+    assert _latest_insight_follow_up_answer("I need to import products", frontend_history) is None
+    assert _latest_insight_follow_up_answer("next action", frontend_history) is not None
     assert "Stockouts" in (_latest_insight_follow_up_answer("What are the risks?", history) or "")
     assert "Eva Premium Water" in (_latest_insight_follow_up_answer("Which products drove revenue?", history) or "")
     assert "₦35,000.00" in (_latest_insight_follow_up_answer("What was total revenue?", history) or "")
     assert _latest_insight_follow_up_answer("Give me last month sales instead", history) is None
     assert _latest_insight_follow_up_answer("Can you hear me now?", history) is None
+
+    business_review_history = [
+        {
+            "role": "assistant",
+            "content": "Business review ready.",
+            "structuredPayload": {
+                "kind": "insight_response",
+                "timeframe": {"label": "last 3 months"},
+                "widgets": [
+                    {
+                        "type": "section_stack",
+                        "sections": [
+                            {
+                                "title": "Point of Sale (POS)",
+                                "widgets": [
+                                    {
+                                        "type": "comparison_table",
+                                        "title": "Location contribution for last 3 months",
+                                        "rows": [
+                                            {"location": "Maitama, Abuja", "sales": 8652220, "orders": 153},
+                                            {"location": "Agric, Ikorodu Store", "sales": 4879620, "orders": 85},
+                                        ],
+                                    }
+                                ],
+                            },
+                            {
+                                "title": "Inventory Management",
+                                "widgets": [
+                                    {
+                                        "type": "risk_panel",
+                                        "title": "Highest priority stock risks - All locations",
+                                        "items": [
+                                            {"label": "Out of Stock: Rice", "detail": "Maitama, Abuja · out of stock"},
+                                            {"label": "Out of Stock: Toothpaste", "detail": "Maitama, Abuja · out of stock"},
+                                        ],
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            },
+        }
+    ]
+    location_attention = _latest_insight_follow_up_answer(
+        "Which location needs the most attention from that review?",
+        business_review_history,
+    ) or ""
+    assert "Maitama, Abuja" in location_attention
+    assert "2 active stock risks" in location_attention
+    assert "₦8,652,220.00" in location_attention
 
     procurement_payload = {
         "kind": "insight_response",
@@ -1358,13 +1772,68 @@ async def test_host_named_insight_payload_supports_users_and_product_passthrough
         tool_ctx=ToolContext(),
         user_text="show global catalog import opportunities",
     )
+    catalog_gap_payload = await _host_named_insight_payload(
+        insight_key="product_discovery::catalog_gaps",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="show the catalog opportunity board",
+    )
 
     assert staff_payload is not None
     assert import_payload is not None
+    assert catalog_gap_payload is not None
     assert executor.calls[0][0] == "audit.get_staff_activity"
     assert executor.calls[0][1]["date_from"] == _resolve_insight_time_window("show staff activity from audit events", default_days=30, default_label="last 30 days")["start_date"]
     assert executor.calls[0][1]["date_to"] == _resolve_insight_time_window("show staff activity from audit events", default_days=30, default_label="last 30 days")["end_date"]
-    assert any(call[0] == "product.get_product_dashboard_stats" for call in executor.calls)
+    catalog_calls = [call for call in executor.calls if call[0] == "product.list_global_catalog_products"]
+    assert len(catalog_calls) == 1
+    assert all(call[1]["exclude_imported"] is True for call in catalog_calls)
+    catalog_widget_titles = [str(widget.get("title") or "") for widget in catalog_gap_payload["widgets"]]
+    assert "New catalog opportunities" not in catalog_widget_titles
+    assert "Catalog opportunity board" not in catalog_widget_titles
+
+
+@pytest.mark.asyncio
+async def test_product_business_review_sequences_product_mcp_calls() -> None:
+    executor = _RecordingToolExecutor()
+
+    payload = await _business_review_specialist_payload(
+        domain="product",
+        original_request="Analyze my business performance for the last three months",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+    )
+
+    assert payload["title"] == "Product catalog health"
+    assert [name for name, _arguments in executor.calls] == [
+        "product.get_product_dashboard_stats",
+        "product.get_product_stock_alerts",
+        "product.search_product_variants",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sales_location_refresh_uses_current_search_endpoint() -> None:
+    executor = _RecordingToolExecutor()
+
+    await _refresh_sales_location_labels(
+        {"groups": [{"location_id": "loc-1", "location": "Legacy location"}]},
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+    )
+
+    assert executor.calls == [
+        (
+            "inventory.search_stock_locations",
+            {"query": None, "limit": 50, "structural_only": True},
+        )
+    ]
+
+
+def test_friendly_agent_label_hides_runtime_card_identifiers() -> None:
+    assert _friendly_agent_label("wa-p4-pos_admin-1d62f6c47bd0") == "Point of Sale (POS)"
+    assert _friendly_agent_label("wa-p4-inventory_visibility-c6635feb24f1") == "Inventory Management"
+    assert _friendly_agent_label("wa-p4-product_discovery-b7774e08b933") == "Product Management"
 
 
 @pytest.mark.asyncio
@@ -1430,6 +1899,449 @@ def test_host_orchestration_plan_does_not_append_inventory_for_pos_insight_query
     )
 
     assert plan == ["pos"]
+
+
+def test_host_orchestration_plan_builds_cross_domain_business_review_flow() -> None:
+    plan = _host_orchestration_plan(
+        "Analyze my business performance for the last quarter",
+        [
+            {"name": "inventory"},
+            {"name": "pos"},
+            {"name": "users"},
+        ],
+    )
+
+    assert plan == ["pos", "inventory", "users"]
+
+
+def test_delegated_business_review_is_intercepted_by_each_domain_before_llm_fallback() -> None:
+    request = (
+        "Continue the user's multi-domain business review.\n"
+        "Original user request: Analyze my business performance for the last three months\n"
+        "Time range to use: last 3 months (2026-05-28 to 2026-08-28).\n"
+        "Run the full Point of Sale (POS) portion of the business review for that same time range."
+    )
+
+    assert _business_review_specialist_domain("pos_admin", request) == (
+        "pos",
+        "Analyze my business performance for the last three months",
+    )
+    assert _business_review_specialist_domain("inventory_visibility", request) == (
+        "inventory",
+        "Analyze my business performance for the last three months",
+    )
+    assert _business_review_specialist_domain("users", request) == (
+        "users",
+        "Analyze my business performance for the last three months",
+    )
+    assert _business_review_specialist_domain("product_discovery", request) == (
+        "product",
+        "Analyze my business performance for the last three months",
+    )
+    assert _business_review_specialist_domain("pos", request) is None
+    assert _business_review_specialist_domain("host", request) is None
+    assert _business_review_specialist_domain("pos", "Show me sales for last week") is None
+
+
+def test_business_review_router_targets_concrete_specialists_even_while_the_directory_is_warming() -> None:
+    request = (
+        "Continue the user's multi-domain business review.\n"
+        "Original user request: Analyze my business performance for the last three months"
+    )
+
+    assert _select_router_handoff_agent("pos", request, [{"name": "inventory_visibility", "skills": []}]) == "pos_admin"
+    assert _select_router_handoff_agent("inventory", request, [{"name": "pos_admin", "skills": []}]) == "inventory_visibility"
+    assert _select_router_handoff_agent("product", request, [{"name": "pos_admin", "skills": []}]) == "product_discovery"
+
+
+def test_strong_domain_override_does_not_force_pos_for_cross_domain_business_review() -> None:
+    assert (
+        _strong_domain_agent_override(
+            "Analyze my business sales and inventory performance for the last quarter"
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_auto_completes_cross_domain_business_review_without_continue_prompt() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    request = "Analyze my business performance for the last quarter"
+    task = Task(
+        id="task-host-business-review",
+        context_id="ctx-host-business-review",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    specialist_result_names = {
+        event.name
+        for event in events
+        if isinstance(event, Artifact) and isinstance(event.name, str) and event.name.endswith(".result")
+    }
+    assert specialist_result_names >= {"pos.result", "inventory.result", "users.result", "product.result"}
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[:5] == [
+        ("list_available_agents", {}),
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "Continue the user's multi-domain business review.\n"
+                    "Original user request: Analyze my business performance for the last quarter\n"
+                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+                    "Run the full Point of Sale (POS) portion of the business review for that same time range.\n"
+                    "Use sensible defaults and do not ask the user for a menu selection unless access is genuinely blocked."
+                ),
+                "agent_name": "pos",
+            },
+        ),
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "Continue the user's multi-domain business review.\n"
+                    "Original user request: Analyze my business performance for the last quarter\n"
+                    "Completed steps so far: Point of Sale (POS).\n"
+                    "Latest completed step result: Sales performance for the last quarter is ready. Revenue was strongest in the final month and repeat purchasing improved.\n"
+                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+                    "Run the full Inventory Management portion of the business review for that same time range.\n"
+                    "Cover all of these in one response: stock posture and availability; turnover and velocity; reorder recommendations; ageing and expiry analysis; valuation and carrying cost; fulfillment and reservation issues; and procurement or receiving signals that affect stock health.\n"
+                    "Use defaults without asking the user to choose a single focus: include all locations, provide both company-wide and per-location outputs, use POS sales from earlier steps as the demand signal where helpful, and only include lot or expiry-aware analysis if the workspace tracks it.\n"
+                    "Do not send a focus picker, a default-confirmation checklist, or any retry prompt unless required permissions or source data are truly unavailable."
+                ),
+                "agent_name": "inventory",
+            },
+        ),
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "Continue the user's multi-domain business review.\n"
+                    "Original user request: Analyze my business performance for the last quarter\n"
+                    "Completed steps so far: Point of Sale (POS), Inventory Management.\n"
+                    "Latest completed step result: Inventory health for the requested review period is ready. Stock posture was stable overall, slow movers tied up capital, several reorder candidates emerged, and fulfillment delays were concentrated in a small set of locations.\n"
+                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+                    "Run the full Users and Workspace Controls portion of the business review for that same time range.\n"
+                    "Cover staff activity, audit anomalies, role or permission risks, and subscription or capacity pressure that could affect operations.\n"
+                    "Use sensible defaults and do not ask the user to choose a sub-focus unless access is genuinely blocked."
+                ),
+                "agent_name": "users",
+            },
+        ),
+        (
+            "delegate_to_agent",
+            {
+                    "request": (
+                        "Continue the user's multi-domain business review.\n"
+                        "Original user request: Analyze my business performance for the last quarter\n"
+                        "Completed steps so far: Point of Sale (POS), Inventory Management, User and Workspace Management.\n"
+                        "Latest completed step result: Workspace controls for the requested review period are ready. Staff activity was concentrated in a few operators, audit activity stayed normal overall, and there was no immediate subscription-capacity pressure.\n"
+                        "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+                        "Run the full Product Management portion of the business review for that same time range.\n"
+                        "Cover catalog health, assortment gaps, duplicate-code risks, media or merchandising weaknesses, and global catalog import opportunities that could strengthen current demand coverage.\n"
+                        "Use sensible defaults and do not ask the user to choose a sub-focus unless access is genuinely blocked."
+                ),
+                "agent_name": "product",
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    result_payload = result_artifact.parts[0].data
+    assert result_payload["kind"] == "insight_response"
+    assert result_payload["summary"] == "Business review is ready for last quarter."
+    assert result_payload["explanation"] == "I completed the business review for: Analyze my business performance for the last quarter"
+    widgets = result_payload["widgets"]
+    assert widgets[0]["type"] == "metric_grid"
+    assert widgets[1]["type"] == "section_stack"
+    section_titles = [section["title"] for section in widgets[1]["sections"]]
+    assert "Point of Sale (POS)" in section_titles
+    assert "Inventory Management" in section_titles
+    assert "User and Workspace Management" in section_titles
+    assert "Product Management" in section_titles
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.completed
+
+
+@pytest.mark.asyncio
+async def test_host_cross_domain_business_review_requires_time_range_before_delegation() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    request = "Analyze my business data"
+    task = Task(
+        id="task-host-business-review-needs-range",
+        context_id="ctx-host-business-review-needs-range",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == (
+        "What time range should I use for the business review: last 7 days, "
+        "last month, last quarter, or last year?"
+    )
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+def test_delegation_status_uses_public_specialist_name() -> None:
+    assert (
+        _format_delegation_status_text(
+            agent_name="wa-p4-product_catalog_admin-1dd459404fe4",
+            state=TaskState.submitted,
+            message=None,
+        )
+        == "The product catalog specialist has accepted the task."
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_merges_time_range_follow_up_into_sales_analysis_request() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    original_request = "Can you analyze my sales data?"
+    follow_up_answer = "past one year"
+    task = Task(
+        id="task-host-sales-follow-up",
+        context_id="ctx-host-sales-follow-up",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=follow_up_answer)]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text=original_request)]),
+            Message(role=Role.agent, parts=[TextPart(text="What time range should I use for the sales analysis?")]),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=follow_up_answer)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert _latest_host_clarification_merge(follow_up_answer, task.history) == (
+        "Analyze my sales data for the past one year"
+    )
+    assert fake_langgraph_components.FAKE_TOOL_CALLS
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[0] == (
+        "pos.get_sales_summary",
+        {"days": 365, "date": datetime.now(timezone.utc).date().isoformat(), "group_by": "location"},
+    )
+    assert any(
+        name == "pos.get_sales_summary" and args.get("days") == 365
+        for name, args in fake_langgraph_components.FAKE_TOOL_CALLS
+    )
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts)
+    assert "What time range should I use for the sales analysis?" not in _text_from_parts(result_artifact.parts)
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state != TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_host_direct_sales_analysis_request_requires_time_range_before_delegation() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    request = "Can you analyze my sales data?"
+    task = Task(
+        id="task-host-sales-needs-range",
+        context_id="ctx-host-sales-needs-range",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert not any(name == "pos.get_sales_summary" for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS)
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(result_artifact.parts) == "What time range should I use for the sales analysis?"
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_host_sales_follow_up_merges_from_saved_clarification_workflow_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    original_request = "Can you analyze my sales data?"
+
+    first_task = Task(
+        id="task-host-sales-follow-up-state-first",
+        context_id="ctx-host-sales-follow-up-state",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=original_request)]),
+        ),
+    )
+    first_message = Message(role=Role.user, parts=[TextPart(text=original_request)])
+
+    first_events = [event async for event in processor(first_task, first_message, None, None)]
+
+    first_result = next(event for event in first_events if isinstance(event, Artifact) and event.name == "result")
+    assert _text_from_parts(first_result.parts) == "What time range should I use for the sales analysis?"
+    assert not any(name == "pos.get_sales_summary" for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS)
+
+    fake_langgraph_components.reset_fake_components()
+
+    follow_up_answer = "for the last one year or so"
+    second_task = Task(
+        id="task-host-sales-follow-up-state-second",
+        context_id="ctx-host-sales-follow-up-state",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=follow_up_answer)]),
+        ),
+    )
+    second_message = Message(role=Role.user, parts=[TextPart(text=follow_up_answer)])
+
+    second_events = [event async for event in processor(second_task, second_message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[0] == (
+        "pos.get_sales_summary",
+        {"days": 365, "date": datetime.now(timezone.utc).date().isoformat(), "group_by": "location"},
+    )
+    assert any(
+        name == "pos.get_sales_summary" and args.get("days") == 365
+        for name, args in fake_langgraph_components.FAKE_TOOL_CALLS
+    )
+
+    second_result = next(event for event in second_events if isinstance(event, Artifact) and event.name == "result")
+    assert "What time range should I use for the sales analysis?" not in _text_from_parts(second_result.parts)
+
+    second_status_events = [event for event in second_events if isinstance(event, TaskStatus)]
+    assert second_status_events[-1].state != TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_host_merges_business_review_follow_up_from_task_history() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    original_request = "Can you help me analyze my business performance?"
+    follow_up_answer = "last quarter"
+    task = Task(
+        id="task-host-business-review-follow-up",
+        context_id="ctx-host-business-review-follow-up",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=follow_up_answer)]),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text=original_request)]),
+            Message(
+                role=Role.agent,
+                parts=[
+                    TextPart(
+                        text="What time range should I use for the business review: last 7 days, last month, last quarter, or last year?"
+                    )
+                ],
+            ),
+        ],
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=follow_up_answer)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[:5] == [
+        ("list_available_agents", {}),
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "Continue the user's multi-domain business review.\n"
+                    "Original user request: Analyze my business performance for the last quarter\n"
+                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+                    "Run the full Point of Sale (POS) portion of the business review for that same time range.\n"
+                    "Use sensible defaults and do not ask the user for a menu selection unless access is genuinely blocked."
+                ),
+                "agent_name": "pos",
+            },
+        ),
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "Continue the user's multi-domain business review.\n"
+                    "Original user request: Analyze my business performance for the last quarter\n"
+                    "Completed steps so far: Point of Sale (POS).\n"
+                    "Latest completed step result: Sales performance for the last quarter is ready. Revenue was strongest in the final month and repeat purchasing improved.\n"
+                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+                    "Run the full Inventory Management portion of the business review for that same time range.\n"
+                    "Cover all of these in one response: stock posture and availability; turnover and velocity; reorder recommendations; ageing and expiry analysis; valuation and carrying cost; fulfillment and reservation issues; and procurement or receiving signals that affect stock health.\n"
+                    "Use defaults without asking the user to choose a single focus: include all locations, provide both company-wide and per-location outputs, use POS sales from earlier steps as the demand signal where helpful, and only include lot or expiry-aware analysis if the workspace tracks it.\n"
+                    "Do not send a focus picker, a default-confirmation checklist, or any retry prompt unless required permissions or source data are truly unavailable."
+                ),
+                "agent_name": "inventory",
+            },
+        ),
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "Continue the user's multi-domain business review.\n"
+                    "Original user request: Analyze my business performance for the last quarter\n"
+                    "Completed steps so far: Point of Sale (POS), Inventory Management.\n"
+                    "Latest completed step result: Inventory health for the requested review period is ready. Stock posture was stable overall, slow movers tied up capital, several reorder candidates emerged, and fulfillment delays were concentrated in a small set of locations.\n"
+                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+                    "Run the full Users and Workspace Controls portion of the business review for that same time range.\n"
+                    "Cover staff activity, audit anomalies, role or permission risks, and subscription or capacity pressure that could affect operations.\n"
+                    "Use sensible defaults and do not ask the user to choose a sub-focus unless access is genuinely blocked."
+                ),
+                "agent_name": "users",
+            },
+        ),
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "Continue the user's multi-domain business review.\n"
+                    "Original user request: Analyze my business performance for the last quarter\n"
+                    "Completed steps so far: Point of Sale (POS), Inventory Management, User and Workspace Management.\n"
+                    "Latest completed step result: Workspace controls for the requested review period are ready. Staff activity was concentrated in a few operators, audit activity stayed normal overall, and there was no immediate subscription-capacity pressure.\n"
+                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+                    "Run the full Product Management portion of the business review for that same time range.\n"
+                    "Cover catalog health, assortment gaps, duplicate-code risks, media or merchandising weaknesses, and global catalog import opportunities that could strengthen current demand coverage.\n"
+                    "Use sensible defaults and do not ask the user to choose a sub-focus unless access is genuinely blocked."
+                ),
+                "agent_name": "product",
+            },
+        ),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    result_payload = result_artifact.parts[0].data
+    assert result_payload["kind"] == "insight_response"
+    assert result_payload["summary"] == "Business review is ready for last quarter."
+    assert result_payload["explanation"] == "I completed the business review for: Analyze my business performance for the last quarter"
+    section_titles = [section["title"] for section in result_payload["widgets"][1]["sections"]]
+    assert "Inventory Management" in section_titles
+    assert "Point of Sale (POS)" in section_titles
+    assert "User and Workspace Management" in section_titles
+    assert "Product Management" in section_titles
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.completed
 
 
 def test_coerce_delegated_response_treats_plain_text_confirmation_as_input_required() -> None:
@@ -2047,8 +2959,8 @@ async def test_host_auto_delegates_and_waits_for_specialist_result() -> None:
     assert len(status_events) == 4
     assert status_events[0].state == TaskState.working
     assert _text_from_parts(status_events[0].message.parts) == "Delegating this request to the product specialist agent."
-    assert _text_from_parts(status_events[1].message.parts) == "product agent: delegated task submitted"
-    assert _text_from_parts(status_events[2].message.parts) == "product agent: searching catalog"
+    assert _text_from_parts(status_events[1].message.parts) == "product management specialist: delegated task submitted"
+    assert _text_from_parts(status_events[2].message.parts) == "product management specialist: searching catalog"
     assert status_events[-1].state == TaskState.completed
     assert _text_from_parts(status_events[-1].message.parts) == "Found 3 products matching t-shirt."
 
@@ -2360,7 +3272,7 @@ async def test_host_capability_selection_routes_onboarding_to_guided_flow_reques
     assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
     assert result_artifact.parts[0].data["delegated_agent"] == "onboarding"
     assert result_artifact.parts[0].data["workflow"] == "product_import"
-    assert result_artifact.parts[0].data["delegated_task_id"] == "delegated-onboarding-scope"
+    assert result_artifact.parts[0].data["delegated_task_id"] == "delegated-onboarding-product-import"
 
 
 @pytest.mark.asyncio
@@ -2532,7 +3444,7 @@ async def test_host_inventory_domain_picker_free_text_stays_in_inventory_domain(
 
     events = [event async for event in processor(task, message, None, None)]
 
-    assert ("inventory.get_stock_risk", {"limit": 12, "expiring_days": 30}) in fake_langgraph_components.FAKE_TOOL_CALLS
+    assert ("inventory.get_stock_risk", {"limit": 25, "expiring_days": 30}) in fake_langgraph_components.FAKE_TOOL_CALLS
     assert (
         "delegate_to_agent",
         {
@@ -2603,9 +3515,9 @@ async def test_host_direct_setup_query_routes_to_onboarding() -> None:
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
-    assert result_artifact.parts[0].data["workflow_stage"] == "catalog_scope_prompt"
+    assert result_artifact.parts[0].data["workflow_stage"] == "scope_picker"
     assert result_artifact.parts[0].data["delegated_agent"] == "onboarding"
-    assert result_artifact.parts[0].data["workflow"] == "product_import"
+    assert result_artifact.parts[0].data["workflow"] == "inventory_onboarding"
     assert result_artifact.parts[0].data["delegated_task_id"] == "delegated-onboarding-scope"
 
 
@@ -2856,13 +3768,13 @@ async def test_onboarding_agent_scope_selection_opens_wizard() -> None:
     events = [event async for event in processor(task, message, None, None)]
 
     assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "users.get_active_company_profile",
         "create_wizard_flow",
         "inventory.list_stock_locations",
         "inventory.list_inventory_categories",
         "product.get_product_categories",
-        "users.get_active_company_profile",
     ]
-    assert fake_langgraph_components.FAKE_TOOL_CALLS[0][1]["title"] == "Product Import Wizard"
+    assert fake_langgraph_components.FAKE_TOOL_CALLS[1][1]["title"] == "Product Import Wizard"
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     assert result_artifact.parts[0].data["interaction_type"] == "wizard_flow"
@@ -2915,10 +3827,10 @@ async def test_onboarding_agent_inventory_setup_scope_populates_relation_selects
     events = [event async for event in processor(task, message, None, None)]
 
     assert [name for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS] == [
+        "users.get_active_company_profile",
         "create_wizard_flow",
         "inventory.list_stock_locations",
         "inventory.list_inventory_categories",
-        "users.get_active_company_profile",
     ]
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
@@ -3461,10 +4373,28 @@ async def test_onboarding_agent_saved_workflow_repeats_catalog_scope_prompt(
     events = [event async for event in processor(second_task, second_message, None, None)]
 
     assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
-    assert fake_langgraph_components.FAKE_TOOL_CALLS == []
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("users.get_active_company_profile", {}),
+        (
+            "create_multiple_choice",
+            {
+                "title": "Start Product Import",
+                "description": "Current company: Intera Demo Company\n\nChoose the setup area you want to complete first. I will guide you step by step.",
+                "options": [
+                    {"value": "product_onboarding", "label": "Product Import"},
+                    {"value": "stock_locations", "label": "Stock Locations"},
+                    {"value": "inventory_categories", "label": "Inventory Categories"},
+                    {"value": "inventory_setup", "label": "Inventory Setup"},
+                ],
+                "multiple": False,
+                "allow_input": True,
+            },
+        ),
+    ]
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
-    assert _text_from_parts(result_artifact.parts) == "Do you want to browse products by category, by brand, or by both?"
+    assert result_artifact.parts[0].data["workflow_stage"] == "scope_picker"
+    assert result_artifact.parts[0].data["interaction_type"] == "multiple_choice"
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
     assert status_events[-1].state == TaskState.input_required
@@ -3505,21 +4435,20 @@ async def test_onboarding_agent_explicit_product_import_skips_saved_resume_promp
 
     assert fake_langgraph_components.FAKE_LLM_CALL_COUNT == 0
     assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("users.get_active_company_profile", {}),
         (
             "create_multiple_choice",
             {
                 "title": "Choose Catalog Filters",
-                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "description": "Current company: Intera Demo Company\n\nI can import products from the global catalog. Do you want to browse by category or by brand?",
                 "options": [
                     {"value": "category", "label": "Product Category"},
                     {"value": "brand", "label": "Brand"},
-                    {"value": "both", "label": "Both Category and Brand"},
                 ],
                 "multiple": False,
                 "allow_input": True,
             },
         ),
-        ("users.get_active_company_profile", {}),
     ]
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
@@ -3554,11 +4483,10 @@ async def test_product_router_explicit_product_import_reuses_structured_onboardi
             "create_multiple_choice",
             {
                 "title": "Choose Catalog Filters",
-                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "description": "I can import products from the global catalog. Do you want to browse by category or by brand?",
                 "options": [
                     {"value": "category", "label": "Product Category"},
                     {"value": "brand", "label": "Brand"},
-                    {"value": "both", "label": "Both Category and Brand"},
                 ],
                 "multiple": False,
                 "allow_input": True,
@@ -3599,11 +4527,10 @@ async def test_namespaced_product_agent_explicit_product_import_reuses_structure
             "create_multiple_choice",
             {
                 "title": "Choose Catalog Filters",
-                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "description": "I can import products from the global catalog. Do you want to browse by category or by brand?",
                 "options": [
                     {"value": "category", "label": "Product Category"},
                     {"value": "brand", "label": "Brand"},
-                    {"value": "both", "label": "Both Category and Brand"},
                 ],
                 "multiple": False,
                 "allow_input": True,
@@ -3644,11 +4571,10 @@ async def test_namespaced_inventory_agent_explicit_product_import_reuses_structu
             "create_multiple_choice",
             {
                 "title": "Choose Catalog Filters",
-                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "description": "I can import products from the global catalog. Do you want to browse by category or by brand?",
                 "options": [
                     {"value": "category", "label": "Product Category"},
                     {"value": "brand", "label": "Brand"},
-                    {"value": "both", "label": "Both Category and Brand"},
                 ],
                 "multiple": False,
                 "allow_input": True,
@@ -3689,11 +4615,10 @@ async def test_product_catalog_admin_explicit_product_import_reuses_structured_o
             "create_multiple_choice",
             {
                 "title": "Choose Catalog Filters",
-                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "description": "I can import products from the global catalog. Do you want to browse by category or by brand?",
                 "options": [
                     {"value": "category", "label": "Product Category"},
                     {"value": "brand", "label": "Brand"},
-                    {"value": "both", "label": "Both Category and Brand"},
                 ],
                 "multiple": False,
                 "allow_input": True,
@@ -3734,11 +4659,10 @@ async def test_inventory_setup_explicit_product_import_reuses_structured_onboard
             "create_multiple_choice",
             {
                 "title": "Choose Catalog Filters",
-                "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+                "description": "I can import products from the global catalog. Do you want to browse by category or by brand?",
                 "options": [
                     {"value": "category", "label": "Product Category"},
                     {"value": "brand", "label": "Brand"},
-                    {"value": "both", "label": "Both Category and Brand"},
                 ],
                 "multiple": False,
                 "allow_input": True,
@@ -3755,7 +4679,7 @@ async def test_inventory_setup_explicit_product_import_reuses_structured_onboard
 
 
 @pytest.mark.asyncio
-async def test_namespaced_product_agent_catalog_scope_both_returns_category_widget(
+async def test_namespaced_product_agent_category_scope_returns_category_widget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
@@ -3764,11 +4688,10 @@ async def test_namespaced_product_agent_catalog_scope_both_returns_category_widg
     catalog_scope_payload = {
         "interaction_type": "multiple_choice",
         "title": "Choose Catalog Filters",
-        "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+        "description": "I can import products from the global catalog. Do you want to browse by category or by brand?",
         "options": [
             {"value": "category", "label": "Product Category"},
             {"value": "brand", "label": "Brand"},
-            {"value": "both", "label": "Both Category and Brand"},
         ],
         "multiple": False,
         "allow_input": True,
@@ -3777,13 +4700,13 @@ async def test_namespaced_product_agent_catalog_scope_both_returns_category_widg
         "onboarding_scope": "product_onboarding",
     }
     task = Task(
-        id="task-namespaced-product-router-both",
-        context_id="ctx-namespaced-product-router-both",
+        id="task-namespaced-product-router-category-prompt",
+        context_id="ctx-namespaced-product-router-category-prompt",
         status=TaskStatus(
             state=TaskState.submitted,
             message=Message(
                 role=Role.user,
-                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"both","additional_input":null}')],
+                parts=[TextPart(text='{"type":"multiple_choice_response","selected":"category","additional_input":null}')],
             ),
         ),
         history=[
@@ -3793,7 +4716,7 @@ async def test_namespaced_product_agent_catalog_scope_both_returns_category_widg
     )
     message = Message(
         role=Role.user,
-        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"both","additional_input":null}')],
+        parts=[TextPart(text='{"type":"multiple_choice_response","selected":"category","additional_input":null}')],
     )
 
     events = [event async for event in processor(task, message, None, None)]
@@ -3824,11 +4747,10 @@ async def test_namespaced_product_agent_category_selection_resumes_from_saved_wo
     scope_payload = {
         "interaction_type": "multiple_choice",
         "title": "Choose Catalog Filters",
-        "description": "I can start the product import flow. Do you want to browse products by category, by brand, or by both?",
+        "description": "I can import products from the global catalog. Do you want to browse by category or by brand?",
         "options": [
             {"value": "category", "label": "Product Category"},
             {"value": "brand", "label": "Brand"},
-            {"value": "both", "label": "Both Category and Brand"},
         ],
         "multiple": False,
         "allow_input": True,
@@ -3905,6 +4827,169 @@ async def test_namespaced_product_agent_category_selection_resumes_from_saved_wo
         "Eva Premium Water 75cl",
         "Coca-Cola Original Taste 50cl",
     ]
+
+    second_status_events = [event for event in second_events if isinstance(event, TaskStatus)]
+    assert second_status_events[-1].state == TaskState.input_required
+
+
+@pytest.mark.asyncio
+async def test_product_import_failure_surfaces_targeted_mcp_auth_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "KA2A_TOOL_EXECUTOR",
+        "tests.fake_langgraph_components:build_fake_tool_executor_with_global_import_failure",
+    )
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="product")
+    product_selection_payload = {
+        "interaction_type": "searchable_selection",
+        "title": "Choose Products to Import",
+        "description": "Page 1 of 1. Select the products you want to import from categories: Beverages.",
+        "items": [
+            {"id": "global-prod-1", "name": "Eva Premium Water 75cl"},
+            {"id": "global-prod-2", "name": "Coca-Cola Original Taste 50cl"},
+        ],
+        "search_fields": ["name", "description", "category"],
+        "multiple": True,
+        "max_selections": 30,
+        "allow_additional_input": False,
+        "workflow": "product_import",
+        "workflow_stage": "product_selection",
+        "onboarding_scope": "product_onboarding",
+        "catalog_scope": "category",
+        "selected_category_names": ["Beverages"],
+        "selected_brand_names": [],
+        "page": 1,
+        "total_pages": 1,
+        "total_count": 2,
+        "imported_count": 0,
+    }
+    task = Task(
+        id="task-product-import-failure",
+        context_id="ctx-product-import-failure",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"searchable_selection_response","selected_items":["global-prod-1"]}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="I want to import products")]),
+            Message(role=Role.agent, parts=[DataPart(data=product_selection_payload)]),
+        ],
+    )
+    message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"searchable_selection_response","selected_items":["global-prod-1"]}')],
+    )
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("product.import_global_catalog_products", {"global_product_ids": ["global-prod-1"]}),
+    ]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert result_artifact.parts[0].text == (
+        "I couldn't import the selected products from the global catalog. "
+        "The global catalog connection rejected the request. Reconnect the product MCP credentials and retry the import."
+    )
+
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.failed
+
+
+@pytest.mark.asyncio
+async def test_product_import_duplicate_selection_does_not_reimport_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+
+    processor = make_langgraph_chat_processor_from_env(agent_name="product")
+    product_selection_payload = {
+        "interaction_type": "searchable_selection",
+        "title": "Choose Products to Import",
+        "description": "Page 1 of 2. Select the products you want to import from categories: Beverages.",
+        "items": [
+            {"id": "global-prod-1", "name": "Eva Premium Water 75cl"},
+            {"id": "global-prod-2", "name": "Coca-Cola Original Taste 50cl"},
+        ],
+        "search_fields": ["name", "description", "category"],
+        "multiple": True,
+        "max_selections": 30,
+        "allow_additional_input": False,
+        "workflow": "product_import",
+        "workflow_stage": "product_selection",
+        "onboarding_scope": "product_onboarding",
+        "catalog_scope": "category",
+        "selected_category_names": ["Beverages"],
+        "selected_brand_names": [],
+        "page": 1,
+        "total_pages": 2,
+        "total_count": 60,
+        "imported_count": 0,
+    }
+    first_task = Task(
+        id="task-product-import-duplicate-first",
+        context_id="ctx-product-import-duplicate",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"searchable_selection_response","selected_items":["global-prod-1"]}')],
+            ),
+        ),
+        history=[
+            Message(role=Role.user, parts=[TextPart(text="I want to import products")]),
+            Message(role=Role.agent, parts=[DataPart(data=product_selection_payload)]),
+        ],
+    )
+    first_message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"searchable_selection_response","selected_items":["global-prod-1"]}')],
+    )
+
+    first_events = [event async for event in processor(first_task, first_message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("product.import_global_catalog_products", {"global_product_ids": ["global-prod-1"]}),
+    ]
+
+    first_result = next(event for event in first_events if isinstance(event, Artifact) and event.name == "result")
+    assert first_result.parts[0].data["workflow_stage"] == "page_continue"
+
+    first_status_events = [event for event in first_events if isinstance(event, TaskStatus)]
+    assert first_status_events[-1].state == TaskState.input_required
+
+    fake_langgraph_components.reset_fake_components()
+
+    second_task = Task(
+        id="task-product-import-duplicate-second",
+        context_id="ctx-product-import-duplicate",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(
+                role=Role.user,
+                parts=[TextPart(text='{"type":"searchable_selection_response","selected_items":["global-prod-1"]}')],
+            ),
+        ),
+    )
+    second_message = Message(
+        role=Role.user,
+        parts=[TextPart(text='{"type":"searchable_selection_response","selected_items":["global-prod-1"]}')],
+    )
+
+    second_events = [event async for event in processor(second_task, second_message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == []
+
+    second_result = next(event for event in second_events if isinstance(event, Artifact) and event.name == "result")
+    assert second_result.parts[0].text == (
+        "Those products were already imported from this catalog page. "
+        "Use the current prompt to continue to the next page or finish the import."
+    )
 
     second_status_events = [event for event in second_events if isinstance(event, TaskStatus)]
     assert second_status_events[-1].state == TaskState.input_required
@@ -4471,6 +5556,65 @@ async def test_inventory_router_auto_delegates_to_inventory_setup_subspecialist(
 
     delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
     assert delegation_artifact.parts[0].data["selectedAgent"] == "inventory_setup"
+
+
+@pytest.mark.asyncio
+async def test_inventory_router_rewrites_comprehensive_business_review_for_visibility_specialist() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="inventory")
+    request = (
+        "Continue the user's multi-domain business review.\n"
+        "Original user request: Analyze my business performance for the last quarter\n"
+        "Completed steps so far: Point of Sale (POS).\n"
+        "Latest completed step result: Sales performance for the requested review period is ready.\n"
+        "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+        "Run the full Inventory Management portion of the business review for that same time range.\n"
+        "Cover all of these in one response: stock posture and availability; turnover and velocity; reorder recommendations; ageing and expiry analysis; valuation and carrying cost; fulfillment and reservation issues; and procurement or receiving signals that affect stock health.\n"
+        "Use defaults without asking the user to choose a single focus: include all locations, provide both company-wide and per-location outputs, use POS sales from earlier steps as the demand signal where helpful, and only include lot or expiry-aware analysis if the workspace tracks it.\n"
+        "Do not send a focus picker, a default-confirmation checklist, or any retry prompt unless required permissions or source data are truly unavailable."
+    )
+    task = Task(
+        id="task-router-inventory-business-review",
+        context_id="ctx-router-inventory-business-review",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=request)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=request)])
+
+    events = [event async for event in processor(task, message, None, None)]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        ("list_available_agents", {}),
+        (
+            "delegate_to_agent",
+            {
+                "request": (
+                    "Run a comprehensive inventory health review for the requested time range.\n"
+                    "Original request: Continue the user's multi-domain business review.\n"
+                    "Original user request: Analyze my business performance for the last quarter\n"
+                    "Completed steps so far: Point of Sale (POS).\n"
+                    "Latest completed step result: Sales performance for the requested review period is ready.\n"
+                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+                    "Run the full Inventory Management portion of the business review for that same time range.\n"
+                    "Cover all of these in one response: stock posture and availability; turnover and velocity; reorder recommendations; ageing and expiry analysis; valuation and carrying cost; fulfillment and reservation issues; and procurement or receiving signals that affect stock health.\n"
+                    "Use defaults without asking the user to choose a single focus: include all locations, provide both company-wide and per-location outputs, use POS sales from earlier steps as the demand signal where helpful, and only include lot or expiry-aware analysis if the workspace tracks it.\n"
+                    "Do not send a focus picker, a default-confirmation checklist, or any retry prompt unless required permissions or source data are truly unavailable.\n"
+                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
+                    "Cover all of these in one consolidated response: stock posture and availability; turnover and velocity; reorder recommendations; ageing and expiry analysis; valuation and carrying cost; fulfillment and reservation issues; and procurement or receiving signals that affect stock health.\n"
+                    "Use defaults without asking the user to choose a focus: include all locations, provide both company-wide and per-location outputs, use established POS demand signals where helpful, and only include lot or expiry-aware analysis if the workspace tracks it.\n"
+                    "Do not send a focus picker, a default-confirmation checklist, or a retry-with-defaults prompt unless access is genuinely blocked."
+                ),
+                "agent_name": "inventory_visibility",
+            },
+        ),
+    ]
+
+    delegation_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation_artifact.parts[0].data["selectedAgent"] == "inventory_visibility"
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert "Comprehensive inventory health is ready." in _text_from_parts(result_artifact.parts)
 
 
 @pytest.mark.asyncio

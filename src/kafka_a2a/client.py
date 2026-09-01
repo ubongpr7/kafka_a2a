@@ -49,7 +49,12 @@ from kafka_a2a.transport.kafka import EnvelopeType, KafkaEnvelope, KafkaTranspor
 StreamResult = Task | Message | TaskStatusUpdateEvent | TaskArtifactUpdateEvent
 
 
-def _parse_stream_result(value: Any) -> StreamResult | Any:
+def _parse_stream_result(
+    value: Any,
+    *,
+    fallback_task_id: str | None = None,
+    fallback_context_id: str | None = None,
+) -> StreamResult | Any:
     if not isinstance(value, dict):
         return value
     kind = value.get("kind")
@@ -58,7 +63,14 @@ def _parse_stream_result(value: Any) -> StreamResult | Any:
     if kind == "message":
         return Message.model_validate(value)
     if kind == "status-update":
-        return TaskStatusUpdateEvent.model_validate(value)
+        # A compliant runtime includes task and context IDs. Preserve a usable
+        # status event if an older runtime omits them from a terminal update.
+        payload = dict(value)
+        if fallback_task_id and not payload.get("taskId") and not payload.get("task_id"):
+            payload["taskId"] = fallback_task_id
+        if fallback_context_id and not payload.get("contextId") and not payload.get("context_id"):
+            payload["contextId"] = fallback_context_id
+        return TaskStatusUpdateEvent.model_validate(payload)
     if kind == "artifact-update":
         return TaskArtifactUpdateEvent.model_validate(value)
     return value
@@ -379,7 +391,11 @@ class Ka2aClient:
                     item = await queue.get()
                     if item.error is not None:
                         raise A2AError(code=item.error.code, message=item.error.message, data=item.error.data)
-                    result = _parse_stream_result(item.result)
+                    result = _parse_stream_result(
+                        item.result,
+                        fallback_task_id=message.task_id or request_id,
+                        fallback_context_id=message.context_id or request_id,
+                    )
                     yield result
                     if _is_stream_done(result):
                         break
@@ -428,7 +444,11 @@ class Ka2aClient:
                     item = await queue.get()
                     if item.error is not None:
                         raise A2AError(code=item.error.code, message=item.error.message, data=item.error.data)
-                    result = _parse_stream_result(item.result)
+                    result = _parse_stream_result(
+                        item.result,
+                        fallback_task_id=task_id,
+                        fallback_context_id=request_id,
+                    )
                     yield result
                     if _is_stream_done(result):
                         break
@@ -483,7 +503,11 @@ class Ka2aClient:
                     item = await queue.get()
                     if item.error is not None:
                         raise A2AError(code=item.error.code, message=item.error.message, data=item.error.data)
-                    result = _parse_stream_result(item.result)
+                    result = _parse_stream_result(
+                        item.result,
+                        fallback_task_id=task_id,
+                        fallback_context_id=message.context_id or request_id,
+                    )
                     yield result
                     if _is_stream_done(result):
                         break

@@ -74,6 +74,7 @@ def test_insight_upgrade_binds_required_read_tools_to_specialists() -> None:
         "product_discovery": {
             "product.get_variant_lookup",
             "product.get_top_catalog_matches",
+            "product.list_global_catalog_products",
             "audit.get_product_activity",
         },
     }
@@ -106,6 +107,7 @@ def test_insight_upgrade_binds_required_read_tools_to_host() -> None:
         "product.get_product_stock_alerts",
         "product.get_variant_lookup",
         "product.get_top_catalog_matches",
+        "product.list_global_catalog_products",
         "audit.search_events",
         "audit.get_event_timeline",
         "audit.get_staff_activity",
