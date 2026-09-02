@@ -52,9 +52,12 @@ jobs:
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" <<'EOF'
           set -euo pipefail
+          flock /tmp/interaims-dev-deploy.lock bash <<'LOCKED'
+          set -euo pipefail
           /usr/local/bin/interaims-host-init
           cd "${{ env.DEPLOY_PATH }}"
           docker compose -f "${{ env.COMPOSE_FILE }}" up -d --build --force-recreate --remove-orphans
-          docker image prune -f
+          docker image prune -f || true
           docker compose -f "${{ env.COMPOSE_FILE }}" ps
+          LOCKED
           EOF
