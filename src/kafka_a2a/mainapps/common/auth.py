@@ -24,7 +24,11 @@ class AgentAuthContext:
 
     @property
     def is_workspace_owner(self) -> bool:
-        return bool(self.owner_id and self.owner_id == self.user_id)
+        owner_claim = self.claims.get("is_owner")
+        claim_marks_owner = owner_claim is True or (
+            isinstance(owner_claim, str) and owner_claim.strip().lower() in {"1", "true", "yes"}
+        )
+        return claim_marks_owner or bool(self.owner_id and self.owner_id == self.user_id)
 
     def has_permission(self, permission: str) -> bool:
         return self.is_workspace_owner or permission in self.permissions
