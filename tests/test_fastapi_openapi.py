@@ -1,3 +1,6 @@
+import asyncio
+
+import httpx
 import pytest
 
 
@@ -29,6 +32,37 @@ def test_proxy_openapi_builds() -> None:
     assert "/health" in schema.get("paths", {})
     assert "/" in schema.get("paths", {})
     assert "/.well-known/agent-card.json" in schema.get("paths", {})
+
+
+def test_proxy_enables_cors_middleware() -> None:
+    app = create_a2a_http_proxy_app(A2AHttpProxyConfig(bootstrap_servers="localhost:9092", agent_name="host"))
+    middleware_classes = [middleware.cls for middleware in app.user_middleware]
+    assert CORSMiddleware in middleware_classes
+
+
+def test_proxy_cors_preflight_allows_configured_local_frontend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KA2A_CORS_ALLOW_ORIGINS", "https://dev.interaims.com,http://localhost:3000")
+    monkeypatch.setenv("KA2A_CORS_ALLOW_CREDENTIALS", "true")
+    app = create_a2a_http_proxy_app(A2AHttpProxyConfig(bootstrap_servers="localhost:9092", agent_name="host"))
+
+    async def request_preflight() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.options(
+                "/",
+                headers={
+                    "Origin": "http://localhost:3000",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "authorization,content-type",
+                },
+            )
+
+    response = asyncio.run(request_preflight())
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert response.headers["access-control-allow-credentials"] == "true"
+    assert "POST" in response.headers["access-control-allow-methods"]
 
 
 def test_gateway_enables_cors_middleware() -> None:

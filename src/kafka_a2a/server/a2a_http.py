@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
@@ -33,6 +34,9 @@ from kafka_a2a.server.auth import JwtBearerConfig, JwtVerificationError, parse_a
 from kafka_a2a.tenancy import with_principal
 
 
+_DEFAULT_CORS_ALLOW_ORIGIN_REGEX = r"^https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?$"
+
+
 def _require_fastapi() -> Any:
     try:
         from fastapi import FastAPI  # noqa: F401
@@ -56,6 +60,23 @@ def _jsonrpc_error(request_id: Any, code: int, message: str, data: Any | None = 
     return {"jsonrpc": "2.0", "id": request_id, "error": err}
 
 
+def _parse_csv_env(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 @dataclass(slots=True)
 class A2AHttpProxyConfig:
     bootstrap_servers: str
@@ -70,6 +91,7 @@ class A2AHttpProxyConfig:
 def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
     FastAPI = _require_fastapi()
     from fastapi import Request
+    from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse, StreamingResponse
 
     transport = KafkaTransport(
@@ -90,6 +112,22 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
             await client.stop()
 
     app = FastAPI(title=config.title, version=config.version, lifespan=_lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_parse_csv_env("KA2A_CORS_ALLOW_ORIGINS"),
+        allow_origin_regex=os.environ.get("KA2A_CORS_ALLOW_ORIGIN_REGEX", _DEFAULT_CORS_ALLOW_ORIGIN_REGEX),
+        allow_credentials=_parse_bool_env("KA2A_CORS_ALLOW_CREDENTIALS", default=False),
+        allow_methods=_parse_csv_env("KA2A_CORS_ALLOW_METHODS") or ["GET", "POST", "OPTIONS"],
+        allow_headers=_parse_csv_env("KA2A_CORS_ALLOW_HEADERS")
+        or [
+            "Authorization",
+            "Content-Type",
+            "X-Requested-With",
+            "X-Profile-ID",
+            "X-Company-Code",
+            "X-Device-ID",
+        ],
+    )
 
     def _authorization_from_request(request: Request) -> str | None:
         value = request.headers.get("authorization")
