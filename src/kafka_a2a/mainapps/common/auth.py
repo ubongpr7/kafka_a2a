@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
+import json
+import os
+import time
 from typing import Any
+from urllib import error, request as urlrequest
 
 from fastapi import HTTPException, Request, WebSocket
 
@@ -11,6 +16,10 @@ from kafka_a2a.server.auth import (
     parse_authorization_header,
     verify_bearer_jwt,
 )
+
+
+_permission_cache: dict[str, tuple[float, bool]] = {}
+_permission_cache_version = 1
 
 
 @dataclass(slots=True)
@@ -27,7 +36,7 @@ class AgentAuthContext:
         return bool(self.owner_id and self.owner_id == self.user_id)
 
     def has_permission(self, permission: str) -> bool:
-        return self.is_workspace_owner or permission in self.permissions
+        return self.is_workspace_owner or _has_permission(self, permission)
 
 
 def _normalize_id(value: Any) -> str | None:
@@ -35,6 +44,99 @@ def _normalize_id(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _matches_permission(required: str, granted_permissions: set[str]) -> bool:
+    return any(
+        granted == required
+        or (granted.endswith(".*") and required.startswith(granted[:-1]))
+        for granted in granted_permissions
+    )
+
+
+def _permission_service_config() -> tuple[str, str, str, float, int]:
+    return (
+        (
+            os.getenv("USER_SERVICE_URL")
+            or os.getenv("INTERA_USERS_SERVICE_URL")
+            or os.getenv("AUTHORIZATION_SERVICE_URL")
+            or ""
+        ).rstrip("/"),
+        (
+            os.getenv("PERMISSION_EVALUATION_SERVICE_KEY")
+            or os.getenv("INTERA_INTERNAL_SERVICE_KEY")
+            or os.getenv("SUBSCRIPTION_SERVICE_KEY")
+            or ""
+        ),
+        os.getenv("KAFKA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "kafka_a2a",
+        float(os.getenv("PERMISSION_EVALUATION_TIMEOUT", "2.0")),
+        int(os.getenv("PERMISSION_EVALUATION_CACHE_TTL_SECONDS", "3600")),
+    )
+
+
+def _permission_cache_key(*, context: AgentAuthContext, permission: str, service_name: str) -> str:
+    raw = json.dumps(
+        {
+            "permission": permission,
+            "platform": str(context.claims.get("platform") or "intera_ims"),
+            "profile_id": context.profile_id,
+            "service": service_name,
+            "user_id": context.user_id,
+            "version": _permission_cache_version,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _has_permission(context: AgentAuthContext, permission: str) -> bool:
+    permission = str(permission or "").strip()
+    if not permission:
+        return False
+    if _matches_permission(permission, context.permissions):
+        return True
+
+    base_url, service_key, service_name, timeout, default_ttl = _permission_service_config()
+    if not base_url or not service_key:
+        return False
+
+    cache_key = _permission_cache_key(context=context, permission=permission, service_name=service_name)
+    now = time.monotonic()
+    cached = _permission_cache.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    payload = json.dumps(
+        {
+            "user_id": context.user_id,
+            "profile_id": context.profile_id,
+            "platform": str(context.claims.get("platform") or "intera_ims"),
+            "service": service_name,
+            "permissions": [permission],
+        }
+    ).encode("utf-8")
+    req = urlrequest.Request(
+        f"{base_url}/permission_api/internal/evaluate-permissions/",
+        data=payload,
+        headers={"Content-Type": "application/json", "X-Intera-Service-Key": service_key},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, error.HTTPError, error.URLError):
+        return False
+
+    allowed = bool((data.get("grants") or {}).get(permission))
+    _permission_cache[cache_key] = (now + max(int(data.get("expires_in") or default_ttl), 1), allowed)
+    return allowed
+
+
+def invalidate_permission_cache() -> None:
+    global _permission_cache_version
+    _permission_cache_version += 1
+    _permission_cache.clear()
 
 
 def get_bearer_token_from_request(request: Request) -> str:
