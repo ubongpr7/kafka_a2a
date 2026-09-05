@@ -118,3 +118,27 @@ async def test_shared_runtime_starts_pending_workers_concurrently() -> None:
     await reconcile_task
 
     assert set(started) == {"agent-a", "agent-b", "agent-c"}
+
+
+@pytest.mark.asyncio
+async def test_shared_runtime_provisions_workspace_request_topic(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = SharedRuntimeService(bootstrap_servers="kafka:9092", poll_interval_s=5.0)
+    captured: dict[str, object] = {}
+
+    async def fake_ensure_kafka_topics(**kwargs) -> list[str]:
+        captured.update(kwargs)
+        return ["inventory.ka2a.req.wa-p4-host-123"]
+
+    monkeypatch.setenv("KA2A_TOPIC_NAMESPACE", "inventory")
+    monkeypatch.setenv("KA2A_KAFKA_TOPIC_PARTITIONS", "3")
+    monkeypatch.setenv("KA2A_KAFKA_TOPIC_REPLICATION_FACTOR", "1")
+    monkeypatch.setattr("kafka_a2a.runtime.shared_runtime.ensure_kafka_topics", fake_ensure_kafka_topics)
+
+    await service._ensure_agent_request_topic("wa-p4-host-123")
+
+    config = captured["config"]
+    assert config.bootstrap_servers == "kafka:9092"
+    assert config.client_id == "ka2a-runtime-topic-wa-p4-host-123"
+    assert captured["topic_names"] == ["inventory.ka2a.req.wa-p4-host-123"]
+    assert captured["partitions"] == 3
+    assert captured["replication_factor"] == 1

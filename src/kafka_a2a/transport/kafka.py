@@ -7,7 +7,7 @@ import ssl
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterable
 from uuid import uuid4
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -294,6 +294,52 @@ class KafkaConfig:
 
         # Remove None values to keep aiokafka happy.
         return {k: v for k, v in kwargs.items() if v is not None}
+
+
+async def ensure_kafka_topics(
+    *,
+    config: KafkaConfig,
+    topic_names: Iterable[str],
+    partitions: int = 1,
+    replication_factor: int = 1,
+) -> list[str]:
+    """Create missing topics safely when Kafka auto-creation is disabled."""
+
+    names = sorted({str(name).strip() for name in topic_names if str(name).strip()})
+    if not names:
+        return []
+
+    try:
+        from aiokafka.admin import AIOKafkaAdminClient, NewTopic
+        from aiokafka.errors import TopicAlreadyExistsError
+    except Exception as exc:  # pragma: no cover - aiokafka is a runtime dependency
+        raise RuntimeError("aiokafka admin support is required to provision Kafka topics.") from exc
+
+    admin = AIOKafkaAdminClient(**config.aiokafka_kwargs())
+    await admin.start()
+    try:
+        existing = set(await admin.list_topics())
+        missing = [name for name in names if name not in existing]
+        if not missing:
+            return []
+        try:
+            await admin.create_topics(
+                new_topics=[
+                    NewTopic(
+                        name=name,
+                        num_partitions=max(1, int(partitions)),
+                        replication_factor=max(1, int(replication_factor)),
+                    )
+                    for name in missing
+                ],
+                validate_only=False,
+            )
+        except TopicAlreadyExistsError:
+            # Another runtime may have won the creation race.
+            pass
+        return missing
+    finally:
+        await admin.close()
 
 
 @dataclass(slots=True)

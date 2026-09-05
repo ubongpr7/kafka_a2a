@@ -20,7 +20,7 @@ from kafka_a2a.mcp_tools import McpServerAuthConfig, McpServerConfig, MultiMcpTo
 from kafka_a2a.models import AgentCard, DataPart, Message, Role, Task, TaskArtifactUpdateEvent, TaskStatusUpdateEvent, TextPart
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
 from kafka_a2a.runtime.agent import Ka2aAgent, Ka2aAgentConfig, TaskProcessor
-from kafka_a2a.transport.kafka import KafkaConfig, KafkaTransport
+from kafka_a2a.transport.kafka import KafkaConfig, KafkaTransport, TopicNamer, ensure_kafka_topics
 
 logger = logging.getLogger("kafka_a2a.shared_runtime")
 
@@ -586,10 +586,28 @@ class SharedRuntimeService:
                 )
             )
 
+    async def _ensure_agent_request_topic(self, runtime_name: str) -> None:
+        """Provision a workspace worker's request topic before it joins Kafka."""
+
+        config = KafkaConfig.from_env(
+            bootstrap_servers=self._bootstrap_servers,
+            client_id=f"ka2a-runtime-topic-{runtime_name}",
+        )
+        created = await ensure_kafka_topics(
+            config=config,
+            topic_names=[TopicNamer.from_env().agent_requests(runtime_name)],
+            partitions=int(os.getenv("KA2A_KAFKA_TOPIC_PARTITIONS") or "1"),
+            replication_factor=int(os.getenv("KA2A_KAFKA_TOPIC_REPLICATION_FACTOR") or "1"),
+        )
+        if created:
+            logger.info("provisioned workspace runtime request topic", extra={"runtime_name": runtime_name, "topics": created})
+
     async def _start_agent(self, *, runtime_name: str, fingerprint: str, agent_payload: dict[str, Any]) -> None:
         runtime_card_payload = agent_payload.get("runtime_card_payload")
         if not isinstance(runtime_card_payload, dict):
             raise ValueError(f"Runtime card payload is missing for agent '{runtime_name}'.")
+
+        await self._ensure_agent_request_topic(runtime_name)
 
         card = AgentCard.model_validate(runtime_card_payload)
         processor = _build_processor(

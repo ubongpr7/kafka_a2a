@@ -202,6 +202,13 @@ services:
     expose:
       - "7007"
 
+  runtime:
+    <<: *service
+    container_name: interaims-dev-ka2a-runtime
+    depends_on:
+      - gateway
+    command: ["runtime"]
+
   voice-agent:
     <<: *service
     container_name: interaims-dev-ka2a-voice-agent

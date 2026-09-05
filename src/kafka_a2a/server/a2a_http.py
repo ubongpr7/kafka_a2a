@@ -126,6 +126,8 @@ def create_a2a_http_proxy_app(config: A2AHttpProxyConfig):
             "X-Profile-ID",
             "X-Company-Code",
             "X-Device-ID",
+            "X-Intera-Authorization-Context",
+            "X-Intera-Frontend-Origin",
         ],
     )
 
