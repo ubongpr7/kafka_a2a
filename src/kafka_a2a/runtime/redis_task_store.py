@@ -65,7 +65,7 @@ class RedisTaskStore:
         env_map = env or os.environ
         defaults = RedisTaskStoreConfig()
         cfg = RedisTaskStoreConfig(
-            url=(env_map.get("KA2A_REDIS_URL") or defaults.url).strip(),
+            url=(env_map.get("KA2A_REDIS_URL") or env_map.get("REDIS_URL") or defaults.url).strip(),
             namespace=(env_map.get("KA2A_REDIS_NAMESPACE") or defaults.namespace).strip(),
             block_ms=int(env_map.get("KA2A_REDIS_BLOCK_MS") or str(defaults.block_ms)),
             read_count=int(env_map.get("KA2A_REDIS_READ_COUNT") or str(defaults.read_count)),

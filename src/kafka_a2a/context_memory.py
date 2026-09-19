@@ -119,7 +119,7 @@ class RedisContextMemoryStore:
         env_map = env or os.environ
         defaults = RedisContextMemoryStoreConfig()
         cfg = RedisContextMemoryStoreConfig(
-            url=(env_map.get("KA2A_REDIS_URL") or defaults.url).strip(),
+            url=(env_map.get("KA2A_REDIS_URL") or env_map.get("REDIS_URL") or defaults.url).strip(),
             namespace=(env_map.get("KA2A_REDIS_NAMESPACE") or defaults.namespace).strip(),
             ttl_s=int(env_map["KA2A_CONTEXT_MEMORY_TTL_S"]) if env_map.get("KA2A_CONTEXT_MEMORY_TTL_S") else None,
         )

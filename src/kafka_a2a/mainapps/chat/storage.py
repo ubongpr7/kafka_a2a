@@ -367,7 +367,7 @@ class RedisConversationStore:
         env_map = env or os.environ
         defaults = RedisConversationStoreConfig()
         cfg = RedisConversationStoreConfig(
-            url=(env_map.get("KA2A_REDIS_URL") or defaults.url).strip(),
+            url=(env_map.get("KA2A_REDIS_URL") or env_map.get("REDIS_URL") or defaults.url).strip(),
             namespace=(env_map.get("KA2A_REDIS_NAMESPACE") or defaults.namespace).strip(),
         )
         redis_async = _require_redis()
