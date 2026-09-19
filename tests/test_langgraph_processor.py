@@ -14,6 +14,7 @@ from kafka_a2a.langgraph_processor import (
     _build_pos_product_comparison_insight,
     _build_pos_sales_by_location_insight,
     _build_pos_sales_overview_insight,
+    _build_pos_total_units_sold_insight,
     _build_pos_top_sellers_insight,
     _enrich_top_seller_results_with_variant_context,
     _build_inventory_operation,
@@ -122,6 +123,8 @@ def test_pos_admin_named_insight_from_text_detects_priority_flows() -> None:
     assert _pos_admin_named_insight_from_text("Show top sellers in seven days") == "top_sellers_seven_days"
     assert _pos_admin_named_insight_from_text("How many sales was made last month?") == "sales_overview"
     assert _pos_admin_named_insight_from_text("can you analyse my sales data for the past 1 year?") == "sales_overview"
+    assert _pos_admin_named_insight_from_text("How many products did we sell today?") == "total_units_sold"
+    assert _pos_admin_named_insight_from_text("What about the amount of products I have sold for the past two years?") == "total_units_sold"
     assert _pos_admin_named_insight_from_text("Which products are selling the most?") == "top_sellers_seven_days"
     assert _pos_admin_named_insight_from_text("Show sales trend for barcode 8800000001501 over the past year") == "product_sales_trend"
     assert _pos_admin_named_insight_from_text("Compare product Eva Premium Water across locations for the past year") == "product_sales_trend"
@@ -444,6 +447,22 @@ def test_build_pos_top_sellers_insight_returns_ranked_widget_payload() -> None:
     assert payload["insights"][1]["detail"] == "12 units contributed ₦7,800.00 in sales across the ranked set."
 
 
+def test_build_pos_total_units_sold_insight_uses_all_completed_order_lines() -> None:
+    payload = _build_pos_total_units_sold_insight(
+        {
+            "_window_label": "last 2 years",
+            "total_quantity_sold": 143,
+            "total_sales": 71500.0,
+            "groups": [{"label": "HQ", "order_count": 24, "total_sales": 71500.0}],
+        }
+    )
+
+    assert payload["summary"] == "143 units were sold for last 2 years across 24 completed POS orders."
+    assert payload["widgets"][0]["data"][0] == {"label": "Units Sold", "value": 143.0}
+    assert payload["data_sources"][0]["endpoint_or_topic"] == "get_sales_summary"
+    assert "not only the highest-ranked products" in payload["explanation"]
+
+
 def test_build_pos_best_sales_day_insight_returns_trend_payload() -> None:
     payload = _build_pos_best_sales_day_insight(
         {
@@ -542,6 +561,7 @@ class _RecordingToolExecutor:
             if arguments.get("group_by") == "day":
                 return {
                     "total_sales": 2400.0,
+                    "total_quantity_sold": 9.0,
                     "groups": [
                         {"label": "2026-06-01", "order_count": 1, "total_sales": 900.0},
                         {"label": "2026-06-04", "order_count": 1, "total_sales": 1500.0},
@@ -549,6 +569,7 @@ class _RecordingToolExecutor:
                 }
             return {
                 "total_sales": 2400.0,
+                "total_quantity_sold": 9.0,
                 "groups": [{"label": "HQ", "order_count": 2, "total_sales": 2400.0}],
             }
         if name == "pos.get_top_sellers":
@@ -929,6 +950,12 @@ async def test_pos_named_insight_payload_threads_relative_date_filters_into_tool
         tool_ctx=ToolContext(),
         user_text="compare Eva Premium Water with barcode 8800000001101 for the past year",
     )
+    total_units_payload = await _pos_admin_named_insight_payload(
+        insight_key="total_units_sold",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="What about the amount of products I have sold for the past two years?",
+    )
 
     assert overview_payload is not None
     assert sales_payload is not None
@@ -957,6 +984,8 @@ async def test_pos_named_insight_payload_threads_relative_date_filters_into_tool
     assert mixed_product_comparison_payload["widgets"][2]["type"] == "line_chart"
     assert mixed_product_comparison_payload["widgets"][6]["type"] == "comparison_table"
     assert "sku" not in mixed_product_comparison_payload["widgets"][6]["columns"]
+    assert total_units_payload is not None
+    assert total_units_payload["summary"].startswith("9 units were sold for last 2 years")
     overview_window = _resolve_insight_time_window("how many sales was made last month", default_days=1, default_label="today")
     sales_window = _resolve_insight_time_window("show sales by location for the past month", default_days=1, default_label="today")
     top_sellers_window = _resolve_insight_time_window("show top sellers from 3 months ago", default_days=7, default_label="last 7 days")
@@ -965,6 +994,11 @@ async def test_pos_named_insight_payload_threads_relative_date_filters_into_tool
     product_window = _resolve_insight_time_window("show sales trend for barcode 8800000001501 over the past year", default_days=365, default_label="last 1 year")
     variant_window = _resolve_insight_time_window("compare variants of Next Pique Polo Shirt for the past year", default_days=365, default_label="last 1 year")
     comparison_window = _resolve_insight_time_window("compare Eva Premium Water with barcode 8800000001101 for the past year", default_days=365, default_label="last 1 year")
+    total_units_window = _resolve_insight_time_window(
+        "What about the amount of products I have sold for the past two years?",
+        default_days=1,
+        default_label="today",
+    )
     pos_calls = [call for call in executor.calls if call[0].startswith("pos.")]
     assert pos_calls[0] == (
         "pos.get_sales_summary",
@@ -1033,6 +1067,10 @@ async def test_pos_named_insight_payload_threads_relative_date_filters_into_tool
             "include_recent": False,
         },
     ) in pos_calls
+    assert pos_calls[-1] == (
+        "pos.get_sales_summary",
+        {"days": total_units_window["days"], "date": total_units_window["anchor_date"], "group_by": "location"},
+    )
     assert (
         "pos.get_product_sales_trend",
         {
@@ -1299,9 +1337,9 @@ def test_host_named_insight_from_text_detects_cross_domain_flows() -> None:
     assert _host_named_insight_from_text("How many sales was made last month?") == "pos::sales_overview"
     assert _host_named_insight_from_text("Give me the sales analysis for last month.") == "pos::sales_overview"
     assert _host_named_insight_from_text("can you analyse my sales data for the past 1 year?") == "pos::sales_overview"
-    assert _host_named_insight_from_text("how many goods has been sold today") == "pos::top_sellers_seven_days"
-    assert _host_named_insight_from_text("how many products did we sell today") == "pos::top_sellers_seven_days"
-    assert _host_named_insight_from_text("How many units were sold today?") == "pos::top_sellers_seven_days"
+    assert _host_named_insight_from_text("how many goods has been sold today") == "pos::total_units_sold"
+    assert _host_named_insight_from_text("how many products did we sell today") == "pos::total_units_sold"
+    assert _host_named_insight_from_text("How many units were sold today?") == "pos::total_units_sold"
     assert _host_named_insight_from_text("what is my revenue today") == "pos::sales_overview"
     assert _host_named_insight_from_text("which terminal sold the most today") == "pos::terminal_cashier_activity"
     assert _host_named_insight_from_text("which location sold the most this month") == "pos::sales_by_location_today"
@@ -1886,6 +1924,23 @@ def test_infer_domain_agent_name_prefers_pos_for_sales_by_location_queries() -> 
     assert _infer_domain_agent_name("Show sales by location today") == "pos"
     assert _infer_domain_agent_name("Break down today's sales by location") == "pos"
     assert _infer_domain_agent_name("Show top sellers in seven days") == "pos"
+
+
+def test_product_units_sold_follow_up_routes_to_pos_reporting() -> None:
+    query = "What about the amount of products I have sold for the past two years?"
+    host_agents = [
+        {"name": "product", "description": "Product catalog specialist."},
+        {"name": "pos", "description": "Point-of-sale reporting specialist."},
+    ]
+    router_agents = [
+        {"name": "product_catalog_admin", "description": "Product catalog administration."},
+        {"name": "pos_admin", "description": "POS reports and analytics."},
+    ]
+
+    assert _strong_domain_agent_override(query) == "pos"
+    assert _infer_domain_agent_name(query) == "pos"
+    assert _select_host_delegation_agent(query, host_agents) == "pos"
+    assert _select_router_handoff_agent("pos", query, router_agents) == "pos_admin"
 
 
 def test_host_orchestration_plan_does_not_append_inventory_for_pos_insight_query() -> None:

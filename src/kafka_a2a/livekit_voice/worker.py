@@ -1622,12 +1622,16 @@ def _voice_clarification_requirement(transcript: str) -> dict[str, str] | None:
             ),
         }
     if not _voice_has_business_context(normalized):
-        tokens = [token for token in re.split(r"[^a-z0-9']+", normalized) if token]
-        if len(tokens) <= 8:
-            return {
-                "kind": "continuation",
-                "question": "Tell me what you want me to analyze or check, and I’ll send it through.",
-            }
+        # Never silently discard completed caller speech. A caller may have
+        # phrased a request outside the current business vocabulary or STT may
+        # have garbled it; ask for a focused restatement instead.
+        return {
+            "kind": "continuation",
+            "question": (
+                "I didn’t catch a workspace task I can act on. Please say what you want me to "
+                "check, analyze, compare, or do."
+            ),
+        }
     if _voice_is_likely_incomplete_fragment(normalized):
         return {
             "kind": "continuation",
@@ -1688,8 +1692,6 @@ def _voice_readiness_candidates(
     if str(clarification.get("kind") or "") == "continuation":
         if _voice_has_business_context(transcript) and not _voice_is_likely_incomplete_fragment(transcript):
             candidates["delegate_to_host"] = _VOICE_READINESS_ACTIONS["delegate_to_host"]
-        if not _voice_has_business_context(transcript):
-            candidates["ignore_non_request"] = _VOICE_READINESS_ACTIONS["ignore_non_request"]
     return baseline, candidates
 
 
@@ -3176,15 +3178,23 @@ async def _voice_entrypoint(ctx: Any) -> None:
             if readiness_action == "delegate_to_host":
                 clarification = None
             elif readiness_action == "ignore_non_request":
+                # A decision provider may return an older or unexpected action.
+                # Preserve the no-silent-turn guarantee for any non-empty final
+                # transcript rather than dropping what the caller said.
                 logger.info(
-                    "voice transcript ignored by readiness policy",
+                    "voice transcript converted from ignore to clarification",
                     extra={
                         "profile_id": self._runtime.profile_id,
                         "source": source,
                         "word_count": len(transcript.split()),
                     },
                 )
-                return None
+                readiness_action = "ask_clarification"
+                clarification = _voice_clarification_for_action(
+                    readiness_action,
+                    transcript=transcript,
+                    baseline=clarification,
+                )
             elif readiness_action == "wait_for_more_speech" and clarification is not None:
                 key = self._transcript_key(transcript)
                 max_attempts = max(1, int(os.getenv("KA2A_VOICE_DEFERRED_FRAGMENT_MAX_ATTEMPTS") or "2"))

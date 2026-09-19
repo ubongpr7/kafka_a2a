@@ -364,6 +364,24 @@ def test_voice_readiness_can_defer_an_ambiguous_fragment_without_delegating() ->
     assert "ask_clarification" in candidates
 
 
+def test_voice_router_never_silently_ignores_nonempty_unrecognized_speech() -> None:
+    transcript = "I have something I want to ask but I cannot explain it clearly yet"
+    clarification = _voice_clarification_requirement(transcript)
+
+    assert clarification is not None
+    assert clarification["kind"] == "continuation"
+    assert "workspace task" in clarification["question"]
+
+    baseline, candidates = _voice_readiness_candidates(
+        transcript,
+        clarification,
+        source="completed_turn",
+    )
+
+    assert baseline == "ask_clarification"
+    assert set(candidates) == {"ask_clarification"}
+
+
 def test_voice_decision_action_uses_existing_focused_clarification_templates() -> None:
     metric = _voice_clarification_for_action(
         "ask_metric_scope",
@@ -412,6 +430,21 @@ def test_voice_transcript_batch_merges_question_with_time_range_follow_up() -> N
 
     assert transcript == "Can you help me analyze my sales data? for the past one year"
     assert remaining == []
+
+
+def test_voice_transcript_batch_merges_split_business_request_before_delegation() -> None:
+    transcript, remaining = _select_voice_transcript_batch(
+        [
+            "Can you help me to",
+            "analyze my business performance",
+            "for the last one year",
+        ]
+    )
+
+    assert transcript == "Can you help me to analyze my business performance for the last one year"
+    assert remaining == []
+    assert _voice_clarification_requirement(transcript) is None
+    assert _should_delegate_voice_transcript(transcript)
 
 
 def test_voice_transcript_batch_drops_filler_before_sales_request() -> None:

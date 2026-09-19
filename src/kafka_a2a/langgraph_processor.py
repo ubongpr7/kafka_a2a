@@ -698,6 +698,8 @@ def _strong_domain_agent_override(query: str) -> str | None:
         return "inventory"
     if _is_non_import_onboarding_request(text):
         return "onboarding"
+    if _is_total_units_sold_query(text):
+        return "pos"
     if (
         any(token in text for token in ("import", "onboard", "onboarding"))
         and any(
@@ -6476,6 +6478,8 @@ def _pos_admin_named_insight_from_text(text: str) -> str | None:
         and any(token in normalized for token in ("day", "daily", "ever", "all time", "historical", "history"))
     ):
         return "best_sales_day"
+    if _is_total_units_sold_query(normalized):
+        return "total_units_sold"
     if (
         any(token in normalized for token in ("how many", "total", "count", "number of"))
         and any(token in normalized for token in ("sell", "sold", "selling", "sales"))
@@ -6668,6 +6672,18 @@ def _pos_admin_named_insight_from_text(text: str) -> str | None:
     ):
         return "pos_exceptions"
     return None
+
+
+def _is_total_units_sold_query(value: str) -> bool:
+    """Identify requests for the total number of POS line units, not a ranking."""
+    text = _normalize_user_text(value)
+    if not text:
+        return False
+    return (
+        any(token in text for token in ("how many", "amount", "quantity", "number of", "total", "units"))
+        and any(token in text for token in ("sell", "sold", "selling", "sales"))
+        and any(token in text for token in ("goods", "products", "product", "items", "item", "units", "unit"))
+    )
 
 
 def _inventory_procurement_named_insight_from_text(text: str) -> str | None:
@@ -8379,6 +8395,71 @@ def _build_pos_top_sellers_insight(payload: dict[str, Any]) -> dict[str, Any]:
         "permissions_checked": ["view_pos_reports"],
         "confidence": "high",
         "warnings": [] if ranked_items else ["No completed sales matched the requested window."],
+    }
+
+
+def _build_pos_total_units_sold_insight(payload: dict[str, Any]) -> dict[str, Any]:
+    window_label = _payload_window_label(payload, fallback="the selected period")
+    groups = payload.get("groups") if isinstance(payload.get("groups"), list) else []
+    total_orders = sum(int(item.get("order_count") or 0) for item in groups if isinstance(item, dict))
+    total_sales = float(payload.get("total_sales") or 0)
+    has_quantity_total = "total_quantity_sold" in payload
+    total_quantity = float(payload.get("total_quantity_sold") or 0)
+    quantity_label = _format_plain_number(total_quantity)
+    summary = (
+        f"{quantity_label} units were sold for {window_label} across {total_orders} completed POS orders."
+        if has_quantity_total and total_orders
+        else f"No completed POS sales were recorded for {window_label}."
+        if has_quantity_total
+        else f"The POS report did not return a total units count for {window_label}."
+    )
+    explanation = (
+        "This total includes every completed POS order line in the selected period, not only the highest-ranked products."
+        if has_quantity_total and total_orders
+        else "A complete POS line-item total was not available for the selected period."
+    )
+    return {
+        "kind": "insight_response",
+        "summary": summary,
+        "explanation": explanation,
+        "timeframe": {
+            "label": window_label,
+            "start_date": str(payload.get("_window_start_date") or ""),
+            "end_date": str(payload.get("_window_end_date") or ""),
+            "period": str(payload.get("_window_period") or ""),
+        },
+        "insights": (
+            [
+                {
+                    "title": "Full line-item count",
+                    "detail": f"{quantity_label} units were counted across every completed POS order line.",
+                }
+            ]
+            if has_quantity_total and total_orders
+            else []
+        ),
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": f"Products sold for {window_label}",
+                "data": [
+                    {"label": "Units Sold", "value": round(total_quantity, 3)},
+                    {"label": "Completed Orders", "value": total_orders},
+                    {"label": "Sales", "value": round(total_sales, 2)},
+                ],
+            }
+        ],
+        "suggested_actions": [],
+        "data_sources": [{"service": "pos", "endpoint_or_topic": "get_sales_summary", "freshness": "live"}],
+        "permissions_checked": ["view_pos_reports"],
+        "confidence": "high" if has_quantity_total else "low",
+        "warnings": (
+            []
+            if has_quantity_total and total_orders
+            else ["No completed sales matched the requested window."]
+            if has_quantity_total
+            else ["The POS reporting service did not return total_quantity_sold."]
+        ),
     }
 
 
@@ -11503,6 +11584,15 @@ async def _pos_admin_named_insight_payload(
             tool_ctx=tool_ctx,
         )
         return _build_pos_sales_by_location_insight(_with_window_label(output, window=sales_window))
+    if insight_key == "total_units_sold":
+        output = await tool_executor.call_tool(
+            name="pos.get_sales_summary",
+            arguments={**_insight_window_tool_arguments(sales_window, include_date=True), "group_by": "location"},
+            ctx=tool_ctx,
+        )
+        return _build_pos_total_units_sold_insight(
+            _with_window_label(output if isinstance(output, dict) else {}, window=sales_window)
+        )
     if insight_key == "top_sellers_seven_days":
         output = await tool_executor.call_tool(
             name="pos.get_top_sellers",
@@ -14514,6 +14604,8 @@ def _select_router_specialist_agent(
             return _pick("product_discovery")
 
     if router_agent_name == "pos":
+        if _is_total_units_sold_query(text):
+            return _pick("pos_admin")
         if any(
             token in text
             for token in (
