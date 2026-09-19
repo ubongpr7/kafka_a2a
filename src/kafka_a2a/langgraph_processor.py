@@ -14,6 +14,7 @@ from typing import Any, TypedDict
 from urllib.parse import quote
 
 from kafka_a2a.context_memory import ContextMemory, ContextMemoryStore, InMemoryContextMemoryStore, RedisContextMemoryStore
+from kafka_a2a.decisioning.facade import AgentDecisionFacade
 from kafka_a2a.memory import KA2A_CONVERSATION_HISTORY_METADATA_KEY
 from kafka_a2a.models import (
     Artifact,
@@ -2812,6 +2813,35 @@ def _looks_like_fresh_freeform_request(value: str) -> bool:
     ):
         return True
     return len(text.split()) >= 5
+
+
+def _host_turn_shadow_baseline_intent(
+    *,
+    current_user_text: str,
+    effective_user_text: str,
+    workflow_state: dict[str, Any] | None,
+    clarification_target_agent: str | None,
+    interaction_response: dict[str, Any] | None,
+) -> str:
+    """Describe the existing host branch for shadow comparison without driving it."""
+
+    text = _normalize_user_text(current_user_text)
+    if (
+        clarification_target_agent is not None
+        or str((workflow_state or {}).get("workflow") or "").strip().lower() == "clarification"
+    ):
+        return "clarification_answer"
+    if interaction_response is not None:
+        return "follow_up"
+    if _is_explicit_product_import_request(text):
+        return "import_products"
+    if _is_cross_domain_business_review_query(text):
+        return "broad_business_review"
+    if text in {"yes", "no", "okay", "ok", "thanks", "thank you", "continue", "cancel", "stop here"}:
+        return "acknowledgement"
+    if _looks_like_fresh_freeform_request(effective_user_text):
+        return "new_request"
+    return "other"
 
 
 def _is_host_orchestration_payload(payload: dict[str, Any] | None, *, stage: str) -> bool:
@@ -15737,6 +15767,7 @@ def make_langgraph_chat_processor_from_env(
     agent_name: str | None = None,
     system_prompt_override: str | None = None,
     tool_executor_override: ToolExecutor | None | object = _TOOL_EXECUTOR_SENTINEL,
+    decision_facade: AgentDecisionFacade | None = None,
 ) -> TaskProcessor:
     _require_lang()
 
@@ -15746,6 +15777,12 @@ def make_langgraph_chat_processor_from_env(
     from langgraph.graph import END, StateGraph  # type: ignore
 
     settings = Ka2aSettings.from_env()
+    if decision_facade is None:
+        # Standalone agents still get the optional platform observer. Shared runtime
+        # injects one process-scoped facade instead.
+        from kafka_a2a.decisioning.factory import build_decision_runtime_from_env
+
+        decision_facade = build_decision_runtime_from_env().facade_for(agent_name)
 
     decryptor: Callable[[Any], str] | None = None
     decryptor_path = (os.getenv("KA2A_SECRET_DECRYPTOR") or "").strip()
@@ -16050,12 +16087,33 @@ def make_langgraph_chat_processor_from_env(
             except Exception:
                 tool_specs = []
         tool_names = {spec.name for spec in tool_specs}
-        if tool_specs:
-            sys = (sys or "") + _render_tool_prompt_block(tool_specs)
+
+        history = (metadata or {}).get(KA2A_CONVERSATION_HISTORY_METADATA_KEY)
+        model_tool_specs = list(tool_specs)
+        if tool_specs and user_text_for_memory:
+            try:
+                selected_tool_names = await decision_facade.shortlist_tools(
+                    current_user_message=user_text_for_memory,
+                    candidates={spec.name: spec.description or spec.name for spec in tool_specs},
+                    history=history if isinstance(history, list) else task.history,
+                    workflow_state=None,
+                    metadata=metadata,
+                    task_id=task.id,
+                    context_id=task.context_id,
+                )
+                selected_tool_set = set(selected_tool_names)
+                model_tool_specs = [spec for spec in tool_specs if spec.name in selected_tool_set]
+            except Exception:
+                # Tool shortlisting is advisory infrastructure. Preserve the full
+                # already-authorized model tool list if it is unavailable.
+                logger.warning("decisioning tool shortlist failed; using baseline tool list")
+                model_tool_specs = list(tool_specs)
+        model_tool_names = {spec.name for spec in model_tool_specs}
+        if model_tool_specs:
+            sys = (sys or "") + _render_tool_prompt_block(model_tool_specs)
         if sys:
             lc_messages.append(SystemMessage(content=sys))
 
-        history = (metadata or {}).get(KA2A_CONVERSATION_HISTORY_METADATA_KEY)
         if isinstance(history, list):
             for item in history:
                 if not isinstance(item, dict):
@@ -16122,6 +16180,8 @@ def make_langgraph_chat_processor_from_env(
         last_interaction_payload = _last_agent_interaction_payload(task)
         interaction_response = _interaction_response_from_text(user_text_for_memory)
         saved_workflow_state = await _load_workflow_state(context_id=task.context_id, metadata=metadata)
+        decision_user_text = user_text_for_memory
+        decision_workflow_state = saved_workflow_state
         clarification_target_agent: str | None = None
         if interaction_response is None and user_text_for_memory:
             merged_from_workflow_state = _workflow_state_clarification_merge(
@@ -16216,6 +16276,33 @@ def make_langgraph_chat_processor_from_env(
                 last_interaction_payload = None
                 saved_workflow_state = None
                 await _save_workflow_state(context_id=task.context_id, metadata=metadata, workflow_state=None)
+
+        if _canonical_host_domain_agent(agent_name) == "host" and decision_user_text:
+            baseline_intent = _host_turn_shadow_baseline_intent(
+                current_user_text=decision_user_text,
+                effective_user_text=user_text_for_memory,
+                workflow_state=decision_workflow_state,
+                clarification_target_agent=clarification_target_agent,
+                interaction_response=interaction_response,
+            )
+            # This queues an observation only. Its result is never read by the
+            # following deterministic host routing branches in Phase 1.
+            try:
+                decision_facade.observe_host_turn(
+                    current_user_message=decision_user_text,
+                    history=history if isinstance(history, list) else task.history,
+                    workflow_state=decision_workflow_state,
+                    awaiting_clarification=baseline_intent == "clarification_answer",
+                    previous_host_intent=None,
+                    baseline_intent=baseline_intent,
+                    metadata=metadata,
+                    task_id=task.id,
+                    context_id=task.context_id,
+                )
+            except Exception:
+                # Decisioning is optional infrastructure. A submission failure must
+                # never prevent the established host path from serving the user.
+                logger.warning("decisioning shadow submission failed; continuing with baseline behavior")
 
         if _canonical_host_domain_agent(agent_name) == "host" and interaction_response is None and user_text_for_memory:
             logger.info(
@@ -21096,10 +21183,37 @@ def make_langgraph_chat_processor_from_env(
                 return
 
             if selected_agent is None:
-                if broad_business_review and orchestration_plan:
-                    selected_agent = orchestration_plan[0]
-                else:
-                    selected_agent = _select_host_delegation_agent(user_text_for_memory, agent_summaries)
+                baseline_selected_agent = (
+                    orchestration_plan[0]
+                    if broad_business_review and orchestration_plan
+                    else _select_host_delegation_agent(user_text_for_memory, agent_summaries)
+                )
+                specialist_candidates = {
+                    str(item.get("name") or "").strip(): (
+                        str(item.get("description") or item.get("summary") or item.get("name") or "").strip()
+                    )
+                    for item in agent_summaries
+                    if str(item.get("name") or "").strip()
+                }
+                try:
+                    selected_agent = await decision_facade.choose_specialist(
+                        current_user_message=decision_user_text or user_text_for_memory,
+                        candidates=specialist_candidates,
+                        baseline_agent=baseline_selected_agent,
+                        history=history if isinstance(history, list) else task.history,
+                        workflow_state=saved_workflow_state,
+                        metadata=metadata,
+                        task_id=task.id,
+                        context_id=task.context_id,
+                        # Multi-domain review plans were deliberately built by
+                        # host policy; JEV records them but cannot reorder them.
+                        permit_enforcement=not bool(broad_business_review and orchestration_plan),
+                    )
+                except Exception:
+                    # JEV may only choose from this existing list, and a
+                    # decisioning failure must retain deterministic routing.
+                    logger.warning("decisioning specialist selection failed; using baseline specialist")
+                    selected_agent = baseline_selected_agent
             if selected_agent or len(agent_summaries) == 1 or not agent_summaries:
                 if selected_agent is None and len(agent_summaries) == 1:
                     selected_agent = str(agent_summaries[0].get("name") or "").strip() or None
@@ -21624,10 +21738,10 @@ def make_langgraph_chat_processor_from_env(
             messages2: list[Any] = list(lc_messages)
 
             for _ in range(steps + 1):
-                resp = await llm.ainvoke(messages2, tools=tool_specs)
+                resp = await llm.ainvoke(messages2, tools=model_tool_specs)
                 messages2.append(AIMessage(content=resp.content))
 
-                parts = _parts_from_model_content(resp.content, tool_names=tool_names)
+                parts = _parts_from_model_content(resp.content, tool_names=model_tool_names)
                 tool_calls = [p for p in parts if isinstance(p, ToolCallPart)]
                 if not tool_calls:
                     response_parts = parts
@@ -21792,6 +21906,47 @@ def make_langgraph_chat_processor_from_env(
                 response_parts = [TextPart(text="Tool execution limit reached.")]
                 response_text = "Tool execution limit reached."
 
+        if (
+            tool_executor is None
+            and response_state_override is None
+            and response_parts
+            and all(isinstance(part, TextPart) for part in response_parts)
+            and user_text_for_memory
+            and response_text
+        ):
+            try:
+                evaluation = await decision_facade.evaluate_final_response(
+                    current_user_message=user_text_for_memory,
+                    response_text=response_text,
+                    metadata=metadata,
+                    task_id=task.id,
+                    context_id=task.context_id,
+                )
+                if decision_facade.should_retry_final_response(evaluation):
+                    retry = await llm.ainvoke(
+                        [
+                            SystemMessage(
+                                content=(
+                                    "Rewrite the draft answer so it directly answers the user. "
+                                    "Use only supported information in the draft; do not call tools, "
+                                    "perform actions, invent facts, or claim work was completed."
+                                )
+                            ),
+                            HumanMessage(content=f"User request:\n{user_text_for_memory}"),
+                            AIMessage(content=response_text),
+                            HumanMessage(content="Return the corrected final answer only."),
+                        ]
+                    )
+                    retry_parts = _parts_from_model_content(getattr(retry, "content", ""))
+                    retry_text = _text_from_parts(retry_parts)
+                    if retry_text and all(isinstance(part, TextPart) for part in retry_parts):
+                        response_parts = retry_parts
+                        response_text = retry_text
+            except Exception:
+                # A response-quality decision or rewrite is never required to
+                # deliver the original safe baseline answer.
+                logger.warning("decisioning final response evaluation failed; using baseline response")
+
         if tool_executor is not None and tool_specs and response_parts:
             response_parts = await _rewrite_relation_interaction_parts(
                 response_parts,
@@ -21841,4 +21996,43 @@ def make_langgraph_chat_processor_from_env(
             response_parts=response_parts,
         )
 
-    return _proc
+    async def _decisioning_observed_proc(
+        task: Task,
+        message: Message,
+        configuration: TaskConfiguration | None,
+        metadata: dict[str, Any] | None,
+    ) -> AsyncIterator[TaskEvent]:
+        request_text = "\n".join(part.text for part in message.parts if isinstance(part, TextPart)).strip()
+        is_host = _canonical_host_domain_agent(agent_name) == "host"
+        async for event in _proc(task, message, configuration, metadata):
+            if isinstance(event, TaskStatus) and event.state in {
+                TaskState.completed,
+                TaskState.input_required,
+                TaskState.failed,
+            }:
+                response_message = getattr(event, "message", None)
+                response_parts = getattr(response_message, "parts", None)
+                response_text = _text_from_parts(response_parts if isinstance(response_parts, list) else None)
+                if request_text and response_text:
+                    try:
+                        if is_host:
+                            decision_facade.observe_final_response(
+                                current_user_message=request_text,
+                                response_text=response_text,
+                                metadata=metadata,
+                                task_id=task.id,
+                                context_id=task.context_id,
+                            )
+                        else:
+                            decision_facade.observe_specialist_result(
+                                current_user_message=request_text,
+                                response_text=response_text,
+                                metadata=metadata,
+                                task_id=task.id,
+                                context_id=task.context_id,
+                            )
+                    except Exception:
+                        logger.warning("decisioning response evaluation failed; continuing with baseline response")
+            yield event
+
+    return _decisioning_observed_proc

@@ -21,6 +21,9 @@ from kafka_a2a.livekit_voice.worker import (
     _voice_merge_clarification_answer,
     _voice_progress_clarification,
     _voice_clarification_requirement,
+    _voice_clarification_for_action,
+    _voice_pending_relation_baseline,
+    _voice_readiness_candidates,
     _stream_payload_from_event,
     _voice_supersedes_pending_clarification,
     _transcript_comparison_key,
@@ -330,6 +333,61 @@ def test_voice_router_requires_time_range_for_sales_analysis() -> None:
     assert clarification is not None
     assert clarification["kind"] == "time_range"
     assert "time range" in clarification["question"]
+
+
+def test_voice_readiness_candidates_preserve_required_time_range_clarification() -> None:
+    transcript = "Can you help me analyze my sales data?"
+    clarification = _voice_clarification_requirement(transcript)
+
+    baseline, candidates = _voice_readiness_candidates(
+        transcript,
+        clarification,
+        source="completed_turn",
+    )
+
+    assert baseline == "ask_time_range"
+    assert set(candidates) == {"ask_time_range"}
+
+
+def test_voice_readiness_can_defer_an_ambiguous_fragment_without_delegating() -> None:
+    transcript = "Can you help me to"
+    clarification = _voice_clarification_requirement(transcript)
+
+    baseline, candidates = _voice_readiness_candidates(
+        transcript,
+        clarification,
+        source="transcript_event",
+    )
+
+    assert baseline == "wait_for_more_speech"
+    assert "delegate_to_host" not in candidates
+    assert "ask_clarification" in candidates
+
+
+def test_voice_decision_action_uses_existing_focused_clarification_templates() -> None:
+    metric = _voice_clarification_for_action(
+        "ask_metric_scope",
+        transcript="How many products?",
+        baseline=None,
+    )
+    period = _voice_clarification_for_action(
+        "ask_time_range",
+        transcript="Analyze my sales data",
+        baseline=None,
+    )
+
+    assert metric is not None and "products in inventory" in metric["question"]
+    assert period is not None and "time range" in period["question"]
+
+
+def test_voice_pending_relation_never_treats_a_clean_time_range_as_a_new_topic() -> None:
+    pending = {
+        "kind": "time_range",
+        "question": "What time range should I use for that analysis?",
+        "original": "Analyze my sales data.",
+    }
+
+    assert _voice_pending_relation_baseline("for the past three months", pending) == "clarification_answer"
 
 
 def test_voice_router_handles_low_stock_as_a_current_snapshot() -> None:

@@ -14,6 +14,8 @@ from typing import Any
 
 from kafka_a2a.control_plane import ControlPlaneClient
 from kafka_a2a.control_plane import ControlPlaneError
+from kafka_a2a.decisioning.facade import AgentDecisionFacade
+from kafka_a2a.decisioning.factory import DecisionRuntime, build_decision_runtime_from_env
 from kafka_a2a.langgraph_processor import make_langgraph_chat_processor_from_env
 from kafka_a2a.local_tools import HybridDelegationBackend, KafkaDelegationBackend, LocalInteractionToolExecutor
 from kafka_a2a.mcp_tools import McpServerAuthConfig, McpServerConfig, MultiMcpToolExecutor, MultiMcpToolExecutorConfig
@@ -293,7 +295,12 @@ def _build_tool_executor(agent_payload: dict[str, Any], runtime_config: dict[str
     )
 
 
-def _build_processor(agent_payload: dict[str, Any], *, delegation_backend_factory=None) -> TaskProcessor:
+def _build_processor(
+    agent_payload: dict[str, Any],
+    *,
+    delegation_backend_factory=None,
+    decision_facade: AgentDecisionFacade | None = None,
+) -> TaskProcessor:
     runtime_config = agent_payload.get("runtime_config")
     if not isinstance(runtime_config, dict):
         runtime_config = {}
@@ -312,6 +319,7 @@ def _build_processor(agent_payload: dict[str, Any], *, delegation_backend_factor
             agent_name=public_slug,
             system_prompt_override=workspace_instruction,
             tool_executor_override=tool_executor,
+            decision_facade=decision_facade,
         )
 
     env_values = {
@@ -359,6 +367,7 @@ class SharedRuntimeService:
         self._last_registry_agents: list[dict[str, Any]] = []
         self._sync_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self._decision_runtime: DecisionRuntime = build_decision_runtime_from_env()
 
     def _build_delegation_backend(
         self,
@@ -483,6 +492,7 @@ class SharedRuntimeService:
             self._sync_task = None
         for runtime_name in list(self._managed):
             await self._stop_agent(runtime_name)
+        await self._decision_runtime.aclose()
 
     async def wait(self) -> None:
         await self._stop.wait()
@@ -613,6 +623,7 @@ class SharedRuntimeService:
         processor = _build_processor(
             agent_payload,
             delegation_backend_factory=self._build_delegation_backend,
+            decision_facade=self._decision_runtime.facade_for(str(agent_payload.get("slug") or "").strip() or None),
         )
 
         transport = KafkaTransport(

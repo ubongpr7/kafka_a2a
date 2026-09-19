@@ -22,6 +22,8 @@ from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.control_plane import ControlPlaneClient, ControlPlaneError
 from kafka_a2a.core.config import A2AAppSettings
 from kafka_a2a.credentials import KA2A_JWT_CLAIM_KEY
+from kafka_a2a.decisioning.facade import AgentDecisionFacade
+from kafka_a2a.decisioning.factory import DecisionRuntime, build_voice_decision_runtime_from_env
 from kafka_a2a.mainapps.common.auth import build_agent_auth_context, require_permission
 from kafka_a2a.models import Artifact, DataPart, Message, Role, Task, TaskArtifactUpdateEvent, TaskState, TaskStatusUpdateEvent, TextPart
 from kafka_a2a.server.auth import JwtBearerConfig
@@ -1634,6 +1636,100 @@ def _voice_clarification_requirement(transcript: str) -> dict[str, str] | None:
     return None
 
 
+_VOICE_READINESS_ACTIONS = {
+    "wait_for_more_speech": "The caller likely paused mid-request; wait briefly for more speech.",
+    "delegate_to_host": "The caller supplied a complete business request; send it to the workspace host.",
+    "ask_time_range": "The analysis request needs a time range before it can proceed.",
+    "ask_metric_scope": "The request needs a focused metric or product-scope clarification.",
+    "ask_clarification": "The request needs one focused clarification before it can proceed.",
+    "ignore_non_request": "The transcript is not an actionable workspace request.",
+}
+
+_VOICE_RELATION_ACTIONS = {
+    "new_request": "The caller changed to an independent request; abandon the pending clarification.",
+    "clarification_answer": "The caller answered the pending clarification for the earlier request.",
+    "continue_clarification": "The caller still has not supplied enough information to resolve the clarification.",
+}
+
+
+def _voice_readiness_baseline_action(
+    transcript: str,
+    clarification: dict[str, str] | None,
+    *,
+    source: str,
+) -> str:
+    if clarification is None:
+        return "delegate_to_host" if _should_delegate_voice_transcript(transcript) else "ignore_non_request"
+    if source == "transcript_event" and _voice_should_defer_fragment_clarification(transcript, clarification):
+        return "wait_for_more_speech"
+    kind = str(clarification.get("kind") or "").strip()
+    if kind == "time_range":
+        return "ask_time_range"
+    if "how many products" in _normalize_voice_text(transcript):
+        return "ask_metric_scope"
+    return "ask_clarification"
+
+
+def _voice_readiness_candidates(
+    transcript: str,
+    clarification: dict[str, str] | None,
+    *,
+    source: str,
+) -> tuple[str, dict[str, str]]:
+    """Return only local actions that preserve the deterministic safety boundaries."""
+
+    baseline = _voice_readiness_baseline_action(transcript, clarification, source=source)
+    candidates = {baseline: _VOICE_READINESS_ACTIONS[baseline]}
+    if clarification is None:
+        return baseline, candidates
+    if baseline == "wait_for_more_speech":
+        follow_up = _voice_readiness_baseline_action(transcript, clarification, source="completed_turn")
+        candidates[follow_up] = _VOICE_READINESS_ACTIONS[follow_up]
+    if str(clarification.get("kind") or "") == "continuation":
+        if _voice_has_business_context(transcript) and not _voice_is_likely_incomplete_fragment(transcript):
+            candidates["delegate_to_host"] = _VOICE_READINESS_ACTIONS["delegate_to_host"]
+        if not _voice_has_business_context(transcript):
+            candidates["ignore_non_request"] = _VOICE_READINESS_ACTIONS["ignore_non_request"]
+    return baseline, candidates
+
+
+def _voice_clarification_for_action(
+    action: str,
+    *,
+    transcript: str,
+    baseline: dict[str, str] | None,
+) -> dict[str, str] | None:
+    if action == "ask_time_range":
+        return {
+            "kind": "time_range",
+            "question": "What time range should I use for that analysis?",
+        }
+    if action == "ask_metric_scope":
+        return {
+            "kind": "continuation",
+            "question": (
+                "When you say how many products, do you mean products in inventory, "
+                "products sold, or another product metric?"
+            ),
+        }
+    if action == "ask_clarification":
+        if baseline is not None:
+            return baseline
+        return {
+            "kind": "continuation",
+            "question": "Tell me what you want me to analyze or check, and I’ll send it through.",
+        }
+    return None
+
+
+def _voice_pending_relation_baseline(transcript: str, pending: dict[str, Any]) -> str:
+    if _voice_supersedes_pending_clarification(transcript, pending):
+        return "new_request"
+    if _voice_response_satisfies_clarification(transcript, pending):
+        return "clarification_answer"
+    return "continue_clarification"
+
+
 def _voice_response_satisfies_clarification(transcript: str, pending: dict[str, Any]) -> bool:
     kind = str(pending.get("kind") or "").strip()
     normalized = _normalize_voice_text(transcript)
@@ -2219,7 +2315,14 @@ async def _voice_entrypoint(ctx: Any) -> None:
     tts_model = (os.getenv("KA2A_VOICE_TTS_MODEL") or "gpt-4o-mini-tts").strip()
 
     class Ka2aVoiceAgent(Agent):
-        def __init__(self, *, runtime: VoiceRuntimeContext, ai_setup: dict[str, Any], room: Any) -> None:
+        def __init__(
+            self,
+            *,
+            runtime: VoiceRuntimeContext,
+            ai_setup: dict[str, Any],
+            room: Any,
+            decision_facade: AgentDecisionFacade,
+        ) -> None:
             self._runtime = runtime
             self._ai_setup = ai_setup
             self._host_agent_name = runtime.host_agent_name
@@ -2253,7 +2356,75 @@ async def _voice_entrypoint(ctx: Any) -> None:
             self._last_progress_update = ""
             self._last_progress_spoken_at = 0.0
             self._last_completed_result = ""
+            self._decision_facade = decision_facade
             super().__init__(instructions=_build_workspace_instruction(ai_setup))
+
+        def _voice_decision_state(
+            self,
+            *,
+            source: str,
+            baseline_action: str,
+            pending: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "surface": "livekit_voice",
+                "source": source,
+                "baseline_action": baseline_action,
+                "pending_clarification_kind": str((pending or {}).get("kind") or ""),
+                "last_voice_response": self._last_spoken_response,
+            }
+
+        async def _choose_pending_clarification_relation(
+            self,
+            *,
+            transcript: str,
+            pending: dict[str, Any],
+            source: str,
+            turn_id: str,
+        ) -> str:
+            baseline = _voice_pending_relation_baseline(transcript, pending)
+            selected = await self._decision_facade.choose_voice_turn_relation(
+                current_user_message=transcript,
+                candidates=_VOICE_RELATION_ACTIONS,
+                baseline_relation=baseline,
+                history=None,
+                metadata=_voice_request_metadata(self._runtime),
+                task_id=turn_id,
+                context_id=self._voice_context_id,
+                extra_state=self._voice_decision_state(
+                    source=source,
+                    baseline_action=baseline,
+                    pending=pending,
+                ),
+            )
+            # A semantic decision cannot bypass the structural validation needed
+            # to merge a clarification reply into a delegated host request.
+            if selected == "clarification_answer" and not _voice_response_satisfies_clarification(transcript, pending):
+                return baseline
+            if selected == "new_request" and baseline != "new_request":
+                if not (_should_delegate_voice_transcript(transcript) and not _voice_is_likely_incomplete_fragment(transcript)):
+                    return baseline
+            return selected
+
+        async def _choose_voice_readiness_action(
+            self,
+            *,
+            transcript: str,
+            clarification: dict[str, str] | None,
+            source: str,
+            turn_id: str,
+        ) -> str:
+            baseline, candidates = _voice_readiness_candidates(transcript, clarification, source=source)
+            return await self._decision_facade.choose_voice_turn_readiness(
+                current_user_message=transcript,
+                candidates=candidates,
+                baseline_action=baseline,
+                history=None,
+                metadata=_voice_request_metadata(self._runtime),
+                task_id=turn_id,
+                context_id=self._voice_context_id,
+                extra_state=self._voice_decision_state(source=source, baseline_action=baseline),
+            )
 
         def _begin_shutdown(self) -> None:
             self._closing = True
@@ -2751,6 +2922,20 @@ async def _voice_entrypoint(ctx: Any) -> None:
             if follow_up_text:
                 final_text = follow_up_text
 
+            self._decision_facade.observe_voice_response_speakability(
+                current_user_message=transcript,
+                response_text=final_text,
+                baseline_action="speak" if final_text.strip() else "suppress",
+                metadata=_voice_request_metadata(self._runtime),
+                task_id=turn_id,
+                context_id=self._voice_context_id,
+                extra_state={
+                    "surface": "livekit_voice",
+                    "source": "host_stream",
+                    "host_event_count": event_count,
+                },
+            )
+
             logger.info(
                 "voice transcript resolved",
                 extra={
@@ -2818,7 +3003,28 @@ async def _voice_entrypoint(ctx: Any) -> None:
                 await self._say(repeat_text, allow_interruptions=True)
                 return repeat_text
 
+            turn_id = _voice_turn_id(transcript)
             pending_clarification = self._pending_clarification
+            if pending_clarification is not None:
+                clarification_relation = await self._choose_pending_clarification_relation(
+                    transcript=transcript,
+                    pending=pending_clarification,
+                    source=source,
+                    turn_id=turn_id,
+                )
+                if clarification_relation == "new_request":
+                    logger.info(
+                        "voice transcript superseded pending clarification",
+                        extra={
+                            "profile_id": self._runtime.profile_id,
+                            "source": source,
+                            "transcript_preview": _voice_log_preview(transcript),
+                            "clarification_kind": str(pending_clarification.get("kind") or ""),
+                        },
+                    )
+                    self._pending_clarification = None
+                    pending_clarification = None
+
             if pending_clarification is not None and _voice_supersedes_pending_clarification(transcript, pending_clarification):
                 logger.info(
                     "voice transcript superseded pending clarification",
@@ -2961,30 +3167,58 @@ async def _voice_entrypoint(ctx: Any) -> None:
                     return follow_up_prompt
 
             clarification = _voice_clarification_requirement(transcript)
+            readiness_action = await self._choose_voice_readiness_action(
+                transcript=transcript,
+                clarification=clarification,
+                source=source,
+                turn_id=turn_id,
+            )
+            if readiness_action == "delegate_to_host":
+                clarification = None
+            elif readiness_action == "ignore_non_request":
+                logger.info(
+                    "voice transcript ignored by readiness policy",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "source": source,
+                        "word_count": len(transcript.split()),
+                    },
+                )
+                return None
+            elif readiness_action == "wait_for_more_speech" and clarification is not None:
+                key = self._transcript_key(transcript)
+                max_attempts = max(1, int(os.getenv("KA2A_VOICE_DEFERRED_FRAGMENT_MAX_ATTEMPTS") or "2"))
+                attempts = self._deferred_fragment_attempts.get(key, 0) + 1
+                self._deferred_fragment_attempts[key] = attempts
+                if attempts <= max_attempts:
+                    logger.info(
+                        "voice transcript readiness deferred while waiting for more speech",
+                        extra={
+                            "profile_id": self._runtime.profile_id,
+                            "source": source,
+                            "transcript_preview": _voice_log_preview(transcript),
+                            "attempt": attempts,
+                        },
+                    )
+                    self._transcript_buffer.insert(0, transcript)
+                    hold_delay_s = max(
+                        _env_float("KA2A_VOICE_TRANSCRIPT_FLUSH_DELAY_S", 1.6),
+                        _env_float("KA2A_VOICE_DEFERRED_FRAGMENT_DELAY_S", 2.8),
+                    )
+                    self._schedule_transcript_flush(delay_s=hold_delay_s)
+                    return None
+                readiness_action = _voice_readiness_baseline_action(
+                    transcript,
+                    clarification,
+                    source="completed_turn",
+                )
+            if clarification is not None and readiness_action != "wait_for_more_speech":
+                clarification = _voice_clarification_for_action(
+                    readiness_action,
+                    transcript=transcript,
+                    baseline=clarification,
+                )
             if clarification:
-                if source == "transcript_event" and _voice_should_defer_fragment_clarification(transcript, clarification):
-                    key = self._transcript_key(transcript)
-                    max_attempts = max(1, int(os.getenv("KA2A_VOICE_DEFERRED_FRAGMENT_MAX_ATTEMPTS") or "2"))
-                    attempts = self._deferred_fragment_attempts.get(key, 0) + 1
-                    self._deferred_fragment_attempts[key] = attempts
-                    if attempts <= max_attempts:
-                        logger.info(
-                            "voice transcript clarification deferred while waiting for more speech",
-                            extra={
-                                "profile_id": self._runtime.profile_id,
-                                "source": source,
-                                "transcript_preview": _voice_log_preview(transcript),
-                                "clarification_kind": clarification["kind"],
-                                "attempt": attempts,
-                            },
-                        )
-                        self._transcript_buffer.insert(0, transcript)
-                        hold_delay_s = max(
-                            _env_float("KA2A_VOICE_TRANSCRIPT_FLUSH_DELAY_S", 1.6),
-                            _env_float("KA2A_VOICE_DEFERRED_FRAGMENT_DELAY_S", 2.8),
-                        )
-                        self._schedule_transcript_flush(delay_s=hold_delay_s)
-                        return None
                 logger.info(
                     "voice transcript needs clarification",
                     extra={
@@ -3028,7 +3262,6 @@ async def _voice_entrypoint(ctx: Any) -> None:
                     "transcript_preview": _voice_log_preview(transcript),
                 },
             )
-            turn_id = _voice_turn_id(transcript)
             await self._publish_visible_user_transcript(transcript)
             await self._publish_host_synced_transcript(transcript, turn_id=turn_id)
             if not _voice_backend_delegation_enabled():
@@ -3267,7 +3500,26 @@ async def _voice_entrypoint(ctx: Any) -> None:
             preemptive_generation={"enabled": False},
         ),
     )
-    agent = Ka2aVoiceAgent(runtime=runtime, ai_setup=ai_setup, room=ctx.room)
+    decision_runtime: DecisionRuntime = build_voice_decision_runtime_from_env()
+
+    async def _close_voice_decision_runtime(_: str) -> None:
+        await decision_runtime.aclose(drain_timeout_s=decision_runtime.config.voice_drain_timeout_s)
+
+    ctx.add_shutdown_callback(_close_voice_decision_runtime)
+    logger.info(
+        "voice decisioning initialized",
+        extra={
+            "profile_id": profile_id,
+            "enabled": decision_runtime.config.is_active,
+            "mode": decision_runtime.config.mode.value,
+        },
+    )
+    agent = Ka2aVoiceAgent(
+        runtime=runtime,
+        ai_setup=ai_setup,
+        room=ctx.room,
+        decision_facade=decision_runtime.facade_for("voice"),
+    )
 
     def _on_chat_speech_command(packet: Any) -> None:
         task = asyncio.create_task(agent.handle_chat_speech_command(packet))

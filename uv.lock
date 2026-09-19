@@ -1231,6 +1231,9 @@ dependencies = [
 auth = [
     { name = "pyjwt", extra = ["crypto"] },
 ]
+decisioning = [
+    { name = "httpx" },
+]
 dev = [
     { name = "alembic" },
     { name = "pytest" },
@@ -1261,6 +1264,7 @@ requires-dist = [
     { name = "aiokafka", specifier = ">=0.11.0" },
     { name = "alembic", marker = "extra == 'dev'", specifier = ">=1.14.0" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.111.0" },
+    { name = "httpx", marker = "extra == 'decisioning'", specifier = ">=0.27.0" },
     { name = "langchain-core", marker = "extra == 'lang'", specifier = ">=0.2.0" },
     { name = "langgraph", marker = "extra == 'lang'", specifier = ">=0.2.0" },
     { name = "livekit-agents", extras = ["openai"], marker = "extra == 'voice'", specifier = "~=1.6.1" },
@@ -1277,7 +1281,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0.36" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'server'", specifier = ">=0.30.0" },
 ]
-provides-extras = ["server", "auth", "lang", "redis", "mcp", "voice", "dev"]
+provides-extras = ["server", "auth", "lang", "redis", "mcp", "decisioning", "voice", "dev"]
 
 [[package]]
 name = "langchain-core"

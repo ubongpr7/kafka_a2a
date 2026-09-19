@@ -1,0 +1,160 @@
+\documentclass[10pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=0.72in]{geometry}
+\usepackage{array,booktabs,longtable,tabularx}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{titlesec}
+\hypersetup{colorlinks=true,linkcolor=MidnightBlue,urlcolor=MidnightBlue,pdftitle={Kafka A2A and JEV Decisioning Architecture}}
+\definecolor{navy}{HTML}{0B1F3A}
+\definecolor{blue}{HTML}{1E5B9E}
+\definecolor{mist}{HTML}{EEF5FC}
+\definecolor{green}{HTML}{176B3A}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\renewcommand{\arraystretch}{1.18}
+\titleformat{\section}{\Large\bfseries\color{navy}}{}{0pt}{}[\vspace{-3pt}\color{blue}\titlerule]
+\titleformat{\subsection}{\large\bfseries\color{navy}}{}{0pt}{}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\textcolor{navy}{INTERA AI \textbar\ Kafka A2A and JEV}}
+\rhead{\textcolor{navy}{19 September 2026}}
+\cfoot{\textcolor{gray}{\thepage}}
+\begin{document}
+
+{\color{navy}\Huge\bfseries Kafka A2A and JEV Decisioning Architecture\par}
+\vspace{5pt}
+{\large\color{blue}Platform-managed decisioning across host orchestration, specialists, MCP tools, and LiveKit voice\par}
+\vspace{12pt}
+
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}l X}
+Status & Host, specialist/tool, response-quality, and LiveKit voice-turn decisioning are implemented. Voice enforcement remains opt-in. \\
+Ownership & JEV is a platform infrastructure dependency. Workspace LLM settings remain tenant-configured and separate. \\
+Primary goal & Improve bounded decisions while preserving deterministic authorization, safety, confirmation, and fallback behavior. \\
+\end{tabularx}
+
+\section{Operating Principle}
+JEV makes a typed choice from an existing candidate list. It is not a tenant LLM, a user-facing chat model, an A2A agent, or an authority for permissions and business writes. The platform owns the TypeSafe credential. It is never included in browser code, workspace settings, JWTs, agent prompts, MCP requests, or telemetry.
+
+\colorbox{mist}{\parbox{0.96\textwidth}{\textbf{Fail-open rule.} If JEV is disabled, unavailable, slow, malformed, low-confidence, rate-limited, or circuit-open, the current A2A or voice baseline continues without a user-visible decisioning failure.}}
+
+\section{End-to-End Architecture}
+\begin{verbatim}
+Text widget or LiveKit transcript
+  -> voice/gateway safety and transcript processing
+  -> host conversation, clarification, and planning
+  -> authorized specialist selection
+  -> LLM-visible MCP tool shortlist
+  -> tenant-scoped MCP operation and structured artifacts
+  -> host synthesis, quality evaluation, streamed result
+\end{verbatim}
+
+JEV runs beside this path. Shadow mode records a comparison but never alters execution. Enforce mode can apply only an explicitly allowlisted choice above its confidence threshold.
+
+\section{Classification: Host and Orchestrator}
+The host owns conversation state, follow-up handling, targeted clarification, multi-domain planning, delegation, and final synthesis. A voice worker sends completed requests to the host; it never selects a specialist directly.
+
+\small
+\begin{longtable}{@{}>{\bfseries\color{navy}}p{0.22\textwidth}@{\hspace{0.6em}}p{0.25\textwidth}@{\hspace{0.6em}}p{0.43\textwidth}@{}}
+\toprule
+Capability & Baseline owner & JEV role and boundary \\
+\midrule
+\endfirsthead
+\toprule
+Capability & Baseline owner & JEV role and boundary \\
+\midrule
+\endhead
+Host-turn intent & Host conversation policy & Classifies new request, follow-up, clarification answer, acknowledgement, broad review, and global product import. Shadow only. \\
+Specialist selection & Host routing policy & Chooses only from already authorized candidates. Enforcement requires an explicit allowlist and confidence threshold. \\
+Tool shortlist & Specialist/host tool policy & Limits only tools shown to the LLM. The executor, permissions, deterministic tools, and writes are unchanged. \\
+Specialist-result quality & Specialist terminal result & Evaluates whether the specialist result answers the request. Shadow only. \\
+Final-response quality & Host synthesis & Evaluates the final answer. A separately gated high-confidence result may permit one text-only, no-tool rewrite. \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+For multi-domain business reviews, the existing host plan is protected. JEV observes the decision but cannot reorder the approved broad-review workflow.
+
+\section{Classification: Specialists and MCP Tools}
+Specialists run only within existing agent allowlists, tenant scope, permissions, and MCP contracts. JEV cannot register an agent, create a tool, call an MCP service, bypass confirmation, or execute a mutation.
+
+The host first constructs an authorized tool candidate set. JEV may select one candidate or \texttt{no\_tool\_needed}; on every failure or low-confidence result, the complete baseline tool set is retained. Delete/remove operations, confirmation gates, and deterministic business workflows remain outside the decisioning layer.
+
+\section{Classification: LiveKit Voice}
+The LiveKit worker retains the existing deterministic sequence:
+\begin{enumerate}[leftmargin=18pt,itemsep=3pt]
+\item Buffer and deduplicate final STT fragments after a silence window.
+\item Handle explicit cancellation, greetings, repeat/status requests, and transcription correction locally.
+\item Merge compatible fragments, preserve clarification state, and retain one A2A context for the call.
+\item Send a complete request to the host, then filter stream events into safe spoken updates.
+\end{enumerate}
+
+\small
+\begin{longtable}{@{}>{\bfseries\color{navy}}p{0.25\textwidth}@{\hspace{0.6em}}p{0.30\textwidth}@{\hspace{0.6em}}p{0.34\textwidth}@{}}
+\toprule
+Voice capability & Candidate classes & Application boundary \\
+\midrule
+\endfirsthead
+\toprule
+Voice capability & Candidate classes & Application boundary \\
+\midrule
+\endhead
+Turn readiness & Wait, delegate, time range, metric scope, clarification, ignore & Runs after local cancellation/command checks. Candidate set is restricted to safe actions available for the observed request state. \\
+Turn relation & New request, clarification answer, continue clarification & Helps distinguish a topic change from an answer to a pending voice clarification. Structural merge validation still applies. \\
+Response speakability & Speak, suppress, concise summary needed & Shadow evaluation of host output suitability for speech. Existing sanitization and concise response selection remain authoritative. \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+JEV receives bounded STT text state only, never audio. It does not decide caller identity, permission, interruption, cancellation, specialist routing, tool routing, confirmation, or writes.
+
+\section{Runtime and Reliability}
+The local LiveKit deployment runs voice jobs in threads. Voice decisioning therefore uses a session-local decision runtime rather than a module-global async client or queue. This prevents event-loop crossing. On session shutdown, queued shadow observations receive a short bounded drain before the provider is closed.
+
+The generic decision service provides bounded concurrency, queueing, retry/circuit behavior, state redaction, and structured telemetry. Voice uses its own short timeout and no retry because it runs on an interactive speech path.
+
+\section{Configuration}
+\textbf{Host shadow mode}
+\begin{verbatim}
+KA2A_DECISIONING_ENABLED=true
+KA2A_DECISIONING_PROVIDER=typesafe
+KA2A_DECISIONING_MODE=shadow
+KA2A_DECISIONING_MODEL=jev-latest
+TYPESAFE_API_KEY=platform-managed-secret
+\end{verbatim}
+
+\textbf{Voice surface, disabled by default}
+\begin{verbatim}
+KA2A_VOICE_DECISIONING_ENABLED=true
+KA2A_VOICE_DECISIONING_TIMEOUT_S=0.25
+KA2A_VOICE_DECISIONING_SHADOW_SAMPLE_RATE=0.10
+KA2A_VOICE_DECISIONING_ENFORCE_MIN_CONFIDENCE=0.92
+KA2A_VOICE_DECISIONING_ENFORCE_CAPABILITIES=
+KA2A_VOICE_DECISIONING_DRAIN_TIMEOUT_S=0.25
+\end{verbatim}
+
+To enforce a voice capability, global decisioning must be in \texttt{enforce} mode and the voice allowlist must explicitly name that capability. Start only with \texttt{voice\_turn\_readiness}.
+
+\section{Telemetry and Privacy}
+Structured \texttt{decisioning\_shadow} and \texttt{decisioning\_enforcement} records include workspace attribution, task or voice-turn ID, context ID, agent surface, baseline and JEV decisions, probabilities, confidence, latency, retry count, fallback category, model, and usage.
+
+Decision state is bounded, redacted, and represented in logs by a keyed hash. It excludes API keys, bearer tokens, credentials, authorization headers, passwords, raw tool results, MCP payloads, audio, and internal stream metadata.
+
+\section{Verification and Rollout}
+\begin{enumerate}[leftmargin=18pt,itemsep=4pt]
+\item Deploy host and voice in shadow mode.
+\item Compare JEV divergence, latency, fallback rate, token usage, and false delegation/clarification outcomes.
+\item Enable only \texttt{voice\_turn\_readiness} with confidence at least 0.92.
+\item Keep response speakability shadow-only until voice transcript evidence proves it improves delivery without adding delay.
+\item Keep authorization, confirmation, mutation, and direct MCP execution outside JEV indefinitely.
+\end{enumerate}
+
+\textbf{Automated evidence.} The focused decisioning and LiveKit voice suite passed 87 tests after implementation. It covers configuration isolation, provider validation, redaction, fallback, high/low confidence actions, transcript readiness, relation handling, cancellation, merge behavior, and currency speech handling. Manual acceptance is still required for microphone/speaker hardware, LiveKit connectivity, mute controls, and provider billing limits.
+
+\vfill
+{\small\color{gray}Prepared for Intera IMS operations and engineering. This document describes platform decisioning, not tenant API-key configuration.}
+\end{document}

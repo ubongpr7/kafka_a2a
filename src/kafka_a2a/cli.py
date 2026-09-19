@@ -118,12 +118,12 @@ def _load_agent_card(path: str) -> AgentCard:
     return AgentCard.model_validate(data)
 
 
-def _resolve_processor(value: str | None, *, agent_name: str | None = None) -> TaskProcessor:
+def _resolve_processor(value: str | None, *, agent_name: str | None = None, decision_facade=None) -> TaskProcessor:
     name = (value or os.getenv("KA2A_AGENT_PROCESSOR") or "langgraph-chat").strip()
     if name in ("langgraph-chat", "langgraph_chat", "langgraph"):
         from kafka_a2a.langgraph_processor import make_langgraph_chat_processor_from_env
 
-        return make_langgraph_chat_processor_from_env(agent_name=agent_name)
+        return make_langgraph_chat_processor_from_env(agent_name=agent_name, decision_facade=decision_facade)
     if name in ("router", "host-router", "router-agent", "router_agent"):
         from kafka_a2a.router_processor import make_router_processor_from_env
 
@@ -259,7 +259,14 @@ async def _run_agent(args: argparse.Namespace) -> None:
         context_history_turns=int(os.getenv("KA2A_CONTEXT_HISTORY_TURNS") or "20"),
     )
 
-    processor = _resolve_processor(args.processor, agent_name=name)
+    from kafka_a2a.decisioning.factory import build_decision_runtime_from_env
+
+    decision_runtime = build_decision_runtime_from_env()
+    processor = _resolve_processor(
+        args.processor,
+        agent_name=name,
+        decision_facade=decision_runtime.facade_for(name),
+    )
 
     if card is not None and card.name and card.name != cfg.agent_name:
         # Prefer the card name (it defines the A2A addressable identity).
@@ -291,11 +298,12 @@ async def _run_agent(args: argparse.Namespace) -> None:
         except NotImplementedError:  # pragma: no cover
             pass
 
-    await agent.start()
     try:
+        await agent.start()
         await stop.wait()
     finally:
         await agent.stop()
+        await decision_runtime.aclose()
 
 
 async def _run_shared_runtime(args: argparse.Namespace) -> None:
