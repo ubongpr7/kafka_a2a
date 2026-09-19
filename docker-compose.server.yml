@@ -8,6 +8,10 @@ x-service: &service
       KA2A_UV_EXTRAS: "server,auth,lang,redis,mcp,decisioning,voice"
   env_file:
     - .env
+  environment:
+    # Keep browser access stable even if the CI-managed dev env file is stale.
+    KA2A_CORS_ALLOW_ORIGINS: https://www.interaims.com,https://interaims.com,https://dev.interaims.com,https://dev.hosperator.com,http://localhost:3000,http://127.0.0.1:3000
+    KA2A_CORS_ALLOW_HEADERS: Authorization,Content-Type,X-Requested-With,X-Profile-ID,X-Company-Code,X-Device-ID,X-Intera-Authorization-Context,X-Intera-Frontend-Origin
   restart: unless-stopped
   networks:
     - platform
