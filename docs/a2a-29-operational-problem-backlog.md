@@ -62,6 +62,15 @@ prevents the renderer from parsing the typed insight in the message text, and
 balanced JSON embedded after a status prefix is converted into widgets instead
 of a code block. Existing routing, location label refresh, image propagation,
 and timeframe clarification tests cover the corresponding observed failures.
+
+The fifth slice adds a published-demo contract regression suite covering all
+20 landing-page prompts: deterministic read prompts retain their specialist
+intent, warehouse and procurement workflows preserve their inventory routing,
+role and notification prompts stay with Users, and contextual follow-ups are
+not misclassified as fresh named insights. The full A2A suite now passes 527
+tests. The separate Users entitlement fix for LiveKit voice access is deployed
+through the Users release path, which creates `oral_conversation_with_ai`,
+syncs role/group presets, and invalidates the permission cache.
 Browser click-through remains pending because local browser automation is
 disabled in the current session; the user's port-3000 frontend is not started
 or stopped by this QA run.
