@@ -240,7 +240,7 @@ services:
     <<: *service
     container_name: interaims-dev-ka2a-runtime
     environment:
-      KA2A_CONTROL_PLANE_BASE_URL: http://interaims-dev-ka2a-gateway:7006
+      KA2A_CONTROL_PLANE_BASE_URL: ${KA2A_CONTROL_PLANE_BASE_URL:-http://gateway:7006}
       KA2A_REGISTRY_PUBLISH_ENABLED: "true"
     depends_on:
       - gateway
@@ -253,7 +253,7 @@ services:
       - gateway
       - host-agent
     environment:
-      KA2A_CONTROL_PLANE_BASE_URL: http://interaims-dev-ka2a-gateway:7006
+      KA2A_CONTROL_PLANE_BASE_URL: ${KA2A_CONTROL_PLANE_BASE_URL:-http://gateway:7006}
       KA2A_LIVEKIT_AGENT_NAME: ka2a-voice
       KA2A_VOICE_HOST_AGENT_NAME: host
       KA2A_VOICE_TTS_VOICE: marin
