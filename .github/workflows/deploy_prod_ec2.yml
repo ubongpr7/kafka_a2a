@@ -65,7 +65,7 @@ jobs:
       - name: Deploy With Migrations
         run: |
           set -euo pipefail
-          ssh "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \\
+          ssh "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
             "DEPLOY_PATH='${{ env.DEPLOY_PATH }}' COMPOSE_FILE='${{ env.COMPOSE_FILE }}' GITHUB_REPOSITORY='${{ github.repository }}' bash -s" <<'REMOTE'
           set -euo pipefail
           flock /tmp/interaims-prod-deploy.lock bash <<'LOCKED'
