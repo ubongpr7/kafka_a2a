@@ -59,7 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${ENV_FILE}" || { echo "ENV_FILE is required"; exit 1; }
-          printf '%s\n' "${ENV_FILE}" | ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+          printf '%s' "${ENV_FILE}" | python3 -c 'import sys; sys.stdout.write(sys.stdin.read().replace("\\\\n", "\\n"))' | ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
             "cat > '${{ env.DEPLOY_PATH }}/.env' && chmod 600 '${{ env.DEPLOY_PATH }}/.env'"
 
       - name: Deploy With Migrations
