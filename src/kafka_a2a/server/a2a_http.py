@@ -34,7 +34,7 @@ from kafka_a2a.server.auth import JwtBearerConfig, JwtVerificationError, parse_a
 from kafka_a2a.tenancy import with_principal
 
 
-_DEFAULT_CORS_ALLOW_ORIGIN_REGEX = r"^https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?$"
+_DEFAULT_CORS_ALLOW_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
 
 def _require_fastapi() -> Any:

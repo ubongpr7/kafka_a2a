@@ -1,0 +1,97 @@
+name: Deploy Prod EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod-ec2-${{ github.repository }}
+  cancel-in-progress: true
+
+env:
+  DEPLOY_PATH: /srv/interaims/repositories/${{ github.event.repository.name }}
+  COMPOSE_FILE: docker-compose.server.yml
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "${SSH_PRIVATE_KEY}" || { echo "EC2_PRIVATE_KEY is required"; exit 1; }
+          test -n "${SSH_KNOWN_HOSTS}" || { echo "EC2_KNOWN_HOSTS is required"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s' "${SSH_PRIVATE_KEY}" > ~/.ssh/deploy_key
+          printf '%s\n' "${SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 400 ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Sync Repo
+        run: |
+          set -euo pipefail
+          ssh "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" "mkdir -p '${{ env.DEPLOY_PATH }}'"
+          rsync -az --delete -e "ssh -i ~/.ssh/deploy_key" \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.venv' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            ./ "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:${{ env.DEPLOY_PATH }}/"
+
+      - name: Write Production Environment
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+        run: |
+          set -euo pipefail
+          test -n "${ENV_FILE}" || { echo "ENV_FILE is required"; exit 1; }
+          printf '%s\n' "${ENV_FILE}" | ssh "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+            "cat > '${{ env.DEPLOY_PATH }}/.env' && chmod 600 '${{ env.DEPLOY_PATH }}/.env'"
+
+      - name: Deploy With Migrations
+        run: |
+          set -euo pipefail
+          ssh "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \\
+            "DEPLOY_PATH='${{ env.DEPLOY_PATH }}' COMPOSE_FILE='${{ env.COMPOSE_FILE }}' GITHUB_REPOSITORY='${{ github.repository }}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          flock /tmp/interaims-prod-deploy.lock bash <<'LOCKED'
+          set -euo pipefail
+          /usr/local/bin/interaims-host-init
+          cd "${DEPLOY_PATH}"
+          case "${GITHUB_REPOSITORY##*/}" in
+            kafka_a2a)
+              docker compose -f "${COMPOSE_FILE}" up -d --build --force-recreate --remove-orphans
+              ;;
+            intera_users|subscriptions)
+              docker compose -f "${COMPOSE_FILE}" --profile release build web migrate release-tasks
+              docker compose -f "${COMPOSE_FILE}" --profile release run --rm migrate
+              docker compose -f "${COMPOSE_FILE}" --profile release run --rm release-tasks
+              docker compose -f "${COMPOSE_FILE}" up -d --build --force-recreate --remove-orphans
+              ;;
+            *)
+              docker compose -f "${COMPOSE_FILE}" --profile release build web migrate
+              docker compose -f "${COMPOSE_FILE}" --profile release run --rm migrate
+              docker compose -f "${COMPOSE_FILE}" up -d --build --force-recreate --remove-orphans
+              ;;
+          esac
+          docker image prune -f
+          docker compose -f "${COMPOSE_FILE}" ps
+          LOCKED
+          REMOTE
+      - name: Verify
+        run: |
+          ssh "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+            "docker compose -f '${{ env.DEPLOY_PATH }}/${{ env.COMPOSE_FILE }}' ps"
+

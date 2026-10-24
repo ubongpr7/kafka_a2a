@@ -50,6 +50,35 @@ _TERMINAL_TASK_STATES = {
 }
 
 
+async def _safe_voice_playback(
+    session: Any,
+    text: str,
+    *,
+    allow_interruptions: bool,
+    profile_id: str,
+) -> bool:
+    """Keep a TTS/provider failure from terminating the voice turn task."""
+    if session is None or not text.strip():
+        return False
+    try:
+        handle = session.say(_voice_tts_text(text), allow_interruptions=allow_interruptions)
+        wait_for_playout = getattr(handle, "wait_for_playout", None)
+        if callable(wait_for_playout):
+            await wait_for_playout()
+        elif asyncio.iscoroutine(handle):
+            await handle
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "voice text-to-speech playback failed",
+            extra={"profile_id": profile_id},
+            exc_info=True,
+        )
+        return False
+
+
 def _parse_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None:
         return default
@@ -2462,18 +2491,16 @@ async def _voice_entrypoint(ctx: Any) -> None:
                     extra={"profile_id": self._runtime.profile_id},
                 )
 
-        async def _say(self, text: str, *, allow_interruptions: bool = False) -> None:
+        async def _say(self, text: str, *, allow_interruptions: bool = False) -> bool:
             if self._closing:
-                return
+                return False
             session = getattr(self, "session", None)
-            if session is None or not text.strip():
-                return
-            handle = session.say(_voice_tts_text(text), allow_interruptions=allow_interruptions)
-            wait_for_playout = getattr(handle, "wait_for_playout", None)
-            if callable(wait_for_playout):
-                await wait_for_playout()
-            elif asyncio.iscoroutine(handle):
-                await handle
+            return await _safe_voice_playback(
+                session,
+                text,
+                allow_interruptions=allow_interruptions,
+                profile_id=self._runtime.profile_id,
+            )
 
         async def handle_chat_speech_command(self, packet: Any) -> None:
             text = _voice_chat_speech_command_text(
@@ -2685,7 +2712,27 @@ async def _voice_entrypoint(ctx: Any) -> None:
             transcript, remaining_fragments = _select_voice_transcript_batch(unique_fragments)
             if not transcript:
                 return
-            await self._handle_voice_transcript(transcript, source="transcript_event")
+            try:
+                await self._handle_voice_transcript(transcript, source="transcript_event")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "voice transcript processing failed",
+                    extra={
+                        "profile_id": self._runtime.profile_id,
+                        "transcript_preview": _voice_log_preview(transcript),
+                    },
+                )
+                if not self._closing:
+                    fallback = "I couldn’t process that request. Please say it again or rephrase it."
+                    self._last_spoken_response = fallback
+                    await self._publish_voice_event(
+                        "result",
+                        fallback,
+                        payload={"voiceLocalResult": True, "processingError": True},
+                    )
+                    await self._say(fallback, allow_interruptions=True)
             if remaining_fragments and not self._closing:
                 self._transcript_buffer.extend(remaining_fragments)
                 self._schedule_transcript_flush()

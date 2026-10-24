@@ -33,7 +33,7 @@ in cleartext). You have two common options:
 
 ### Option A (recommended): Kafka terminates TLS (`SASL_SSL`)
 
-Kafka itself presents a certificate (for `kafka.interaims.com`) and your clients connect with
+Kafka itself presents a certificate (for `kafka.api.interaims.com`) and your clients connect with
 `security.protocol=SASL_SSL`. This is the cleanest approach for multi-broker later, but it requires
 setting up Kafka keystores/truststores.
 
@@ -42,7 +42,7 @@ setting up Kafka keystores/truststores.
 - Use a **TCP proxy** (not HTTP). Your example:
 
 ```caddyfile
-kafka.interaims.com {
+kafka.api.interaims.com {
   reverse_proxy localhost:9092
 }
 ```
@@ -68,8 +68,8 @@ If you get `address already in use` for port `9094`, set `KA2A_KAFKA_HOST_PORT` 
 and update your TCP proxy upstream accordingly.
 
 - Decide what port you want the public endpoint to be:
-  - If your proxy listens on `:443`, you must advertise `kafka.interaims.com:443`
-  - If your proxy listens on `:9094`, you must advertise `kafka.interaims.com:9094`
+  - If your proxy listens on `:443`, you must advertise `kafka.api.interaims.com:443`
+  - If your proxy listens on `:9094`, you must advertise `kafka.api.interaims.com:9094`
 
 In this compose, the host-facing broker listener is `9094` (the internal Docker listener is `9092`), so:
 - If your proxy runs on the **host**, proxy to `127.0.0.1:9094` (or `127.0.0.1:$KA2A_KAFKA_HOST_PORT` if you changed it)
@@ -80,7 +80,7 @@ Then configure K-A2A to connect to the proxy endpoint using `SASL_SSL` (TLS to t
 #### Minimal “server” checklist (Option B)
 
 1) In `kafka/sasl/.env`, set:
-- `KAFKA_ADVERTISED_LISTENERS` to your public DNS/port, e.g. `kafka.interaims.com:443`
+- `KAFKA_ADVERTISED_LISTENERS` to your public DNS/port, e.g. `kafka.api.interaims.com:443`
 - strong passwords (don’t keep the defaults)
 
 2) Start Kafka bound to localhost only:
@@ -97,7 +97,7 @@ docker compose -f docker-compose.yml -f docker-compose.server.yml up -d
 4) Point K-A2A at it (root `.env` used by your agent/gateway containers):
 
 ```env
-KA2A_BOOTSTRAP_SERVERS=kafka.interaims.com:443
+KA2A_BOOTSTRAP_SERVERS=kafka.api.interaims.com:443
 KA2A_KAFKA_SECURITY_PROTOCOL=SASL_SSL
 KA2A_KAFKA_SASL_MECHANISM=PLAIN
 KA2A_KAFKA_SASL_USERNAME=ka2a

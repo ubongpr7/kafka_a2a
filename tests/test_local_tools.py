@@ -533,6 +533,51 @@ async def test_explicit_delegation_uses_control_plane_while_directory_is_still_c
 
 
 @pytest.mark.asyncio
+async def test_explicit_delegation_scopes_shared_control_plane_cards_to_request_profile() -> None:
+    backend = KafkaDelegationBackend(agent_name="host", allowed_public_slugs={"onboarding"})
+
+    class _EmptyDirectory:
+        def list(self) -> list[AgentCard]:
+            return []
+
+    async def _ensure_started() -> None:
+        return None
+
+    def _card(name: str, profile_id: str) -> AgentCard:
+        return AgentCard(
+            name=name,
+            description="Onboarding specialist",
+            url=f"local://{name}",
+            version="0.1.0",
+            metadata={
+                "ka2aRuntime": {
+                    "publicSlug": "onboarding",
+                    "profileId": profile_id,
+                }
+            },
+        )
+
+    async def _list_control_plane_cards() -> list[AgentCard]:
+        return [_card("wa-p1-onboarding-1", "1"), _card("wa-p4-onboarding-4", "4")]
+
+    backend._ensure_started = _ensure_started  # type: ignore[method-assign]
+    backend._state.directory = _EmptyDirectory()  # type: ignore[assignment]
+    backend._control_plane = type("_ControlPlane", (), {"enabled": True})()
+    backend._list_control_plane_cards = _list_control_plane_cards  # type: ignore[method-assign]
+
+    ctx = ToolContext(
+        principal=Principal(user_id="user-1", claims={"profile_id": "4"}),
+    )
+    selected = await backend._wait_for_explicit_agent_card(
+        "Onboarding",
+        workspace_profile_id=backend._profile_id_from_context(ctx),
+    )
+
+    assert selected is not None
+    assert selected.name == "wa-p4-onboarding-4"
+
+
+@pytest.mark.asyncio
 async def test_hybrid_delegation_backend_uses_local_transport_for_local_agents() -> None:
     delegated: list[tuple[str, str | None]] = []
 
@@ -562,7 +607,9 @@ async def test_hybrid_delegation_backend_uses_local_transport_for_local_agents()
                 name="wa-p1-inventory_setup-123",
                 description="Inventory setup",
                 url="local://wa-p1-inventory_setup-123",
-                preferred_transport="local",
+                # Shared-runtime cards can still advertise Kafka compatibility
+                # while the selected workspace agent is loaded locally.
+                preferred_transport="kafka",
                 version="0.1.0",
                 metadata={
                     "ka2aRuntime": {

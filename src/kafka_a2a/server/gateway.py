@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import math
 import mimetypes
 import os
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from typing import Any
 from typing import NoReturn
 from uuid import uuid4
 
-from kafka_a2a.agent_filter import card_public_slug, card_profile_id, filter_agent_cards
+from kafka_a2a.agent_filter import card_public_slug, filter_agent_cards
 from kafka_a2a.client import Ka2aClient, Ka2aClientConfig
 from kafka_a2a.core.config import A2AAppSettings
 from kafka_a2a.errors import A2AError, A2AErrorCode
@@ -28,7 +29,7 @@ from kafka_a2a.protocol import METHOD_TASKS_LIST, TaskListParams, TaskListResult
 from kafka_a2a.registry.directory import KafkaAgentDirectory, KafkaAgentDirectoryConfig
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
 from kafka_a2a.server.auth import JwtBearerConfig, JwtVerificationError, parse_authorization_header, verify_bearer_jwt
-from kafka_a2a.tenancy import with_principal
+from kafka_a2a.tenancy import with_principal, with_workspace_profile_id
 from kafka_a2a.transport.kafka import KafkaConfig, KafkaTransport
 
 
@@ -50,12 +51,28 @@ class GatewayConfig:
     default_agent: str
     client_id: str | None = None
     request_timeout_s: float | None = None
-    stream_request_timeout_s: float | None = 120.0
+    # Multi-agent analysis can legitimately run for several minutes. Compose
+    # deployments use the same budget, and callers can still explicitly set
+    # this to ``None`` when their transport must not impose a stream timeout.
+    stream_request_timeout_s: float | None = 900.0
     jwt: JwtBearerConfig | None = None
 
 
 _DEFAULT_CORS_ALLOW_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 _LOGGER = logging.getLogger(__name__)
+
+
+def _json_safe(value: Any) -> Any:
+    """Normalize streamed payloads so one non-finite metric cannot break SSE JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _normalize_agent_lookup(value: str | None) -> str:
@@ -223,7 +240,7 @@ def create_gateway_app(config: GatewayConfig):
         if hasattr(event, "model_dump"):
             payload = event.model_dump(mode="json", by_alias=True, exclude_none=True)
         if isinstance(payload, dict):
-            return payload
+            return _json_safe(payload)
         return {"kind": "status-update", "status": {"state": "working"}}
 
     def _gateway_error_response(exc: Exception, *, action: str) -> tuple[int, str]:
@@ -315,6 +332,9 @@ def create_gateway_app(config: GatewayConfig):
             )
             overrides = {}
         claims.update(overrides)
+        # Keep the profile resolved by the server auth layer available even
+        # when the original access token does not carry that claim shape.
+        claims["profile_id"] = auth_context.profile_id
         principal.claims = claims
         return principal
 
@@ -338,16 +358,20 @@ def create_gateway_app(config: GatewayConfig):
         if not token:
             raise HTTPException(status_code=401, detail="Authentication required")
 
-        principal = await _principal_from_token(token, request.headers.get("x-intera-authorization-context"))
-        metadata = with_principal({}, principal)
+        context_token = request.headers.get("x-intera-authorization-context")
+        principal = await _principal_from_token(token, context_token)
+        auth_context = build_agent_auth_context(token=token, jwt=config.jwt, context_token=context_token)
+        metadata = with_workspace_profile_id(with_principal({}, principal), auth_context.profile_id)
         return ensure_trace_metadata(metadata, headers=request.headers)
 
     async def _metadata_from_request(request: Request) -> dict[str, Any] | None:
         metadata: dict[str, Any] | None = None
         token = _token_from_request(request)
         if token and config.jwt is not None:
-            principal = await _principal_from_token(token, request.headers.get("x-intera-authorization-context"))
-            metadata = with_principal({}, principal)
+            context_token = request.headers.get("x-intera-authorization-context")
+            principal = await _principal_from_token(token, context_token)
+            auth_context = build_agent_auth_context(token=token, jwt=config.jwt, context_token=context_token)
+            metadata = with_workspace_profile_id(with_principal({}, principal), auth_context.profile_id)
         return ensure_trace_metadata(metadata, headers=request.headers)
 
     def _runtime_access_from_authorization(authorization: str) -> AgentRuntimeAccessContext:

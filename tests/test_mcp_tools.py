@@ -1989,6 +1989,90 @@ async def test_multi_mcp_executor_wraps_call_tool_failure_with_remote_tool_conte
 
 
 @pytest.mark.asyncio
+async def test_multi_mcp_executor_retries_transient_idempotent_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    from kafka_a2a import mcp_tools
+
+    attempts: list[str] = []
+
+    async def fake_call_remote_tool(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        _ = server_url, headers, timeout_s, arguments
+        attempts.append(name)
+        if len(attempts) == 1:
+            raise RuntimeError("connection reset by peer")
+        return {"ok": True, "tool": name}
+
+    monkeypatch.setattr(mcp_tools, "_call_remote_tool", fake_call_remote_tool)
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            read_retry_max_retries=1,
+            read_retry_backoff_s=0,
+            servers=[
+                McpServerConfig(
+                    id="pos",
+                    server_url="http://pos-mcp:8000/mcp",
+                    tool_name_prefix="pos.",
+                    tools=["get_sales_summary"],
+                    auth=McpServerAuthConfig(mode="none"),
+                )
+            ],
+        )
+    )
+
+    result = await executor.call_tool(name="pos.get_sales_summary", arguments={}, ctx=ToolContext())
+
+    assert result == {"ok": True, "tool": "get_sales_summary"}
+    assert attempts == ["get_sales_summary", "get_sales_summary"]
+
+
+@pytest.mark.asyncio
+async def test_multi_mcp_executor_never_retries_write_operation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from kafka_a2a import mcp_tools
+
+    attempts: list[str] = []
+
+    async def fake_call_remote_tool(
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        _ = server_url, headers, timeout_s, arguments
+        attempts.append(name)
+        raise RuntimeError("gateway timeout")
+
+    monkeypatch.setattr(mcp_tools, "_call_remote_tool", fake_call_remote_tool)
+    executor = MultiMcpToolExecutor(
+        config=MultiMcpToolExecutorConfig(
+            read_retry_max_retries=3,
+            read_retry_backoff_s=0,
+            servers=[
+                McpServerConfig(
+                    id="inventory",
+                    server_url="http://inventory-mcp:8000/mcp",
+                    tool_name_prefix="inventory.",
+                    tools=["reserve_stock"],
+                    auth=McpServerAuthConfig(mode="none"),
+                )
+            ],
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="remote tool 'reserve_stock'.*gateway timeout"):
+        await executor.call_tool(name="inventory.reserve_stock", arguments={"sku": "A-1"}, ctx=ToolContext())
+
+    assert attempts == ["reserve_stock"]
+
+
+@pytest.mark.asyncio
 async def test_composite_executor_skip_warning_includes_inline_context(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

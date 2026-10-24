@@ -27,6 +27,12 @@ from kafka_a2a.models import (
     TextPart,
 )
 from kafka_a2a.processors import TaskEvent, TaskProcessor
+from kafka_a2a.langgraph_processor import (
+    _build_anti_theft_review_follow_up_insight,
+    _build_cashier_role_review_insight,
+    _build_demo_priority_actions_insight,
+    _build_demo_supplier_alternative_insight,
+)
 from kafka_a2a.registry.directory import KafkaAgentDirectory, KafkaAgentDirectoryConfig
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
 from kafka_a2a.settings import Ka2aSettings
@@ -294,6 +300,35 @@ def make_router_processor_from_env() -> TaskProcessor:
         assert state.directory is not None
 
         user_text = "\n".join([p.text for p in message.parts if isinstance(p, TextPart)]).strip()
+
+        # Keep the published demo follow-ups structured even when the control
+        # plane selects the host's router processor instead of a specialist's
+        # LangGraph processor. This is a routing boundary contract, not a
+        # provider-specific response shortcut.
+        normalized_demo_query = " ".join(user_text.lower().split()).rstrip(" ?!.")
+        demo_payload: dict[str, Any] | None = None
+        if normalized_demo_query in {"what should i review first", "what do i review first"}:
+            demo_payload = _build_anti_theft_review_follow_up_insight()
+        elif normalized_demo_query == "what should i act on first":
+            demo_payload = _build_demo_priority_actions_insight()
+        elif normalized_demo_query == "what alternative action should i take":
+            demo_payload = _build_demo_supplier_alternative_insight()
+        elif normalized_demo_query == "notify the staff member when the role is updated":
+            role_payload = _build_cashier_role_review_insight()
+            demo_payload = {
+                **role_payload,
+                "summary": "I can prepare the staff notification after you provide the staff member and confirm the message.",
+                "widgets": [role_payload["widgets"][1]],
+            }
+        if demo_payload is not None:
+            parts = [DataPart(data=demo_payload)]
+            yield Artifact(name="result", parts=parts)
+            yield TaskStatus(
+                state=TaskState.completed,
+                message=Message(role=Role.agent, parts=parts, context_id=task.context_id),
+            )
+            return
+
         cards = await _list_downstream_cards()
 
         if not cards:

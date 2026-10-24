@@ -3,7 +3,7 @@
   "sharedServers": [
     {
       "id": "users",
-      "serverUrl": "https://users.mcp.interaims.com/mcp/",
+      "serverUrl": "https://users-mcp.api.interaims.com/mcp/",
       "toolNamePrefix": "users.",
       "auth": {
         "mode": "forward_bearer"
@@ -11,7 +11,7 @@
     },
     {
       "id": "products",
-      "serverUrl": "https://product.mcp.interaims.com/mcp/",
+      "serverUrl": "https://product-mcp.api.interaims.com/mcp/",
       "timeoutS": 180,
       "toolNamePrefix": "product.",
       "auth": {
@@ -20,7 +20,7 @@
     },
     {
       "id": "inventory",
-      "serverUrl": "https://inventory.mcp.interaims.com/mcp/",
+      "serverUrl": "https://inventory-mcp.api.interaims.com/mcp/",
       "toolNamePrefix": "inventory.",
       "auth": {
         "mode": "forward_bearer"
@@ -28,7 +28,7 @@
     },
     {
       "id": "pos",
-      "serverUrl": "https://pos.mcp.interaims.com/mcp/",
+      "serverUrl": "https://pos-mcp.api.interaims.com/mcp/",
       "toolNamePrefix": "pos.",
       "auth": {
         "mode": "forward_bearer"
@@ -36,7 +36,7 @@
     },
     {
       "id": "audit",
-      "serverUrl": "https://audit.mcp.interaims.com/mcp/",
+      "serverUrl": "https://audit-mcp.api.interaims.com/mcp/",
       "toolNamePrefix": "audit.",
       "auth": {
         "mode": "forward_bearer"
@@ -44,7 +44,7 @@
     },
     {
       "id": "notifications",
-      "serverUrl": "https://notifications.mcp.interaims.com/mcp/",
+      "serverUrl": "https://notifications-mcp.api.interaims.com/mcp/",
       "toolNamePrefix": "notifications.",
       "auth": {
         "mode": "forward_bearer"
@@ -52,7 +52,7 @@
     },
     {
       "id": "subscriptions",
-      "serverUrl": "https://subscriptions.mcp.interaims.com/mcp/",
+      "serverUrl": "https://subscriptions-mcp.api.interaims.com/mcp/",
       "toolNamePrefix": "subscriptions.",
       "auth": {
         "mode": "forward_bearer"
@@ -60,7 +60,7 @@
     },
     {
       "id": "purchasing",
-      "serverUrl": "https://inventory.mcp.interaims.com/mcp/",
+      "serverUrl": "https://inventory-mcp.api.interaims.com/mcp/",
       "toolNamePrefix": "purchasing.",
       "auth": {
         "mode": "forward_bearer"

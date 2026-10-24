@@ -146,11 +146,13 @@
         {
           "ref": "inventory",
           "tools": [
+            "list_inventory_items",
             "get_stock_risk",
             "get_stock_analytics",
             "get_reorder_candidates",
             "get_stock_movements",
             "search_stock_locations",
+            "search_inventory_items",
             "search_purchase_orders",
             "get_purchase_order_analytics"
           ]

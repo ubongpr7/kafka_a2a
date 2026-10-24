@@ -2,11 +2,36 @@ from __future__ import annotations
 
 import pytest
 
+from kafka_a2a.context_memory import ContextMemory
 from kafka_a2a.memory import KA2A_CONVERSATION_HISTORY_METADATA_KEY
-from kafka_a2a.models import Artifact, Message, TaskConfiguration, TextPart
+from kafka_a2a.models import Artifact, DataPart, Message, TaskConfiguration, TextPart
 from kafka_a2a.runtime.agent import Ka2aAgent, Ka2aAgentConfig
 from kafka_a2a.runtime.task_store import InMemoryTaskStore
 from kafka_a2a.transport.kafka import KafkaConfig, KafkaTransport
+
+
+def test_context_memory_round_trips_canonical_fact_packets() -> None:
+    memory = ContextMemory(
+        summary="Sales review completed.",
+        fact_packets=[
+            {
+                "schema_version": 1,
+                "facts": [
+                    {
+                        "dimension": "location",
+                        "entity_label": "Agric",
+                        "metric": "sales_revenue",
+                        "value": 2500,
+                    }
+                ],
+            }
+        ],
+    )
+
+    restored = ContextMemory.from_json(memory.to_json())
+
+    assert restored.fact_packets is not None
+    assert restored.fact_packets[0]["facts"][0]["entity_label"] == "Agric"
 
 
 @pytest.mark.asyncio
@@ -86,3 +111,45 @@ async def test_agent_preserves_direct_structured_history_over_text_only_task_his
 
     assert metadata is not None
     assert metadata[KA2A_CONVERSATION_HISTORY_METADATA_KEY] == direct_history
+
+
+@pytest.mark.asyncio
+async def test_agent_prefers_server_structured_artifact_over_direct_history() -> None:
+    store = InMemoryTaskStore()
+    transport = KafkaTransport(KafkaConfig(bootstrap_servers="localhost:9092"))
+    agent = Ka2aAgent(config=Ka2aAgentConfig(agent_name="t", context_history_turns=2), transport=transport, task_store=store)
+
+    context_id = "ctx-server-structured-history"
+    prior_message = Message(role="user", parts=[TextPart(text="analyze sales")], context_id=context_id)
+    prior_task = await store.create_task(initial_message=prior_message, context_id=context_id)
+    server_payload = {"kind": "insight_response", "title": "Server sales review", "widgets": []}
+    await store.append_artifact(
+        task_id=prior_task.id,
+        artifact=Artifact(name="result", parts=[TextPart(text="Server sales summary"), DataPart(data=server_payload)]),
+    )
+    current_message = Message(role="user", parts=[TextPart(text="which location was lowest")], context_id=context_id)
+    current_task = await store.create_task(initial_message=current_message, context_id=context_id)
+    direct_history = [
+        {"role": "user", "content": "analyze sales"},
+        {
+            "role": "assistant",
+            "content": "Stale client summary",
+            "structured_payload": {"kind": "insight_response", "title": "Client snapshot", "widgets": []},
+        },
+    ]
+
+    metadata = await agent._processor_metadata_for_request(  # type: ignore[attr-defined]
+        task=current_task,
+        configuration=None,
+        request_metadata={KA2A_CONVERSATION_HISTORY_METADATA_KEY: direct_history},
+    )
+
+    assert metadata is not None
+    assert metadata[KA2A_CONVERSATION_HISTORY_METADATA_KEY] == [
+        {"role": "user", "content": "analyze sales"},
+        {
+            "role": "assistant",
+            "content": "Server sales summary",
+            "structured_payload": server_payload,
+        },
+    ]

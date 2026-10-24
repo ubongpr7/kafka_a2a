@@ -10,6 +10,11 @@ x-ka2a-image: &ka2a_image
     # Production deploys should export `KA2A_ENV_FILE=.env.prod` so the
     # containers do not start with the local development `.env`.
     - ${KA2A_ENV_FILE:-.env}
+  environment:
+    # Redis-backed context is required for factual follow-ups after reconnects
+    # and when voice shares a host conversation with the browser.
+    KA2A_CONTEXT_MEMORY_STORE: ${KA2A_CONTEXT_MEMORY_STORE:-redis}
+    KA2A_CONTEXT_MEMORY_TTL_S: ${KA2A_CONTEXT_MEMORY_TTL_S:-604800}
 
 services:
   host-agent:
@@ -352,6 +357,7 @@ services:
       - pos-admin-agent
     environment:
       KA2A_RUNTIME_SHARED_TOKEN: ${KA2A_RUNTIME_SHARED_TOKEN:-interaims-local-ka2a-runtime}
+      KA2A_GATEWAY_STREAM_REQUEST_TIMEOUT_S: ${KA2A_GATEWAY_STREAM_REQUEST_TIMEOUT_S:-900}
     ports:
       - "7006:7006"
     command: ["gateway", "--default-agent", "host", "--host", "0.0.0.0", "--port", "7006"]
@@ -371,8 +377,10 @@ services:
       KA2A_VOICE_STT_MODEL: whisper-1
       KA2A_VOICE_TTS_MODEL: gpt-4o-mini-tts
       KA2A_VOICE_LLM_MODEL: gpt-4.1-mini
-      KA2A_VOICE_HOST_TIMEOUT_S: "240"
+      KA2A_VOICE_HOST_TIMEOUT_S: "900"
       KA2A_VOICE_BACKEND_DELEGATION_ENABLED: "true"
+      KA2A_VOICE_DECISIONING_ENABLED: ${KA2A_VOICE_DECISIONING_ENABLED:-true}
+      KA2A_VOICE_DECISIONING_TIMEOUT_S: ${KA2A_VOICE_DECISIONING_TIMEOUT_S:-0.25}
     command: ["voice"]
     restart: unless-stopped
 

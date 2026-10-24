@@ -1434,6 +1434,7 @@ def test_gateway_stream_keeps_verified_jwt_claims_when_principal_overrides_fail(
     principal = metadata["urn:ka2a:principal"]
     assert principal["userId"] == "17"
     assert principal["claims"]["profile_id"] == "1"
+    assert metadata["urn:ka2a:workspace_profile_id"] == "1"
 
 
 def test_gateway_stream_uses_stream_specific_timeout_override(

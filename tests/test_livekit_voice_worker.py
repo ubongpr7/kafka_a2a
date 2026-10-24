@@ -15,6 +15,7 @@ from kafka_a2a.livekit_voice.worker import (
     _resolve_voice_host_name_from_setup,
     _sanitize_voice_text,
     _select_voice_response_candidate,
+    _safe_voice_playback,
     _select_voice_transcript_batch,
     _should_delegate_voice_transcript,
     _voice_has_actionable_business_request,
@@ -266,6 +267,23 @@ def test_voice_session_greeting_is_short_and_user_facing() -> None:
     assert greeting in voice_worker._VOICE_SESSION_GREETINGS
     assert "connected" not in greeting.lower()
     assert "listening now" not in greeting.lower()
+
+
+@pytest.mark.asyncio
+async def test_safe_voice_playback_contains_provider_failure() -> None:
+    class FailingSession:
+        def say(self, *_args, **_kwargs):
+            raise RuntimeError("tts unavailable")
+
+    assert (
+        await _safe_voice_playback(
+            FailingSession(),
+            "I am ready.",
+            allow_interruptions=True,
+            profile_id="4",
+        )
+        is False
+    )
 
 
 def test_voice_progress_hides_internal_agent_lifecycle_messages() -> None:

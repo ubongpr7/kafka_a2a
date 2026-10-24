@@ -27,6 +27,7 @@ from kafka_a2a.models import (
 from kafka_a2a.registry.directory import KafkaAgentDirectory, KafkaAgentDirectoryConfig
 from kafka_a2a.registry.kafka_registry import KafkaAgentRegistry
 from kafka_a2a.tools import ToolContext, ToolExecutor, ToolSpec
+from kafka_a2a.tenancy import KA2A_WORKSPACE_PROFILE_ID_METADATA_KEY
 from kafka_a2a.transport.kafka import KafkaConfig, KafkaTransport
 
 
@@ -633,20 +634,30 @@ class KafkaDelegationBackend:
         cards.sort(key=lambda card: card.name)
         return cards
 
-    def _visible_downstream_cards(self, cards: list[AgentCard]) -> list[AgentCard]:
+    def _visible_downstream_cards(
+        self,
+        cards: list[AgentCard],
+        *,
+        workspace_profile_id: str | None = None,
+    ) -> list[AgentCard]:
         visible_cards = filter_agent_cards(
             cards,
-            required_profile_id=self._workspace_profile_id,
+            required_profile_id=workspace_profile_id or self._workspace_profile_id,
             allowed_public_slugs=self._allowed_public_slugs or None,
         )
         visible_cards.sort(key=lambda card: card.name)
         return visible_cards
 
-    async def _list_downstream_cards(self) -> list[AgentCard]:
+    async def _list_downstream_cards(self, *, workspace_profile_id: str | None = None) -> list[AgentCard]:
         registered_cards = await self._list_registered_cards()
-        return self._visible_downstream_cards(registered_cards)
+        return self._visible_downstream_cards(registered_cards, workspace_profile_id=workspace_profile_id)
 
-    async def _wait_for_explicit_agent_card(self, agent_name: str) -> AgentCard | None:
+    async def _wait_for_explicit_agent_card(
+        self,
+        agent_name: str,
+        *,
+        workspace_profile_id: str | None = None,
+    ) -> AgentCard | None:
         requested = (agent_name or "").strip()
         if not requested:
             return None
@@ -659,7 +670,7 @@ class KafkaDelegationBackend:
         next_control_plane_check_at = loop.time()
 
         def _match(cards: list[AgentCard]) -> AgentCard | None:
-            for card in self._visible_downstream_cards(cards):
+            for card in self._visible_downstream_cards(cards, workspace_profile_id=workspace_profile_id):
                 if card.name == requested or _card_matches_requested_agent(card, requested):
                     return card
             return None
@@ -702,6 +713,38 @@ class KafkaDelegationBackend:
             "registered_agents": [_card_summary(card) for card in registered_cards],
             "hidden_agents": [_card_summary(card) for card in hidden_cards],
         }
+
+    @staticmethod
+    def _profile_id_from_context(ctx: ToolContext) -> str | None:
+        """Resolve the authenticated workspace for a delegation request."""
+        candidates: list[Any] = []
+        if ctx.principal is not None:
+            claims = ctx.principal.claims
+            if isinstance(claims, dict):
+                candidates.extend(
+                    claims.get(key)
+                    for key in ("profile_id", "profileId", "profile", "profile_context")
+                )
+
+        metadata = ctx.metadata or {}
+        for key in (KA2A_WORKSPACE_PROFILE_ID_METADATA_KEY, "profile_id", "profileId", "profile"):
+            candidates.append(metadata.get(key))
+        principal_payload = metadata.get("urn:ka2a:principal")
+        if isinstance(principal_payload, dict):
+            claims = principal_payload.get("claims")
+            if isinstance(claims, dict):
+                candidates.extend(
+                    claims.get(key)
+                    for key in ("profile_id", "profileId", "profile", "profile_context")
+                )
+
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                candidate = candidate.get("id") or candidate.get("profile_id") or candidate.get("profileId")
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return None
 
     def _select_agent(self, *, cards: list[AgentCard], request: str, agent_name: str | None) -> AgentCard:
         if agent_name:
@@ -776,8 +819,12 @@ class KafkaDelegationBackend:
         ctx: ToolContext,
     ) -> dict[str, Any]:
         selected: AgentCard
+        workspace_profile_id = self._profile_id_from_context(ctx)
         if agent_name:
-            explicit_card = await self._wait_for_explicit_agent_card(agent_name)
+            explicit_card = await self._wait_for_explicit_agent_card(
+                agent_name,
+                workspace_profile_id=workspace_profile_id,
+            )
             # A public router slug (for example ``pos``) is a routing hint, not
             # a reason to add another hop when its concrete specialist is ready.
             # Re-score the visible workspace cards so business-review planning
@@ -786,13 +833,16 @@ class KafkaDelegationBackend:
                 selected = explicit_card
             else:
                 selected = self._select_agent(
-                    cards=await self._list_downstream_cards(),
+                    cards=await self._list_downstream_cards(workspace_profile_id=workspace_profile_id),
                     request=request,
                     agent_name=agent_name,
                 )
         else:
             registered_cards = await self._list_registered_cards()
-            visible_cards = self._visible_downstream_cards(registered_cards)
+            visible_cards = self._visible_downstream_cards(
+                registered_cards,
+                workspace_profile_id=workspace_profile_id,
+            )
             selected = self._select_agent(cards=visible_cards, request=request, agent_name=agent_name)
 
         child_metadata = self._metadata_for_delegation(ctx.metadata, selected)
@@ -918,9 +968,24 @@ class HybridDelegationBackend(KafkaDelegationBackend):
     ) -> dict[str, Any]:
         registered_cards = await self._list_registered_cards()
         visible_cards = self._visible_downstream_cards(registered_cards)
-        selected = self._select_agent(cards=visible_cards, request=request, agent_name=agent_name)
-        preferred_transport = str(selected.preferred_transport or "").strip().lower() or "kafka"
-        if preferred_transport in {"local", "direct", "inprocess", "in-process"} and await self._agent_is_local(selected.name):
+        try:
+            selected = self._select_agent(cards=visible_cards, request=request, agent_name=agent_name)
+        except RuntimeError:
+            # A newly reconciled shared-runtime worker can be available in the
+            # control plane before its short-lived Kafka directory consumer
+            # has observed the corresponding card. Use the authoritative
+            # scoped registry instead of reporting a false "not registered".
+            control_plane_cards = await self._list_control_plane_cards()
+            selected = self._select_agent(
+                cards=self._visible_downstream_cards(control_plane_cards),
+                request=request,
+                agent_name=agent_name,
+            )
+        # The shared runtime may expose Kafka-compatible cards even though the
+        # selected workspace agent is already loaded in this process. Prefer
+        # that local instance to avoid a second registry lookup and duplicate
+        # routing races between legacy workers and scoped runtime cards.
+        if await self._agent_is_local(selected.name):
             return await self._delegate_local(selected, request, delegated_task_id, ctx)
         return await super().delegate(
             request=request,

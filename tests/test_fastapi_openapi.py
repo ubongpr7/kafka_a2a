@@ -25,6 +25,12 @@ def test_gateway_openapi_builds() -> None:
     assert "/tasks/{task_id}/events" in schema.get("paths", {})
 
 
+def test_gateway_defaults_to_the_long_running_stream_budget() -> None:
+    config = GatewayConfig(bootstrap_servers="localhost:9092", default_agent="host")
+
+    assert config.stream_request_timeout_s == 900.0
+
+
 def test_proxy_openapi_builds() -> None:
     app = create_a2a_http_proxy_app(A2AHttpProxyConfig(bootstrap_servers="localhost:9092", agent_name="host"))
     schema = app.openapi()
@@ -63,6 +69,29 @@ def test_proxy_cors_preflight_allows_configured_local_frontend(monkeypatch: pyte
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
     assert response.headers["access-control-allow-credentials"] == "true"
     assert "POST" in response.headers["access-control-allow-methods"]
+
+
+def test_proxy_cors_preflight_allows_default_loopback_regex(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KA2A_CORS_ALLOW_ORIGINS", raising=False)
+    monkeypatch.delenv("KA2A_CORS_ALLOW_ORIGIN_REGEX", raising=False)
+    app = create_a2a_http_proxy_app(A2AHttpProxyConfig(bootstrap_servers="localhost:9092", agent_name="host"))
+
+    async def request_preflight() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.options(
+                "/",
+                headers={
+                    "Origin": "http://127.0.0.1:3005",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "authorization,content-type",
+                },
+            )
+
+    response = asyncio.run(request_preflight())
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:3005"
 
 
 def test_gateway_enables_cors_middleware() -> None:

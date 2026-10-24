@@ -1852,6 +1852,32 @@ class FakeToolExecutorWithGlobalImportFailure(FakeToolExecutor):
         }
 
 
+class FakeToolExecutorWithPosAnalytics(FakeToolExecutor):
+    """Provide one realistic read model for deterministic host analytics tests."""
+
+    async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
+        if name == "pos.get_sales_summary":
+            FAKE_TOOL_CALLS.append((name, dict(arguments)))
+            return {
+                "total_sales": 210_971_280.0,
+                "total_quantity_sold": 646,
+                "groups": [
+                    {
+                        "label": "Maitama, Abuja",
+                        "total_sales": 92_951_000.0,
+                        "order_count": 271,
+                    },
+                    {
+                        "label": "Agric, Ikorodu Store",
+                        "total_sales": 68_102_000.0,
+                        "order_count": 204,
+                    },
+                ],
+                "currency_code": "NGN",
+            }
+        return await super().call_tool(name=name, arguments=arguments, ctx=ctx)
+
+
 class FakeWrappedLookupToolExecutor(FakeToolExecutor):
     async def call_tool(self, *, name: str, arguments: dict[str, Any], ctx: ToolContext) -> Any:
         result = await super().call_tool(name=name, arguments=arguments, ctx=ctx)
@@ -1929,6 +1955,10 @@ def build_fake_tool_executor_with_category_failures(*, agent_name: str | None = 
 
 def build_fake_tool_executor_with_global_import_failure(*, agent_name: str | None = None) -> ToolExecutor:
     return FakeToolExecutorWithGlobalImportFailure(agent_name=agent_name)
+
+
+def build_fake_tool_executor_with_pos_analytics(*, agent_name: str | None = None) -> ToolExecutor:
+    return FakeToolExecutorWithPosAnalytics(agent_name=agent_name)
 
 
 def build_fake_wrapped_lookup_tool_executor(*, agent_name: str | None = None) -> ToolExecutor:

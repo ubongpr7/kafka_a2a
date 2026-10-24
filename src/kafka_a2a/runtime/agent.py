@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -74,6 +75,18 @@ TaskProcessor = Callable[
 ]
 
 logger = logging.getLogger("kafka_a2a.agent")
+
+
+def _parse_bool_env(name: str, *, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _user_safe_failure_message(exc: Exception) -> str:
@@ -201,7 +214,14 @@ class Ka2aAgent:
             self._push_queue = asyncio.Queue(maxsize=self._cfg.push_queue_maxsize)
             self._push_task = asyncio.create_task(self._push_loop())
 
-        if self._registry is not None:
+        # Deployments that use the profile-aware shared runtime may retain
+        # legacy workers for compatibility. Those workers must not publish
+        # unscoped cards under the same registry key as the shared runtime.
+        registry_publish_enabled = _parse_bool_env(
+            "KA2A_REGISTRY_PUBLISH_ENABLED",
+            default=True,
+        )
+        if self._registry is not None and registry_publish_enabled:
             await self._registry.publish(agent_name=self.card.name, card=self.card)
             logger.info("published agent card to registry", extra={"agent_name": self.card.name, "topic": self._registry.topic})
             if self._cfg.registry_heartbeat_s is not None and self._cfg.registry_heartbeat_s > 0:
@@ -865,6 +885,22 @@ class Ka2aAgent:
 
         return ""
 
+    def _task_assistant_structured_payload(self, task: Task) -> dict[str, Any] | None:
+        """Return the final server-emitted result payload for follow-up routing.
+
+        Browser-provided history is useful for legacy text-only tasks, but a
+        completed A2A result already lives in the task store. Prefer that
+        server-owned payload whenever it is available so a client cannot steer
+        a follow-up using a stale widget snapshot.
+        """
+        for artifact in reversed(task.artifacts or []):
+            if (artifact.name or "") != "result":
+                continue
+            for part in reversed(artifact.parts):
+                if isinstance(part, DataPart) and isinstance(part.data, dict) and part.data:
+                    return dict(part.data)
+        return None
+
     def _history_turns(self, configuration: TaskConfiguration | None) -> int:
         if configuration is not None and configuration.history_length is not None:
             return max(0, int(configuration.history_length))
@@ -877,17 +913,16 @@ class Ka2aAgent:
         configuration: TaskConfiguration | None,
         request_metadata: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        # The browser/voice gateway can supply a richer transcript than the
-        # task store: notably, completed insight widgets live on assistant
-        # history entries.  Do not replace that payload with the task-store's
-        # text-only reconstruction or follow-up routing loses its domain.
+        # The browser/voice gateway can supply a richer transcript than an
+        # older text-only task record. Use it as a compatibility fallback, but
+        # prefer structured artifacts reconstructed from the server task store
+        # whenever they exist for this context.
         direct_history = (request_metadata or {}).get(KA2A_CONVERSATION_HISTORY_METADATA_KEY)
-        if isinstance(direct_history, list) and any(
+        direct_history_has_structured_payload = isinstance(direct_history, list) and any(
             isinstance(item, dict)
             and isinstance(item.get("structured_payload") or item.get("structuredPayload"), dict)
             for item in direct_history
-        ):
-            return request_metadata
+        )
 
         history_turns = self._history_turns(configuration)
         if history_turns <= 0:
@@ -902,7 +937,8 @@ class Ka2aAgent:
 
         # We ask for N+1 so the current task is included, then drop it.
         tasks = await self._store.list_tasks_by_context(task.context_id, limit=history_turns + 1)
-        conversation: list[dict[str, str]] = []
+        conversation: list[dict[str, Any]] = []
+        server_history_has_structured_payload = False
         for t in tasks:
             if t.id == task.id:
                 continue
@@ -917,8 +953,16 @@ class Ka2aAgent:
             assistant_text = self._task_assistant_text(t)
             if user_text:
                 conversation.append({"role": "user", "content": user_text})
-            if assistant_text:
-                conversation.append({"role": "assistant", "content": assistant_text})
+            structured_payload = self._task_assistant_structured_payload(t)
+            if assistant_text or structured_payload:
+                entry: dict[str, Any] = {"role": "assistant", "content": assistant_text}
+                if structured_payload:
+                    entry["structured_payload"] = structured_payload
+                    server_history_has_structured_payload = True
+                conversation.append(entry)
+
+        if direct_history_has_structured_payload and not server_history_has_structured_payload:
+            return request_metadata
 
         if not conversation:
             return request_metadata

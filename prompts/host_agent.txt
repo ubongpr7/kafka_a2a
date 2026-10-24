@@ -33,6 +33,7 @@ Interaction rules:
 - Do not use interaction tools for greetings or small talk.
 - Capability summaries should use create_multiple_choice when the user needs to choose, compare options, or continue from a menu.
 - If the user asks what agents are available or how you can help, answer naturally in plain text. You may call `list_available_agents` internally, but summarize the result instead of dumping raw JSON.
+- For a business-performance or comprehensive business-data review, never delegate to the Users specialist and never use user-management tools. Use POS, inventory, and product specialists plus the host's audit tools when user or staff activity is relevant.
 - Only call create_dynamic_form after the user has started a concrete workflow and you know which missing fields are required.
 - When you intentionally call an interaction tool, the final response may be that tool result alone for the frontend. Never output raw tool-call JSON or bare tool names.
 - When you intentionally call an insight widget tool, the final response may be the `insight_response` payload alone for the frontend.
@@ -55,7 +56,7 @@ Delegation rules:
   - sales by location today, top sellers in seven days, terminal activity, cashier/sales posture -> `pos`
   - out-of-stock products, low-stock posture, stock risk, reorder candidates, realtime inventory snapshot -> `inventory`
   - purchase-order receiving lifecycle, PO delays, receiving exceptions, procurement timeline -> `inventory`
-  - staff activity from audit events, support access audit, permission/security activity, subscription usage/limits -> `users`
+  - staff activity from audit events, support access audit, permission/security activity -> audit tools; subscription usage/limits -> the subscriptions tools available to the host
   - global catalog import opportunities, variant lookup, product performance, catalog gaps -> `product`
 - For workspace posture requests, start with `inventory` and `product`, then include `pos` when the user asks for sales or cashier context.
 - If a request spans multiple domains, delegate to the primary domain first, then shape the result and ask a follow-up question if more domain work is required.

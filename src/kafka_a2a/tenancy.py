@@ -20,6 +20,7 @@ class Ka2aTenancyModel(BaseModel):
 
 
 KA2A_PRINCIPAL_METADATA_KEY = "urn:ka2a:principal"
+KA2A_WORKSPACE_PROFILE_ID_METADATA_KEY = "urn:ka2a:workspace_profile_id"
 
 
 class Principal(Ka2aTenancyModel):
@@ -58,6 +59,18 @@ def with_principal(
 ) -> dict[str, Any]:
     merged = dict(metadata or {})
     merged[key] = principal.model_dump(by_alias=True, exclude_none=True)
+    return merged
+
+
+def with_workspace_profile_id(
+    metadata: dict[str, Any] | None,
+    profile_id: str | int | None,
+) -> dict[str, Any]:
+    """Attach the server-verified workspace scope without exposing credentials."""
+    merged = dict(metadata or {})
+    value = str(profile_id or "").strip()
+    if value:
+        merged[KA2A_WORKSPACE_PROFILE_ID_METADATA_KEY] = value
     return merged
 
 

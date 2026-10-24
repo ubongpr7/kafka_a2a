@@ -57,6 +57,15 @@ def _parse_optional_timeout_s(*values: str | None) -> float | None:
     return None
 
 
+def _gateway_stream_timeout_s_from_env() -> float | None:
+    """Use the production stream budget unless the operator explicitly overrides it."""
+
+    raw = os.getenv("KA2A_GATEWAY_STREAM_REQUEST_TIMEOUT_S")
+    if raw is None or not raw.strip():
+        return 900.0
+    return _parse_optional_timeout_s(raw)
+
+
 def _read_text_file(path: str | None) -> str | None:
     if not path:
         return None
@@ -445,9 +454,7 @@ def _run_gateway(args: argparse.Namespace) -> None:
                 os.getenv("KA2A_GATEWAY_REQUEST_TIMEOUT_S"),
                 os.getenv("KA2A_REQUEST_TIMEOUT_S"),
             ),
-            stream_request_timeout_s=(
-                _parse_optional_timeout_s(os.getenv("KA2A_GATEWAY_STREAM_REQUEST_TIMEOUT_S")) or 120.0
-            ),
+            stream_request_timeout_s=_gateway_stream_timeout_s_from_env(),
             jwt=jwt,
         )
     )
@@ -467,9 +474,7 @@ def create_gateway_app_for_uvicorn_reload():
                 os.getenv("KA2A_GATEWAY_REQUEST_TIMEOUT_S"),
                 os.getenv("KA2A_REQUEST_TIMEOUT_S"),
             ),
-            stream_request_timeout_s=(
-                _parse_optional_timeout_s(os.getenv("KA2A_GATEWAY_STREAM_REQUEST_TIMEOUT_S")) or 120.0
-            ),
+            stream_request_timeout_s=_gateway_stream_timeout_s_from_env(),
             jwt=_jwt_from_env(),
         )
     )

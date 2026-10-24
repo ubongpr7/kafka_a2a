@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import hashlib
 import json
@@ -421,6 +422,8 @@ class MultiMcpToolExecutorConfig:
     servers: list[McpServerConfig] = field(default_factory=list)
     timeout_s: float = 30.0
     tools_cache_s: float = 60.0
+    read_retry_max_retries: int = 1
+    read_retry_backoff_s: float = 0.15
     agent_name: str | None = None
     config_path: str | None = None
 
@@ -435,12 +438,16 @@ class MultiMcpToolExecutorConfig:
         resolved_agent_name = _strip(agent_name or env_map.get("KA2A_MCP_AGENT_NAME") or env_map.get("KA2A_AGENT_NAME"))
         timeout_s = float(env_map.get("KA2A_MCP_TIMEOUT_S") or "30")
         tools_cache_s = float(env_map.get("KA2A_MCP_TOOLS_CACHE_S") or "60")
+        read_retry_max_retries = max(0, int(env_map.get("KA2A_MCP_READ_RETRY_MAX_RETRIES") or "1"))
+        read_retry_backoff_s = max(0.0, float(env_map.get("KA2A_MCP_READ_RETRY_BACKOFF_S") or "0.15"))
         config_path = _strip(env_map.get("KA2A_MCP_CONFIG_PATH"))
         if not config_path:
             return cls(
                 servers=[],
                 timeout_s=timeout_s,
                 tools_cache_s=tools_cache_s,
+                read_retry_max_retries=read_retry_max_retries,
+                read_retry_backoff_s=read_retry_backoff_s,
                 agent_name=resolved_agent_name,
                 config_path=None,
             )
@@ -459,6 +466,8 @@ class MultiMcpToolExecutorConfig:
             servers=[server for server in agent_cfg.servers if server.enabled],
             timeout_s=timeout_s,
             tools_cache_s=tools_cache_s,
+            read_retry_max_retries=read_retry_max_retries,
+            read_retry_backoff_s=read_retry_backoff_s,
             agent_name=resolved_agent_name,
             config_path=config_path,
         )
@@ -1371,10 +1380,21 @@ class McpHttpToolExecutor(ToolExecutor):
 
 
 class _ConfiguredMcpServerExecutor(ToolExecutor):
-    def __init__(self, *, config: McpServerConfig, timeout_s: float, tools_cache_s: float, agent_name: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        config: McpServerConfig,
+        timeout_s: float,
+        tools_cache_s: float,
+        read_retry_max_retries: int = 1,
+        read_retry_backoff_s: float = 0.15,
+        agent_name: str | None = None,
+    ) -> None:
         self._cfg = config
         self._timeout_s = float(timeout_s)
         self._tools_cache_s = float(tools_cache_s)
+        self._read_retry_max_retries = max(0, int(read_retry_max_retries))
+        self._read_retry_backoff_s = max(0.0, float(read_retry_backoff_s))
         self._agent_name = _short_agent_name(agent_name)
         self._cache: dict[tuple[Any, ...], tuple[float, list[_ConfiguredToolSpec]]] = {}
 
@@ -1389,6 +1409,7 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             "tool_name_prefix": self._cfg.tool_name_prefix,
             "allowed_tools": list(self._cfg.tools or []),
             "runtime_connection_count": len(self._cfg.runtime_connections or []),
+            "read_retry_max_retries": self._read_retry_max_retries,
         }
 
     def _runtime_connections(self) -> list[McpRuntimeConnectionConfig]:
@@ -1460,6 +1481,74 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
         if self._cfg.timeout_s is not None:
             return float(self._cfg.timeout_s)
         return self._timeout_s
+
+    @staticmethod
+    def _is_idempotent_read_tool(remote_tool_name: str) -> bool:
+        normalized = str(remote_tool_name or "").strip().lower()
+        return normalized.startswith(("get_", "list_", "search_", "find_", "lookup_", "count_", "summarize_"))
+
+    @staticmethod
+    def _is_transient_failure(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in (
+                "timeout",
+                "timed out",
+                "connection",
+                "network",
+                "temporar",
+                "service unavailable",
+                "bad gateway",
+                "gateway timeout",
+                " 502",
+                " 503",
+                " 504",
+            )
+        )
+
+    async def _call_tool_with_read_recovery(
+        self,
+        *,
+        server_url: str,
+        headers: dict[str, str],
+        route: _ConfiguredToolSpec,
+        arguments: dict[str, Any],
+        argument_keys: list[str],
+    ) -> Any:
+        retryable = self._is_idempotent_read_tool(route.remote_name)
+        for attempt in range(self._read_retry_max_retries + 1):
+            try:
+                return await _call_remote_tool(
+                    server_url=server_url,
+                    headers=headers,
+                    timeout_s=self._timeout_seconds(),
+                    name=route.remote_name,
+                    arguments=arguments,
+                )
+            except Exception as exc:
+                should_retry = (
+                    retryable
+                    and attempt < self._read_retry_max_retries
+                    and self._is_transient_failure(exc)
+                )
+                if not should_retry:
+                    raise
+                _log_mcp_operation(
+                    "warning",
+                    "call_tool_retry",
+                    agent=self._agent_name,
+                    server=self._cfg.id,
+                    server_url=server_url,
+                    remote_tool=route.remote_name,
+                    argument_keys=argument_keys,
+                    attempt=attempt + 1,
+                    max_retries=self._read_retry_max_retries,
+                    error=str(exc),
+                )
+                if self._read_retry_backoff_s > 0:
+                    await asyncio.sleep(self._read_retry_backoff_s * (attempt + 1))
+        raise RuntimeError("unreachable MCP retry state")
 
     def _resolve_auth_token(self, *, ctx: ToolContext) -> str | None:
         auth = self._cfg.auth
@@ -1650,12 +1739,12 @@ class _ConfiguredMcpServerExecutor(ToolExecutor):
             entity_ids=sync_metadata.get("entity_ids")[:8] if sync_metadata else None,
         )
         try:
-            result = await _call_remote_tool(
+            result = await self._call_tool_with_read_recovery(
                 server_url=server_url,
                 headers=headers,
-                timeout_s=self._timeout_seconds(),
-                name=route.remote_name,
+                route=route,
                 arguments=compact_arguments,
+                argument_keys=argument_keys,
             )
         except Exception as exc:
             _log_mcp_operation(
@@ -1721,7 +1810,7 @@ class CompositeToolExecutor(ToolExecutor):
         return [dict(item) for item in self._last_list_tool_failures]
 
     def _direct_executor_for_tool_name(self, name: str) -> ToolExecutor | None:
-        namespace, separator, _ = str(name or "").partition(".")
+        namespace, separator, remote_name = str(name or "").partition(".")
         if not namespace or not separator:
             return None
         expected_prefix = f"{namespace}."
@@ -1729,8 +1818,14 @@ class CompositeToolExecutor(ToolExecutor):
             metadata = self._executor_debug_metadata(executor)
             server_id = str(metadata.get("server_id") or "").strip()
             tool_name_prefix = str(metadata.get("tool_name_prefix") or "").strip()
-            if server_id == namespace or tool_name_prefix == expected_prefix:
-                return executor
+            if server_id != namespace and tool_name_prefix != expected_prefix:
+                continue
+            if _is_destructive_mcp_tool_name(remote_name):
+                continue
+            allowed = {str(item).strip() for item in metadata.get("allowed_tools") or [] if str(item).strip()}
+            if allowed and name not in allowed and remote_name not in allowed:
+                continue
+            return executor
         return None
 
     async def _resolve_routes(self, *, ctx: ToolContext) -> tuple[list[ToolSpec], dict[str, ToolExecutor]]:
@@ -1813,6 +1908,11 @@ class CompositeToolExecutor(ToolExecutor):
                     executor=self._executor_debug_metadata(direct_executor).get("executor_label"),
                     error=str(exc),
                 )
+                # A configured direct route is authoritative. Falling through to
+                # dynamic discovery masks the real operation failure as an
+                # unrelated "Unknown tool" error and can trigger an unsafe
+                # second network path after a write attempt.
+                raise
 
         _, routes = await self._resolve_routes(ctx=ctx)
         executor = routes.get(name)
@@ -1855,6 +1955,8 @@ class MultiMcpToolExecutor(ToolExecutor):
                     config=server,
                     timeout_s=self._cfg.timeout_s,
                     tools_cache_s=self._cfg.tools_cache_s,
+                    read_retry_max_retries=self._cfg.read_retry_max_retries,
+                    read_retry_backoff_s=self._cfg.read_retry_backoff_s,
                     agent_name=self._cfg.agent_name,
                 )
             )
@@ -1870,6 +1972,8 @@ class MultiMcpToolExecutor(ToolExecutor):
             servers=[f"{server.id}:{server.server_url}" for server in self._cfg.servers],
             timeout_s=self._cfg.timeout_s,
             tools_cache_s=self._cfg.tools_cache_s,
+            read_retry_max_retries=self._cfg.read_retry_max_retries,
+            read_retry_backoff_s=self._cfg.read_retry_backoff_s,
             legacy_executor=bool(legacy_executor),
             extra_executor=bool(extra_executor),
         )

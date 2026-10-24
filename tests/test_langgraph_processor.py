@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 import pytest
 
 from tests import fake_langgraph_components
+import kafka_a2a.langgraph_processor as langgraph_processor_module
 from kafka_a2a.langgraph_processor import (
+    _build_inventory_cross_location_stock_insight,
     _build_inventory_stock_risk_insight,
     _build_pos_best_sales_day_insight,
     _build_host_business_analyst_insight,
@@ -16,23 +18,34 @@ from kafka_a2a.langgraph_processor import (
     _build_pos_sales_overview_insight,
     _build_pos_total_units_sold_insight,
     _build_pos_top_sellers_insight,
+    _build_pos_visibility_checklist_insight,
+    _build_pos_zero_sales_products_insight,
+    _build_procurement_supplier_insight,
+    _build_procurement_cost_variance_insight,
     _enrich_top_seller_results_with_variant_context,
     _build_inventory_operation,
     _build_stock_location_operation,
     _build_realtime_dashboard_snapshot_insight,
     _build_product_operation,
     _build_product_import_opportunities_insight,
+    _build_pos_ineligible_products_insight,
     _build_staff_activity_insight,
     _build_permission_security_insight,
+    _build_cashier_role_review_insight,
+    _structure_demo_plain_text_response,
     _build_subscription_usage_insight,
     _business_review_specialist_payload,
+    _combine_business_review_insights,
     _compact_business_review_reorder_payload,
+    _compact_business_review_stock_risk_payload,
     _business_review_specialist_domain,
     _classify_failed_operation,
     _coerce_delegated_response,
     _created_result_ref,
     _corrected_inventory_request,
+    _decisioning_response_text,
     _extract_created_result_value,
+    _extract_product_query_from_text,
     _format_delegation_status_text,
     _fresh_host_request_clarification,
     _friendly_agent_label,
@@ -49,8 +62,14 @@ from kafka_a2a.langgraph_processor import (
     _infer_domain_agent_name,
     _onboarding_creation_request,
     _infer_onboarding_scope_from_text,
+    _is_anti_theft_demo_query,
+    _is_anti_theft_review_follow_up_query,
+    _build_anti_theft_review_follow_up_insight,
+    _is_explicit_workflow_cancellation,
     _interaction_payload_from_text,
     _inventory_setup_action_from_text,
+    _is_inventory_setup_continuation,
+    _is_actionable_marketplace_search_query,
     _is_host_capability_picker_query,
     _is_host_introspection_query,
     _is_simple_greeting_query,
@@ -61,10 +80,12 @@ from kafka_a2a.langgraph_processor import (
     _pos_admin_named_insight_payload,
     _request_explicitly_mentions_time_range,
     _resolve_insight_time_window,
+    _workspace_timezone_from_metadata,
     _refresh_sales_location_labels,
     _normalize_sales_location_payload,
     _render_tool_prompt_block,
     _select_host_delegation_agent,
+    _select_router_specialist_agent,
     _select_router_handoff_agent,
     _select_router_delegation_agent,
     _text_from_parts,
@@ -72,8 +93,22 @@ from kafka_a2a.langgraph_processor import (
     _users_named_insight_payload,
     make_langgraph_chat_processor_from_env,
 )
+from kafka_a2a.memory import KA2A_CONVERSATION_HISTORY_METADATA_KEY
+from kafka_a2a.analytics_facts import fact_packet_from_payload
+from kafka_a2a.context_memory import ContextMemory, InMemoryContextMemoryStore
 from kafka_a2a.models import Artifact, DataPart, Message, Role, Task, TaskState, TaskStatus, TextPart
 from kafka_a2a.tools import ToolContext, ToolSpec
+
+
+def _freeze_processor_clock(monkeypatch: pytest.MonkeyPatch, *, year: int, month: int, day: int) -> None:
+    """Keep calendar-relative orchestration assertions independent of the wall clock."""
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return cls(year, month, day, tzinfo=tz)
+
+    monkeypatch.setattr(langgraph_processor_module, "datetime", FixedDatetime)
 
 
 @pytest.fixture(autouse=True)
@@ -118,9 +153,23 @@ def test_is_simple_greeting_query_matches_plain_greetings() -> None:
     assert not _is_simple_greeting_query("hello, can you analyse sales for last year?")
 
 
+def test_explicit_workflow_cancellation_is_detected_before_domain_routing() -> None:
+    assert _is_explicit_workflow_cancellation("Cancel this form and continue with the next demo question.")
+    assert _is_explicit_workflow_cancellation("Stop the current workflow")
+    assert _is_explicit_workflow_cancellation("Never mind")
+    assert not _is_explicit_workflow_cancellation("What should I reorder this week?")
+
+
+def test_anti_theft_demo_query_is_explicitly_identified_as_unreleased() -> None:
+    assert _is_anti_theft_demo_query("Can you help me spot a stock movement that looks suspicious?")
+    assert not _is_anti_theft_demo_query("Show recent stock movements for the past 28 days.")
+
+
 def test_pos_admin_named_insight_from_text_detects_priority_flows() -> None:
     assert _pos_admin_named_insight_from_text("Show sales by location today") == "sales_by_location_today"
     assert _pos_admin_named_insight_from_text("Show top sellers in seven days") == "top_sellers_seven_days"
+    assert _pos_admin_named_insight_from_text("Which products had the lowest sales last month?") == "bottom_sellers_seven_days"
+    assert _host_named_insight_from_text("Which products had the lowest sales last month?") == "pos::bottom_sellers_seven_days"
     assert _pos_admin_named_insight_from_text("How many sales was made last month?") == "sales_overview"
     assert _pos_admin_named_insight_from_text("can you analyse my sales data for the past 1 year?") == "sales_overview"
     assert _pos_admin_named_insight_from_text("How many products did we sell today?") == "total_units_sold"
@@ -142,8 +191,63 @@ def test_pos_admin_named_insight_from_text_detects_priority_flows() -> None:
     assert _pos_admin_named_insight_from_text("Summarize today's order count by location.") == "sales_by_location_today"
     assert _pos_admin_named_insight_from_text("Which branch is underperforming in sales today?") == "sales_by_location_today"
     assert _pos_admin_named_insight_from_text("Show today's average basket by location.") == "sales_by_location_today"
+    assert _pos_admin_named_insight_from_text("Which location generated the least revenue in the past year?") == "sales_by_location"
     assert _pos_admin_named_insight_from_text("Who were the best sellers in 7 days?") == "top_sellers_seven_days"
     assert _pos_admin_named_insight_from_text("Create a new discount") is None
+
+
+def test_pos_admin_named_insight_detects_zero_sales_product_scan() -> None:
+    assert _pos_admin_named_insight_from_text(
+        "List POS-visible products with no recorded sales between January and March"
+    ) == "zero_sales_products"
+
+
+def test_zero_sales_product_scan_keeps_catalog_rows_without_sales() -> None:
+    payload = _build_pos_zero_sales_products_insight(
+        {
+            "results": [
+                {
+                    "product_name": "Seven Up",
+                    "variant_name": "Seven Up 50cl",
+                    "sku": "7UP-50",
+                    "barcode": "1001",
+                    "pos_visible": True,
+                    "active": True,
+                    "available_quantity": 12,
+                    "selling_price": 250,
+                },
+                {
+                    "product_name": "Eva Water",
+                    "variant_name": "Eva Water 75cl",
+                    "sku": "EVA-75",
+                    "barcode": "1002",
+                    "pos_visible": True,
+                    "active": True,
+                    "available_quantity": 20,
+                    "selling_price": 300,
+                },
+            ]
+        },
+        {"results": [{"product_name": "Eva Water", "variant_name": "Eva Water 75cl", "barcode_snapshot": "1002"}]},
+        window={"label": "last 90 days", "start_date": "2026-01-01", "end_date": "2026-03-31"},
+    )
+
+    table = next(widget for widget in payload["widgets"] if widget["type"] == "comparison_table")
+    assert len(table["rows"]) == 1
+    assert {key: table["rows"][0][key] for key in (
+        "product_name", "variant", "sku", "barcode", "pos_visible", "active", "stock", "price", "status"
+    )} == {
+        "product_name": "Seven Up",
+        "variant": "Seven Up 50cl",
+        "sku": "7UP-50",
+        "barcode": "1001",
+        "pos_visible": "Yes",
+        "active": "Yes",
+        "stock": 12,
+        "price": 250,
+        "status": "Active",
+    }
+    assert table["rows"][0]["image_url"].startswith("data:image/svg+xml")
 
 
 def test_business_review_context_does_not_trigger_product_comparison() -> None:
@@ -277,6 +381,134 @@ def test_business_review_drops_empty_variant_sales_section() -> None:
     assert sections[0]["summary"].startswith("1789 sales were recorded")
 
 
+def test_business_review_marks_unavailable_source_checks_without_hiding_available_data() -> None:
+    payload = _combine_business_review_insights(
+        title="Inventory health",
+        summary="Inventory health is ready.",
+        payloads=[
+            {
+                "kind": "insight_response",
+                "widgets": [
+                    {
+                        "type": "metric_grid",
+                        "title": "Stock risks",
+                        "data": [{"label": "Needs reorder", "value": 3}],
+                    }
+                ],
+                "data_sources": [{"service": "inventory", "endpoint": "get_stock_risk"}],
+                "warnings": [],
+            },
+            {
+                "_ka2a_review_source_status": {
+                    "status": "unavailable",
+                    "label": "stock movements",
+                }
+            },
+        ],
+        required_permissions=["read_inventory"],
+    )
+
+    assert payload["review_coverage"] == {
+        "status": "partial",
+        "sources_attempted": 2,
+        "sources_available": 1,
+    }
+    assert payload["widgets"][0]["title"] == "Stock risks"
+    assert "Unavailable review data checks: stock movements." in payload["warnings"]
+    assert payload["confidence"] == "medium"
+
+
+def test_business_review_summary_does_not_claim_complete_coverage_for_partial_domain() -> None:
+    payload = _host_orchestration_compose_final_payload(
+        "Analyze my business performance for the last quarter",
+        [
+            {
+                "agent_name": "pos_admin",
+                "payload": {
+                    "kind": "insight_response",
+                    "summary": "Sales performance is ready.",
+                    "widgets": [{"type": "metric_grid", "data": [{"label": "Sales", "value": 10}]}],
+                    "review_coverage": {
+                        "status": "complete",
+                        "sources_attempted": 1,
+                        "sources_available": 1,
+                    },
+                },
+            },
+            {
+                "agent_name": "inventory_visibility",
+                "payload": {
+                    "kind": "insight_response",
+                    "summary": "Inventory health has available results.",
+                    "widgets": [{"type": "metric_grid", "data": [{"label": "Needs reorder", "value": 3}]}],
+                    "review_coverage": {
+                        "status": "partial",
+                        "sources_attempted": 3,
+                        "sources_available": 2,
+                    },
+                    "warnings": ["Unavailable review data checks: stock movements."],
+                },
+            },
+        ],
+    )
+
+    assert payload["summary"] == "Business review is partially ready; unavailable checks are clearly marked."
+    assert payload["explanation"].startswith("I completed the available parts")
+    assert payload["review_coverage"] == {
+        "status": "partial",
+        "domains_completed": 1,
+        "domains_partial": 1,
+        "domains_unavailable": 0,
+    }
+    coverage = payload["widgets"][0]["data"]
+    assert {item["label"]: item["value"] for item in coverage if "value" in item}[
+        "Domains Partially Available"
+    ] == 1
+    sections = payload["widgets"][1]["sections"]
+    assert sections[0]["status"] == "complete"
+    assert sections[1]["status"] == "partial"
+    assert sections[1]["coverage"] == {
+        "status": "partial",
+        "sources_attempted": 3,
+        "sources_available": 2,
+    }
+
+
+def test_decisioning_response_text_uses_user_facing_structured_summary() -> None:
+    result = _decisioning_response_text(
+        [
+            DataPart(
+                data={
+                    "kind": "insight_response",
+                    "title": "Sales review",
+                    "summary": "646 sales were recorded for the last two years.",
+                    "explanation": "Maitama contributed the most revenue.",
+                    "widgets": [{"type": "metric_grid", "data": [{"label": "Sales", "value": 646}]}],
+                }
+            )
+        ]
+    )
+
+    assert result == (
+        "Sales review\n646 sales were recorded for the last two years.\n"
+        "Maitama contributed the most revenue."
+    )
+
+
+def test_decisioning_response_text_prefers_explicit_text_over_structured_summary() -> None:
+    assert _decisioning_response_text(
+        [
+            TextPart(text="The requested review is ready."),
+            DataPart(
+                data={
+                    "kind": "insight_response",
+                    "summary": "This should not override the explicit answer.",
+                }
+            ),
+        ]
+    ) == "The requested review is ready."
+
+
 def test_host_routes_stock_snapshot_questions_to_inventory_without_a_time_range() -> None:
     assert _strong_domain_agent_override("Analyze my low-stock products") == "inventory"
     assert _fresh_host_request_clarification("Analyze my low-stock products", "inventory") is None
@@ -294,6 +526,49 @@ def test_host_disambiguates_stock_loss_and_product_risk_without_delegating() -> 
         "Do you want a current inventory-risk check (out of stock, low stock, reorder, and expiry), "
         "or a catalog data-quality review?"
     )
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        (
+            "Analyze my inventory",
+            "What time range should I use for the inventory analysis?",
+        ),
+        (
+            "Analyze inventory movement for the last 28 days",
+            None,
+        ),
+    ],
+)
+def test_inventory_analysis_requires_scope_only_when_history_is_requested(
+    query: str,
+    expected: str | None,
+) -> None:
+    assert _fresh_host_request_clarification(query, "inventory") == expected
+
+
+def test_child_location_setup_reply_is_not_inventory_analysis() -> None:
+    reply = (
+        "Parent location: Oshodi Isolo. Create 20 child locations, BIN-001 through BIN-020. "
+        "Location type: Bin. Non-structural. Auto-generate codes. Capacity 100. Preview list first."
+    )
+
+    assert _is_inventory_setup_continuation(reply)
+    assert _fresh_host_request_clarification(reply, "inventory") is None
+
+
+def test_child_location_setup_reply_routes_to_inventory_setup_specialist() -> None:
+    reply = (
+        "Parent location: Oshodi Isolo. Create 20 child locations, BIN-001 through BIN-020. "
+        "Location type: Bin. Non-structural. Auto-generate codes. Capacity 100. Preview list first."
+    )
+    agents = [
+        {"name": "inventory_setup"},
+        {"name": "inventory_visibility"},
+    ]
+
+    assert _select_router_specialist_agent("inventory", reply, agents) == "inventory_setup"
 
 
 def test_host_rewrites_explicit_stock_transcript_correction() -> None:
@@ -345,6 +620,23 @@ def test_build_pos_sales_by_location_insight_returns_widget_first_payload() -> N
     assert payload["widgets"][0]["type"] == "metric_grid"
     assert payload["widgets"][1]["type"] == "bar_chart"
     assert payload["widgets"][1]["title"] == "Sales by location for last 30 days"
+
+
+def test_build_pos_sales_by_location_insight_can_select_lowest_revenue_location() -> None:
+    payload = _build_pos_sales_by_location_insight(
+        {
+            "total_sales": 41400.0,
+            "_window_label": "last 1 year",
+            "_location_ranking": "lowest",
+            "groups": [
+                {"label": "Agric", "order_count": 3, "total_sales": 22850.0},
+                {"label": "Airport Road", "order_count": 3, "total_sales": 18550.0},
+            ],
+        }
+    )
+
+    assert payload["summary"] == "Airport Road generated the least revenue for last 1 year: 18,550.00."
+    assert payload["insights"][0]["title"] == "Lowest-revenue location"
     assert payload["data_sources"][0]["endpoint_or_topic"] == "get_sales_summary"
     assert payload["widgets"][0]["data"][2]["label"] == "Avg Basket"
 
@@ -546,6 +838,26 @@ def test_resolve_insight_time_window_supports_relative_ranges() -> None:
     )
     assert all_time_window["label"] == "all time"
     assert all_time_window["days"] == 3651
+
+
+def test_workspace_timezone_is_validated_and_used_for_relative_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _workspace_timezone_from_metadata({"workspace_timezone": "Africa/Lagos"}) == "Africa/Lagos"
+    assert _workspace_timezone_from_metadata({"workspace_timezone": "not/a-timezone"}) == "UTC"
+    assert _workspace_timezone_from_metadata(
+        {
+            "urn:ka2a:principal": {
+                "claims": {"timezone": "America/Los_Angeles"},
+            }
+        }
+    ) == "America/Los_Angeles"
+
+    token = langgraph_processor_module._INSIGHT_TIMEZONE.set("Africa/Lagos")
+    try:
+        window = _resolve_insight_time_window("today", default_days=7, default_label="last 7 days")
+    finally:
+        langgraph_processor_module._INSIGHT_TIMEZONE.reset(token)
+    assert window["timezone"] == "Africa/Lagos"
+    assert window["start_date"] == window["end_date"]
 
 
 class _RecordingToolExecutor:
@@ -1087,6 +1399,33 @@ async def test_pos_named_insight_payload_threads_relative_date_filters_into_tool
 
 
 @pytest.mark.asyncio
+async def test_pos_lowest_seller_insight_uses_ascending_mcp_ranking() -> None:
+    executor = _RecordingToolExecutor()
+
+    payload = await _pos_admin_named_insight_payload(
+        insight_key="bottom_sellers_seven_days",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="Which products had the lowest sales last month?",
+    )
+
+    window = _resolve_insight_time_window(
+        "Which products had the lowest sales last month?",
+        default_days=7,
+        default_label="last 7 days",
+    )
+    assert payload is not None
+    assert payload["summary"] == "Cabin Biscuit 200g is the lowest seller for last month."
+    assert payload["widgets"][1]["title"] == "Lowest sellers for last month"
+    assert payload["widgets"][1]["ordered_by"] == "quantity_sold_ascending"
+    assert "products with no completed pos sales" in payload["warnings"][0].lower()
+    assert (
+        "pos.get_top_sellers",
+        {"days": window["days"], "date": window["anchor_date"], "limit": 5, "sort_order": "lowest"},
+    ) in executor.calls
+
+
+@pytest.mark.asyncio
 async def test_enrich_top_sellers_deduplicates_lookup_queries() -> None:
     executor = _VariantLookupCountingExecutor()
 
@@ -1185,7 +1524,43 @@ def test_inventory_visibility_named_insight_from_text_detects_priority_flows() -
     assert _inventory_visibility_named_insight_from_text("Show the realtime dashboard snapshot right now.") == "realtime_snapshot"
     assert _inventory_visibility_named_insight_from_text("Show zero-balance items that need attention now.") == "stock_risk_out_of_stock"
     assert _inventory_visibility_named_insight_from_text("What products are missing from the shelf today?") == "stock_risk_out_of_stock"
+    assert _inventory_visibility_named_insight_from_text(
+        "Show me products with stock in one location but demand in another location."
+    ) == "cross_location_stock"
     assert _inventory_visibility_named_insight_from_text("Adjust stock for item A") is None
+
+
+def test_build_inventory_cross_location_stock_insight_returns_transfer_widget() -> None:
+    payload = _build_inventory_cross_location_stock_insight(
+        {
+            "results": [
+                {
+                    "name": "Eva Premium Water 75cl",
+                    "sku": "EVA-75",
+                    "barcode": "123456789",
+                    "product_variant_image_url": "https://cdn.example.com/eva.png",
+                    "location_breakdown": [
+                        {"structural_location_name": "Agric, Ikorodu Store", "quantity_available": 9},
+                        {"structural_location_name": "Maitama, Abuja", "quantity_available": 0},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert payload["kind"] == "insight_response"
+    assert payload["widgets"][0]["type"] == "metric_grid"
+    assert payload["widgets"][1]["type"] == "comparison_table"
+    assert payload["widgets"][1]["rows"] == [
+        {
+            "product": "Eva Premium Water 75cl",
+            "sku": "EVA-75",
+            "barcode": "123456789",
+            "stocked_at": "Agric, Ikorodu Store (9)",
+            "demand_or_stockout_locations": "Maitama, Abuja",
+            "image_url": "https://cdn.example.com/eva.png",
+        }
+    ]
 
 
 def test_build_inventory_stock_risk_insight_returns_risk_widgets() -> None:
@@ -1215,14 +1590,12 @@ def test_build_inventory_stock_risk_insight_returns_risk_widgets() -> None:
 
     assert payload["kind"] == "insight_response"
     assert payload["widgets"][0]["type"] == "metric_grid"
-    assert payload["widgets"][1]["type"] == "risk_panel"
-    assert payload["widgets"][2]["type"] == "ranked_list"
-    assert payload["widgets"][2]["items"][0]["image_url"] == "https://cdn.example.com/cabin-biscuit.jpg"
-    assert payload["widgets"][3]["type"] == "comparison_table"
-    assert payload["widgets"][3]["rows"] == [
+    assert payload["widgets"][1]["type"] == "comparison_table"
+    assert payload["widgets"][1]["rows"] == [
         {
             "risk": "Out of Stock",
             "product": "Cabin Biscuit 200g",
+            "image_url": "https://cdn.example.com/cabin-biscuit.jpg",
             "barcode": "1234567890123",
             "sku": "CAB-200",
             "location": "Lekki",
@@ -1250,10 +1623,31 @@ def test_business_review_reorder_section_is_compact() -> None:
     )
 
     assert payload is not None
-    assert payload["summary"] == "Replenishment candidates are ready."
-    assert [widget["type"] for widget in payload["widgets"]] == ["metric_grid", "ranked_list"]
-    assert payload["widgets"][0]["data"] == [{"label": "Products to replenish", "value": 2, "format": "number"}]
-    assert payload["widgets"][1]["title"] == "Products to replenish"
+    assert payload["summary"] == "Replenishment signals were checked against the canonical stock-risk results."
+    assert payload["widgets"] == []
+
+
+def test_business_review_stock_risk_uses_one_canonical_product_table() -> None:
+    payload = _compact_business_review_stock_risk_payload(
+        _build_inventory_stock_risk_insight(
+            {
+                "summary": {"out_of_stock_count": 2, "reorder_count": 0, "low_stock_count": 0, "expiring_count": 0},
+                "risk_items": {
+                    "out_of_stock": [
+                        {"name": "Mama Gold Rice 5kg", "quantity_available": 0, "location_name": "Maitama"},
+                        {"name": "Colgate Triple Action Toothpaste 100ml", "quantity_available": 0, "location_name": "Maitama"},
+                    ]
+                },
+            }
+        )
+    )
+
+    assert payload is not None
+    assert [widget["type"] for widget in payload["widgets"]] == ["metric_grid", "comparison_table"]
+    table = payload["widgets"][1]
+    assert table["title"] == "Stock risks by product and location"
+    assert len(table["rows"]) == 2
+    assert "Only products with a stock risk are listed" in table["description"]
 
 
 def test_build_product_import_opportunities_preserves_catalog_media() -> None:
@@ -1309,8 +1703,8 @@ def test_low_stock_summary_surfaces_out_of_stock_items() -> None:
     assert payload["summary"] == (
         "No products are below their low-stock threshold, but 12 products are out of stock and need attention."
     )
-    assert payload["widgets"][3]["rows"][0]["risk"] == "Out of Stock"
-    assert payload["widgets"][3]["rows"][0]["barcode"] == "1234567890123"
+    assert payload["widgets"][1]["rows"][0]["risk"] == "Out of Stock"
+    assert payload["widgets"][1]["rows"][0]["barcode"] == "1234567890123"
 
 
 def test_users_named_insight_from_text_detects_priority_flows() -> None:
@@ -1342,7 +1736,9 @@ def test_host_named_insight_from_text_detects_cross_domain_flows() -> None:
     assert _host_named_insight_from_text("How many units were sold today?") == "pos::total_units_sold"
     assert _host_named_insight_from_text("what is my revenue today") == "pos::sales_overview"
     assert _host_named_insight_from_text("which terminal sold the most today") == "pos::terminal_cashier_activity"
-    assert _host_named_insight_from_text("which location sold the most this month") == "pos::sales_by_location_today"
+    assert _host_named_insight_from_text("which location sold the most this month") == "pos::sales_by_location"
+    assert _host_named_insight_from_text("which location sold the most today") == "pos::sales_by_location_today"
+    assert _host_named_insight_from_text("Which location generated the least revenue in the past year?") == "pos::sales_by_location"
     assert _host_named_insight_from_text("show failed POS payments today") == "pos::pos_exceptions"
     assert _host_named_insight_from_text("show refunds today") == "pos::pos_exceptions"
     assert _host_named_insight_from_text("Show sales trend for barcode 8800000001501 over the past year") == "pos::product_sales_trend"
@@ -1362,6 +1758,9 @@ def test_host_named_insight_from_text_detects_cross_domain_flows() -> None:
     assert _host_named_insight_from_text("show products with no image") == "product_discovery::media_category"
     assert _host_named_insight_from_text("show duplicate barcodes") == "product_discovery::duplicate_codes"
     assert _host_named_insight_from_text("show products not visible in POS") == "product_discovery::media_category"
+    assert _host_named_insight_from_text(
+        "Can you just list out the products that are not eligible for POS and why they are not eligible?"
+    ) == "product_discovery::pos_ineligible_products"
     assert _host_named_insight_from_text("Show subscription usage and limits") == "users::subscription_usage_limits"
     assert _host_named_insight_from_text("Give me a one-screen operational summary for today.") == "cross_domain_ops"
     assert _host_named_insight_from_text("Which areas are strong and weak across inventory and POS?") == "cross_domain_ops"
@@ -1369,6 +1768,62 @@ def test_host_named_insight_from_text_detects_cross_domain_flows() -> None:
     assert _host_named_insight_from_text("Compare branches by top sellers and stockouts.") == "location_comparison"
     assert _host_named_insight_from_text("Compare Maitama and Agric sales this year") is None
     assert _host_named_insight_from_text("What are the top three actions I should take next?") == "recommendations"
+
+
+def test_build_pos_ineligible_products_insight_returns_structured_reasons() -> None:
+    payload = _build_pos_ineligible_products_insight(
+        {
+            "results": [
+                {
+                    "product_name": "Palc Cream Shoe Polish",
+                    "variant_name": "Neutral",
+                    "sku": "PALC-NEUTRAL",
+                    "barcode": "240868337766",
+                    "pos_visible": False,
+                    "pos_ready": False,
+                    "status": "OUT_OF_STOCK",
+                    "available_quantity": 0,
+                },
+                {
+                    "product_name": "Palc Cream Shoe Polish",
+                    "variant_name": "Black",
+                    "sku": "PALC-BLACK",
+                    "barcode": "335592487804",
+                    "pos_visible": True,
+                    "pos_ready": True,
+                    "status": "IN_STOCK",
+                    "available_quantity": 945,
+                },
+            ]
+        }
+    )
+
+    table = next(widget for widget in payload["widgets"] if widget["type"] == "comparison_table")
+    assert payload["kind"] == "insight_response"
+    assert payload["confidence"] == "high"
+    assert len(table["rows"]) == 1
+    assert table["rows"][0]["variant"] == "Neutral"
+    assert "POS visibility is disabled" in table["rows"][0]["reason"]
+    assert "POS-ready" in table["rows"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_pos_ineligible_products_payload_uses_product_variant_search() -> None:
+    executor = _RecordingToolExecutor()
+
+    payload = await _host_named_insight_payload(
+        insight_key="product_discovery::pos_ineligible_products",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="list products that are not eligible for POS",
+    )
+
+    assert payload is not None
+    assert executor.calls[-1] == (
+        "product.search_product_variants",
+        {"limit": 100, "active_only": False},
+    )
+    assert any(widget["type"] == "comparison_table" for widget in payload["widgets"])
 
 
 def test_build_host_business_analyst_insight_returns_cross_service_widgets() -> None:
@@ -1503,6 +1958,10 @@ def test_latest_insight_follow_up_answer_uses_previous_structured_payload() -> N
     assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location was far behind in terms of revenue in that period?", wrapped_history) or "")
     assert "Gberigbe Store" in (_latest_insight_follow_up_answer("Which location led?", direct_stream_history) or "")
     assert (_latest_insight_follow_up_answer("So these are my sales reports, right?", frontend_history) or "").startswith("Yes.")
+    assert (_latest_insight_follow_up_answer("to the analysis you just did.", frontend_history) or "").startswith("Yes.")
+    assert "Airport Road" in (
+        _latest_insight_follow_up_answer("Which location had the lowest sales from that analysis?", frontend_history) or ""
+    )
     grouped_locations = _latest_insight_follow_up_answer("Okay, group it by location.", frontend_history) or ""
     assert "already grouped by location" in grouped_locations
     assert "Gberigbe Store" in grouped_locations
@@ -1678,6 +2137,331 @@ def test_latest_insight_follow_up_answer_uses_previous_structured_payload() -> N
     assert repeated_parts[0].data["kind"] == "insight_response"
 
 
+@pytest.mark.parametrize(
+    ("question", "expected_location", "expected_direction"),
+    [
+        ("What is the location with the lowest sales?", "Agric, Ikorodu Store", "lowest sales"),
+        ("Which branch had the least revenue?", "Agric, Ikorodu Store", "lowest sales"),
+        ("Which store performed the worst by turnover?", "Agric, Ikorodu Store", "lowest sales"),
+        ("Which location had the highest sales?", "Maitama, Abuja", "highest sales"),
+    ],
+)
+def test_latest_insight_follow_up_answers_location_sales_rankings_from_saved_facts(
+    question: str,
+    expected_location: str,
+    expected_direction: str,
+) -> None:
+    payload = {
+        "kind": "insight_response",
+        "timeframe": {"label": "last three weeks"},
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": "Location contribution for last three weeks",
+                "currency_code": "NGN",
+                "rows": [
+                    {"location": "Maitama, Abuja", "sales": 9000, "orders": 20},
+                    {"location": "Agric, Ikorodu Store", "sales": 2500, "orders": 5},
+                    {"location": "Airport Road, Oshodi Store", "sales": 4200, "orders": 8},
+                ],
+            }
+        ],
+    }
+    history = [{"role": "assistant", "content": "Sales analysis ready.", "structuredPayload": payload}]
+
+    answer = _latest_insight_follow_up_answer(question, history) or ""
+
+    assert expected_location in answer
+    assert expected_direction in answer
+    assert "last three weeks" in answer
+    assert "₦" in answer
+
+
+def test_latest_insight_follow_up_preserves_empty_sales_window() -> None:
+    payload = {
+        "kind": "insight_response",
+        "timeframe": {"label": "today"},
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": "Sales by location for today",
+                "rows": [],
+            }
+        ],
+    }
+    history = [{"role": "assistant", "content": "No completed POS sales were recorded for today.", "structuredPayload": payload}]
+
+    answer = _latest_insight_follow_up_answer("Which location is leading by value?", history) or ""
+
+    assert "no location led by value" in answer.lower()
+    assert "today" in answer.lower()
+
+
+def test_latest_insight_follow_up_uses_durable_fact_packet_for_elliptical_ranking() -> None:
+    payload = {
+        "kind": "insight_response",
+        "currency_code": "NGN",
+        "timeframe": {"label": "last three weeks"},
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": "Location contribution for last three weeks",
+                "rows": [
+                    {"location": "Maitama, Abuja", "sales": 9000, "orders": 20},
+                    {"location": "Agric, Ikorodu Store", "sales": 2500, "orders": 5},
+                ],
+            }
+        ],
+    }
+    fact_packet = fact_packet_from_payload(
+        user_text="Show sales by location for the last three weeks",
+        payload=payload,
+    )
+
+    assert fact_packet is not None
+    answer = _latest_insight_follow_up_answer(
+        "Which one sold least?",
+        history=[],
+        memory=ContextMemory(fact_packets=[fact_packet]),
+    )
+
+    assert answer is not None
+    assert "Agric, Ikorodu Store" in answer
+    assert "lowest sales" in answer
+
+
+def test_latest_insight_follow_up_does_not_answer_stock_question_with_saved_sales_ranking() -> None:
+    payload = {
+        "kind": "insight_response",
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": "Location contribution",
+                "rows": [
+                    {"location": "Maitama, Abuja", "sales": 9000, "orders": 20},
+                    {"location": "Agric, Ikorodu Store", "sales": 2500, "orders": 5},
+                ],
+            }
+        ],
+    }
+    history = [{"role": "assistant", "content": "Sales analysis ready.", "structuredPayload": payload}]
+
+    assert _latest_insight_follow_up_answer("Which location has the lowest stock?", history) is None
+    assert _latest_insight_follow_up_answer("Which location is the Sofire terminal assigned to?", history) is None
+
+
+def test_latest_insight_follow_up_answers_zero_sales_location_without_inverting_the_ranking() -> None:
+    payload = {
+        "kind": "insight_response",
+        "timeframe": {"label": "last three weeks"},
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": "Location contribution for last three weeks",
+                "rows": [
+                    {"location": "Maitama, Abuja", "sales": 9000, "orders": 20},
+                    {"location": "Agric, Ikorodu Store", "sales": 2500, "orders": 5},
+                ],
+            }
+        ],
+    }
+    history = [{"role": "assistant", "content": "Sales analysis ready.", "structuredPayload": payload}]
+
+    answer = _latest_insight_follow_up_answer("Which location had no sales?", history) or ""
+
+    assert "no location recorded zero sales" in answer.lower()
+    assert "Agric, Ikorodu Store" in answer
+    assert "Maitama, Abuja had the highest sales" not in answer
+
+
+def test_latest_insight_follow_up_does_not_use_top_seller_list_for_lowest_or_price_question() -> None:
+    payload = {
+        "kind": "insight_response",
+        "widgets": [
+            {
+                "type": "ranked_list",
+                "title": "Top sellers for last month",
+                "items": [
+                    {"label": "Eva Premium Water 75cl", "value": 80, "secondary_value": 24000},
+                    {"label": "Coca-Cola 50cl", "value": 50, "secondary_value": 15000},
+                ],
+            }
+        ],
+    }
+    history = [{"role": "assistant", "content": "Top sellers ready.", "structuredPayload": payload}]
+
+    assert _latest_insight_follow_up_answer("Which product had the lowest sales?", history) is None
+    assert _latest_insight_follow_up_answer("Which product costs the least?", history) is None
+
+
+@pytest.mark.asyncio
+async def test_host_answers_lowest_location_sales_follow_up_from_structured_history_without_delegating() -> None:
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    payload = {
+        "kind": "insight_response",
+        "timeframe": {"label": "last three weeks"},
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": "Location contribution for last three weeks",
+                "currency_code": "NGN",
+                "rows": [
+                    {"location": "Maitama, Abuja", "sales": 9000, "orders": 20},
+                    {"location": "Agric, Ikorodu Store", "sales": 2500, "orders": 5},
+                ],
+            }
+        ],
+    }
+    task = Task(
+        id="task-location-sales-follow-up",
+        context_id="ctx-location-sales-follow-up",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text="What is the location with the lowest sales?")]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text="What is the location with the lowest sales?")])
+
+    events = [
+        event
+        async for event in processor(
+            task,
+            message,
+            None,
+            {
+                KA2A_CONVERSATION_HISTORY_METADATA_KEY: [
+                    {"role": "assistant", "content": "Sales analysis ready.", "structuredPayload": payload}
+                ]
+            },
+        )
+    ]
+
+    result = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    result_text = _text_from_parts(result.parts)
+    assert "Agric, Ikorodu Store had the lowest sales" in result_text
+    assert "Maitama, Abuja" in result_text
+    assert not any(name in {"pos.get_sales_summary", "delegate_to_agent"} for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS)
+    assert [event for event in events if isinstance(event, TaskStatus)][-1].state == TaskState.completed
+
+
+@pytest.mark.asyncio
+async def test_host_routes_historical_units_sold_follow_up_to_pos_not_product_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep product-sales questions on the reporting path after a prior sales turn."""
+    monkeypatch.setenv(
+        "KA2A_TOOL_EXECUTOR",
+        "tests.fake_langgraph_components:build_fake_tool_executor_with_pos_analytics",
+    )
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    prior_payload = {
+        "kind": "insight_response",
+        "summary": "No completed POS sales were recorded for today.",
+        "widgets": [
+            {
+                "type": "metric_grid",
+                "title": "Sales for today",
+                "data": [
+                    {"label": "Units Sold", "value": 0},
+                    {"label": "Sales", "value": 0},
+                ],
+            }
+        ],
+    }
+    query = "That's fine. What about the amount of products I have sold for the past two years?"
+    task = Task(
+        id="task-units-sold-after-sales",
+        context_id="ctx-units-sold-after-sales",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=query)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=query)])
+
+    events = [
+        event
+        async for event in processor(
+            task,
+            message,
+            None,
+            {
+                KA2A_CONVERSATION_HISTORY_METADATA_KEY: [
+                    {
+                        "role": "assistant",
+                        "content": "Sales for today are ready.",
+                        "structuredPayload": prior_payload,
+                    }
+                ]
+            },
+        )
+    ]
+
+    assert any(name == "pos.get_sales_summary" for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS)
+    assert not any(name == "delegate_to_agent" for name, _ in fake_langgraph_components.FAKE_TOOL_CALLS)
+    result = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    assert isinstance(result.parts[0], DataPart)
+    assert result.parts[0].data["kind"] == "insight_response"
+    assert result.parts[0].data["fact_packet"]["query_frame"]["metric"] == "units_sold"
+    assert result.parts[0].metadata["ka2a_fact_validation"]["valid"] is True
+    assert result.parts[0].metadata["ka2a_response_validation"]["valid"] is True
+    assert [event for event in events if isinstance(event, TaskStatus)][-1].state == TaskState.completed
+
+
+@pytest.mark.asyncio
+async def test_host_treats_product_import_as_a_new_request_after_sales_history() -> None:
+    """A new import request must supersede prior sales context instead of becoming a follow-up."""
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    prior_payload = {
+        "kind": "insight_response",
+        "summary": "Sales analysis is ready.",
+        "widgets": [
+            {
+                "type": "comparison_table",
+                "title": "Location contribution for last month",
+                "rows": [{"location": "Maitama, Abuja", "sales": 9000, "orders": 4}],
+            }
+        ],
+    }
+    query = "I want to import products from the global catalog."
+    task = Task(
+        id="task-import-after-sales",
+        context_id="ctx-import-after-sales",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=query)]),
+        ),
+    )
+    message = Message(role=Role.user, parts=[TextPart(text=query)])
+
+    events = [
+        event
+        async for event in processor(
+            task,
+            message,
+            None,
+            {
+                KA2A_CONVERSATION_HISTORY_METADATA_KEY: [
+                    {
+                        "role": "assistant",
+                        "content": "Sales analysis is ready.",
+                        "structuredPayload": prior_payload,
+                    }
+                ]
+            },
+        )
+    ]
+
+    assert fake_langgraph_components.FAKE_TOOL_CALLS == [
+        (
+            "delegate_to_agent",
+            {"request": query, "agent_name": "onboarding"},
+        )
+    ]
+    delegation = next(event for event in events if isinstance(event, Artifact) and event.name == "delegation")
+    assert delegation.parts[0].data["selectedAgent"] == "onboarding"
+
+
 def test_build_staff_activity_insight_returns_timeline_widgets() -> None:
     payload = _build_staff_activity_insight(
         {
@@ -1785,6 +2569,7 @@ async def test_users_named_insight_payload_supports_audit_search_and_timeline() 
     assert search_payload is not None
     assert timeline_payload is not None
     assert executor.calls[0][0] == "audit.search_events"
+    assert executor.calls[0][1]["search"] == "show recent audit logs for the past month"
     assert executor.calls[0][1]["occurred_from"] == _resolve_insight_time_window("show recent audit logs for the past month", default_days=30, default_label="last 30 days")["start_date"]
     assert executor.calls[0][1]["occurred_to"] == _resolve_insight_time_window("show recent audit logs for the past month", default_days=30, default_label="last 30 days")["end_date"]
     assert executor.calls[0][1]["period_label"] == "last month"
@@ -1792,6 +2577,21 @@ async def test_users_named_insight_payload_supports_audit_search_and_timeline() 
         "audit.get_event_timeline",
         {"search": "show the audit timeline for this workspace", "limit": 100},
     )
+
+
+@pytest.mark.asyncio
+async def test_audit_search_extracts_entity_from_reorder_point_question() -> None:
+    executor = _RecordingToolExecutor()
+
+    payload = await _users_named_insight_payload(
+        insight_key="audit_search",
+        tool_executor=executor,
+        tool_ctx=ToolContext(),
+        user_text="Who changed the reorder point for Sure Men Invisible Ice?",
+    )
+
+    assert payload is not None
+    assert executor.calls[0][1]["search"] == "reorder point"
 
 
 @pytest.mark.asyncio
@@ -1874,6 +2674,13 @@ def test_friendly_agent_label_hides_runtime_card_identifiers() -> None:
     assert _friendly_agent_label("wa-p4-product_discovery-b7774e08b933") == "Product Management"
 
 
+def test_workspace_setup_demo_question_is_not_product_import() -> None:
+    query = "I just created my workspace. What should I set up first so inventory works properly?"
+
+    assert _host_named_insight_from_text(query) == "onboarding::setup_path"
+    assert _infer_onboarding_scope_from_text(query) is None
+
+
 @pytest.mark.asyncio
 async def test_host_procurement_payload_threads_calendar_windows_and_labels() -> None:
     executor = _RecordingToolExecutor()
@@ -1906,6 +2713,14 @@ def test_generic_inventory_setup_language_prefers_onboarding_over_direct_mutatio
     assert _inventory_setup_action_from_text("Help me setup inventory") is None
     assert _inventory_setup_action_from_text("List the stock locations in my electronics store setup.") is None
     assert _inventory_setup_action_from_text("Create a new inventory item called Main Inventory") == "create_inventory_item"
+    assert _inventory_setup_action_from_text("Can you prepare the form for adding my first warehouse?") == "create_stock_location"
+    assert _strong_domain_agent_override("Can you prepare the form for adding my first warehouse?") == "inventory"
+    assert _infer_domain_agent_name("Can you prepare the form for adding my first warehouse?") == "inventory"
+    assert _select_router_specialist_agent(
+        "inventory",
+        "Can you prepare the form for adding my first warehouse?",
+        [{"name": "inventory_setup"}, {"name": "inventory_visibility"}],
+    ) == "inventory_setup"
 
 
 def test_host_orchestration_plan_keeps_inventory_grouping_out_of_users_domain() -> None:
@@ -1956,6 +2771,248 @@ def test_host_orchestration_plan_does_not_append_inventory_for_pos_insight_query
     assert plan == ["pos"]
 
 
+def test_cashier_pos_visibility_demo_prompt_is_a_single_pos_insight() -> None:
+    query = "A cashier says a product is not showing on the POS. What should we check?"
+    form_submission = (
+        "Identify the missing POS product\n"
+        "Product name, SKU, or barcode: Palc Cream Shoe Polish\n"
+        "POS terminal or location: Agrig, Ikorodu Store"
+    )
+
+    assert _pos_admin_named_insight_from_text(query) == "pos_visibility_checklist"
+    assert _host_named_insight_from_text(query) == "pos::pos_visibility_checklist"
+    assert _pos_admin_named_insight_from_text(form_submission) == "pos_visibility_checklist"
+    assert _host_named_insight_from_text(form_submission) == "pos::pos_visibility_checklist"
+    assert _extract_product_query_from_text(form_submission) == "Palc Cream Shoe Polish"
+    assert _extract_product_query_from_text(
+        '{"type":"form_response","data":{"product_query":"100 Bon Men Perfume"}}'
+    ) == "100 Bon Men Perfume"
+    product_query_submission = "Identify the missing POS product\nProduct Query: 7 up"
+    assert _pos_admin_named_insight_from_text(product_query_submission) == "pos_visibility_checklist"
+    assert _host_named_insight_from_text(product_query_submission) == "pos::pos_visibility_checklist"
+    assert _extract_product_query_from_text(product_query_submission) == "7 up"
+    assert _fresh_host_request_clarification(query, "pos") is None
+    assert _host_orchestration_plan(
+        query,
+        [{"name": "pos"}, {"name": "product"}, {"name": "inventory"}],
+    ) == ["pos"]
+
+
+@pytest.mark.asyncio
+async def test_cashier_pos_visibility_demo_returns_typed_form_without_workflow_picker() -> None:
+    query = "A cashier says a product is not showing on the POS. What should we check?"
+    processor = make_langgraph_chat_processor_from_env(agent_name="host")
+    task = Task(
+        id="task-pos-visibility-demo",
+        context_id="ctx-pos-visibility-demo",
+        status=TaskStatus(
+            state=TaskState.submitted,
+            message=Message(role=Role.user, parts=[TextPart(text=query)]),
+        ),
+    )
+
+    events = [event async for event in processor(task, task.status.message, None, None)]
+
+    result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
+    result_part = result_artifact.parts[0]
+    assert isinstance(result_part, DataPart)
+    assert result_part.data["kind"] == "insight_response"
+    assert result_part.data["widgets"][0]["type"] == "action_form"
+    assert result_part.data["widgets"][0]["fields"][0]["name"] == "product_query"
+    assert not any(
+        name == "create_multiple_choice"
+        for name, _arguments in fake_langgraph_components.FAKE_TOOL_CALLS
+    )
+    status_events = [event for event in events if isinstance(event, TaskStatus)]
+    assert status_events[-1].state == TaskState.completed
+
+
+def test_pos_visibility_lookup_returns_product_evidence_and_terminal_checks() -> None:
+    payload = _build_pos_visibility_checklist_insight(
+        product_query="Cabin Biscuit 200g",
+        product_payload={
+            "results": [
+                {
+                    "name": "Cabin Biscuit 200g",
+                    "barcode": "1234567890123",
+                    "variant_name": "Cabin Biscuit 200g",
+                    "price": 1600,
+                    "available_quantity": 4,
+                    "pos_ready": True,
+                }
+            ]
+        },
+    )
+
+    diagnostic = next(widget for widget in payload["widgets"] if widget["title"] == "POS visibility diagnostic")
+    assert diagnostic["title"] == "POS visibility diagnostic"
+    checks = {row["check"]: row for row in diagnostic["rows"]}
+    assert checks["Catalog product"]["status"] == "Found"
+    assert checks["POS visibility"]["status"] == "0/1 visible"
+    assert checks["Stock and price"]["status"] == "0 out of stock; 0 without valid price"
+    variant_table = next(widget for widget in payload["widgets"] if widget["title"] == "Variant readiness")
+    assert variant_table["rows"][0]["variant"] == "Cabin Biscuit 200g"
+    assert variant_table["rows"][0]["stock"] == 4
+    assert variant_table["rows"][0]["price"] == 1600
+
+
+def test_role_review_and_anti_theft_demo_contracts_are_structured() -> None:
+    role_payload = _build_cashier_role_review_insight()
+    assert role_payload["kind"] == "insight_response"
+    assert {widget["type"] for widget in role_payload["widgets"]} == {"comparison_table", "action_form"}
+    assert role_payload["widgets"][0]["rows"][1]["status"] == "Blocked"
+
+    assert _is_anti_theft_demo_query("Can you help me spot a stock movement that looks suspicious?")
+
+    history = [{"role": "user", "content": "Can you help me spot a stock movement that looks suspicious?"}]
+    assert _is_anti_theft_review_follow_up_query("What should I review first?", history)
+    assert _build_anti_theft_review_follow_up_insight()["widgets"][0]["type"] == "ranked_list"
+
+
+def test_morning_briefing_plain_text_is_promoted_to_a_widget() -> None:
+    parts, summary = _structure_demo_plain_text_response(
+        user_text="Give me a morning briefing before I open the stores.",
+        response_parts=[langgraph_processor_module.TextPart(text="Stores can open.\n- Review overdue POs.")],
+        response_text="Stores can open.\n- Review overdue POs.",
+    )
+    assert summary == "Stores can open."
+    assert parts[0].data["kind"] == "insight_response"
+    assert parts[0].data["widgets"][0]["type"] == "text_list"
+
+
+def test_morning_briefing_demo_prompt_uses_deterministic_host_insight() -> None:
+    assert _host_named_insight_from_text("Give me a morning briefing before I open the stores.") == "morning_briefing"
+
+
+def test_empty_morning_briefing_result_is_not_rendered_as_raw_json() -> None:
+    parts, summary = _structure_demo_plain_text_response(
+        user_text="Give me a morning briefing before I open the stores.",
+        response_parts=[TextPart(text="[]")],
+        response_text="[]",
+    )
+    assert summary.startswith("No morning briefing items were returned")
+    assert "No morning briefing items" in json.dumps(parts[0].data["widgets"][0])
+
+
+def test_morning_briefing_drops_serialized_insight_payload() -> None:
+    parts, summary = _structure_demo_plain_text_response(
+        user_text="Give me a morning briefing before I open the stores.",
+        response_parts=[TextPart(text="Procurement status: Follow up on overdue POs. insight_response: - summary: raw")],
+        response_text="Procurement status: Follow up on overdue POs. insight_response: - summary: raw",
+    )
+    assert summary == "Procurement status: Follow up on overdue POs."
+    assert "insight_response" not in json.dumps(parts[0].data["widgets"][0])
+
+
+def test_morning_briefing_promotes_serialized_widget_json() -> None:
+    parts, summary = _structure_demo_plain_text_response(
+        user_text="Give me a morning briefing before I open the stores.",
+        response_parts=[TextPart(text='{"summary":"Three POs need follow-up.","widgets":[{"type":"pipeline_counts","counts":{"issued":3}}]}')],
+        response_text='{"summary":"Three POs need follow-up.","widgets":[{"type":"pipeline_counts","counts":{"issued":3}}]}',
+    )
+    assert summary == "Three POs need follow-up."
+    assert parts[0].data["kind"] == "insight_response"
+    assert parts[0].data["widgets"][0]["type"] == "pipeline_counts"
+
+
+def test_coerce_delegated_response_sanitizes_child_artifacts_and_summary() -> None:
+    delegated = _coerce_delegated_response(
+        {
+            "selected_agent": "inventory",
+            "response_text": "Morning briefing: review overdue POs. insight_response: - summary: leaked",
+            "result_parts": [
+                {"kind": "text", "text": "Morning briefing: review overdue POs. insight_response: - summary: leaked"}
+            ],
+            "artifacts": {
+                "result": [
+                    {
+                        "kind": "data",
+                        "data": {
+                            "kind": "insight_response",
+                            "widgets": [
+                                {"type": "text_block", "content": "Morning briefing. insight_response: leaked"}
+                            ],
+                        },
+                    }
+                ]
+            },
+        }
+    )
+
+    assert delegated is not None
+    assert delegated["response_text"] == "Morning briefing: review overdue POs."
+    artifact_text = str(delegated["child_artifacts"]["result"][0]["data"]["widgets"][0]["content"])
+    assert artifact_text == "Morning briefing."
+
+
+def test_purchase_order_draft_is_not_routed_to_marketplace() -> None:
+    query = "Create a draft purchase order grouped by supplier."
+    agents = [
+        {"name": "inventory"},
+        {"name": "product"},
+        {"name": "inventory_procurement"},
+        {"name": "marketplace_sourcing"},
+    ]
+
+    assert _is_actionable_marketplace_search_query(query) is False
+    assert _select_host_delegation_agent(query, agents) == "inventory"
+    assert _select_router_specialist_agent("product", query, agents) == "inventory_procurement"
+
+
+def test_supplier_replenishment_performance_is_not_routed_to_marketplace() -> None:
+    query = "Which supplier is delaying my replenishment most often?"
+    agents = [{"name": "inventory"}, {"name": "product"}]
+
+    assert _is_actionable_marketplace_search_query(query) is False
+    assert _select_host_delegation_agent(query, agents) == "inventory"
+
+
+def test_procurement_money_widgets_declare_currency_explicitly() -> None:
+    payload = {
+        "currency_code": "NGN",
+        "timeframe": {"label": "last 30 days"},
+        "analytics": {
+            "supplier_performance": [
+                {"supplier_name": "Acme", "order_count": 2, "total_value": 1200, "avg_delivery_time": 4}
+            ],
+            "on_time_delivery_rate": 0.5,
+            "average_delivery_time": 4,
+        },
+    }
+
+    supplier = _build_procurement_supplier_insight(payload)
+    scorecard = supplier["widgets"][1]
+    chart = supplier["widgets"][2]
+    ranked = supplier["widgets"][3]
+    assert supplier["currency_code"] == "NGN"
+    assert next(column for column in scorecard["columns"] if isinstance(column, dict))["format"] == "currency"
+    assert chart["y_format"] == "currency"
+    assert ranked["items"][0]["value_format"] == "currency"
+
+    cost = _build_procurement_cost_variance_insight(payload)
+    assert all(item["format"] == "currency" for item in cost["widgets"][0]["data"])
+    assert cost["widgets"][2]["y_format"] == "currency"
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_insight", "expected_agent"),
+    [
+        ("Which location is leading by value?", "pos::sales_by_location", "pos"),
+        ("Which supplier is delaying my replenishment most often?", "inventory_procurement::supplier_performance", "inventory"),
+        ("Show me risky permission changes this week.", "users::permission_security_activity", "users"),
+        ("Who changed the reorder point for Sure Men Invisible Ice?", "users::audit_search", "users"),
+        ("I want my cashier to sell products but not approve purchase orders. Can you check the role?", None, "users"),
+    ],
+)
+def test_demo_prompts_use_the_expected_domain_route(
+    query: str,
+    expected_insight: str | None,
+    expected_agent: str,
+) -> None:
+    assert _host_named_insight_from_text(query) == expected_insight
+    assert _strong_domain_agent_override(query) == expected_agent
+
+
 def test_host_orchestration_plan_builds_cross_domain_business_review_flow() -> None:
     plan = _host_orchestration_plan(
         "Analyze my business performance for the last quarter",
@@ -1963,10 +3020,12 @@ def test_host_orchestration_plan_builds_cross_domain_business_review_flow() -> N
             {"name": "inventory"},
             {"name": "pos"},
             {"name": "users"},
+            {"name": "product"},
         ],
     )
 
-    assert plan == ["pos", "inventory", "users"]
+    assert plan == ["pos", "inventory", "product"]
+    assert "users" not in plan
 
 
 def test_delegated_business_review_is_intercepted_by_each_domain_before_llm_fallback() -> None:
@@ -1985,10 +3044,7 @@ def test_delegated_business_review_is_intercepted_by_each_domain_before_llm_fall
         "inventory",
         "Analyze my business performance for the last three months",
     )
-    assert _business_review_specialist_domain("users", request) == (
-        "users",
-        "Analyze my business performance for the last three months",
-    )
+    assert _business_review_specialist_domain("users", request) is None
     assert _business_review_specialist_domain("product_discovery", request) == (
         "product",
         "Analyze my business performance for the last three months",
@@ -2019,7 +3075,10 @@ def test_strong_domain_override_does_not_force_pos_for_cross_domain_business_rev
 
 
 @pytest.mark.asyncio
-async def test_host_auto_completes_cross_domain_business_review_without_continue_prompt() -> None:
+async def test_host_auto_completes_cross_domain_business_review_without_continue_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_processor_clock(monkeypatch, year=2026, month=7, day=10)
     processor = make_langgraph_chat_processor_from_env(agent_name="host")
     request = "Analyze my business performance for the last quarter"
     task = Task(
@@ -2039,73 +3098,15 @@ async def test_host_auto_completes_cross_domain_business_review_without_continue
         for event in events
         if isinstance(event, Artifact) and isinstance(event.name, str) and event.name.endswith(".result")
     }
-    assert specialist_result_names >= {"pos.result", "inventory.result", "users.result", "product.result"}
+    assert specialist_result_names >= {"pos.result", "inventory.result", "product.result"}
+    assert "users.result" not in specialist_result_names
 
-    assert fake_langgraph_components.FAKE_TOOL_CALLS[:5] == [
-        ("list_available_agents", {}),
-        (
-            "delegate_to_agent",
-            {
-                "request": (
-                    "Continue the user's multi-domain business review.\n"
-                    "Original user request: Analyze my business performance for the last quarter\n"
-                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
-                    "Run the full Point of Sale (POS) portion of the business review for that same time range.\n"
-                    "Use sensible defaults and do not ask the user for a menu selection unless access is genuinely blocked."
-                ),
-                "agent_name": "pos",
-            },
-        ),
-        (
-            "delegate_to_agent",
-            {
-                "request": (
-                    "Continue the user's multi-domain business review.\n"
-                    "Original user request: Analyze my business performance for the last quarter\n"
-                    "Completed steps so far: Point of Sale (POS).\n"
-                    "Latest completed step result: Sales performance for the last quarter is ready. Revenue was strongest in the final month and repeat purchasing improved.\n"
-                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
-                    "Run the full Inventory Management portion of the business review for that same time range.\n"
-                    "Cover all of these in one response: stock posture and availability; turnover and velocity; reorder recommendations; ageing and expiry analysis; valuation and carrying cost; fulfillment and reservation issues; and procurement or receiving signals that affect stock health.\n"
-                    "Use defaults without asking the user to choose a single focus: include all locations, provide both company-wide and per-location outputs, use POS sales from earlier steps as the demand signal where helpful, and only include lot or expiry-aware analysis if the workspace tracks it.\n"
-                    "Do not send a focus picker, a default-confirmation checklist, or any retry prompt unless required permissions or source data are truly unavailable."
-                ),
-                "agent_name": "inventory",
-            },
-        ),
-        (
-            "delegate_to_agent",
-            {
-                "request": (
-                    "Continue the user's multi-domain business review.\n"
-                    "Original user request: Analyze my business performance for the last quarter\n"
-                    "Completed steps so far: Point of Sale (POS), Inventory Management.\n"
-                    "Latest completed step result: Inventory health for the requested review period is ready. Stock posture was stable overall, slow movers tied up capital, several reorder candidates emerged, and fulfillment delays were concentrated in a small set of locations.\n"
-                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
-                    "Run the full Users and Workspace Controls portion of the business review for that same time range.\n"
-                    "Cover staff activity, audit anomalies, role or permission risks, and subscription or capacity pressure that could affect operations.\n"
-                    "Use sensible defaults and do not ask the user to choose a sub-focus unless access is genuinely blocked."
-                ),
-                "agent_name": "users",
-            },
-        ),
-        (
-            "delegate_to_agent",
-            {
-                    "request": (
-                        "Continue the user's multi-domain business review.\n"
-                        "Original user request: Analyze my business performance for the last quarter\n"
-                        "Completed steps so far: Point of Sale (POS), Inventory Management, User and Workspace Management.\n"
-                        "Latest completed step result: Workspace controls for the requested review period are ready. Staff activity was concentrated in a few operators, audit activity stayed normal overall, and there was no immediate subscription-capacity pressure.\n"
-                        "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
-                        "Run the full Product Management portion of the business review for that same time range.\n"
-                        "Cover catalog health, assortment gaps, duplicate-code risks, media or merchandising weaknesses, and global catalog import opportunities that could strengthen current demand coverage.\n"
-                        "Use sensible defaults and do not ask the user to choose a sub-focus unless access is genuinely blocked."
-                ),
-                "agent_name": "product",
-            },
-        ),
+    delegation_agents = [
+        args.get("agent_name")
+        for name, args in fake_langgraph_components.FAKE_TOOL_CALLS
+        if name == "delegate_to_agent"
     ]
+    assert delegation_agents == ["pos", "inventory", "product"]
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     result_payload = result_artifact.parts[0].data
@@ -2118,7 +3119,7 @@ async def test_host_auto_completes_cross_domain_business_review_without_continue
     section_titles = [section["title"] for section in widgets[1]["sections"]]
     assert "Point of Sale (POS)" in section_titles
     assert "Inventory Management" in section_titles
-    assert "User and Workspace Management" in section_titles
+    assert "User and Workspace Management" not in section_titles
     assert "Product Management" in section_titles
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
@@ -2291,7 +3292,61 @@ async def test_host_sales_follow_up_merges_from_saved_clarification_workflow_sta
 
 
 @pytest.mark.asyncio
-async def test_host_merges_business_review_follow_up_from_task_history() -> None:
+async def test_completed_clarification_does_not_resurrect_stale_workflow_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores: list[InMemoryContextMemoryStore] = []
+
+    class _CapturingMemoryStore(InMemoryContextMemoryStore):
+        def __init__(self) -> None:
+            super().__init__()
+            stores.append(self)
+
+    class _SalesOverviewExecutor(fake_langgraph_components.FakeToolExecutorWithPosAnalytics):
+        async def call_tool(self, *, name: str, arguments: dict[str, object], ctx: ToolContext) -> object:
+            if name == "pos.get_top_sellers":
+                fake_langgraph_components.FAKE_TOOL_CALLS.append((name, dict(arguments)))
+                return {"results": []}
+            return await super().call_tool(name=name, arguments=arguments, ctx=ctx)
+
+    monkeypatch.setenv("KA2A_CONTEXT_MEMORY_STORE", "memory")
+    monkeypatch.setattr(langgraph_processor_module, "InMemoryContextMemoryStore", _CapturingMemoryStore)
+    processor = make_langgraph_chat_processor_from_env(
+        agent_name="host",
+        tool_executor_override=_SalesOverviewExecutor(agent_name="host"),
+    )
+    context_id = "ctx-host-sales-cleared-workflow"
+
+    first_request = "Can you analyze my sales data?"
+    first_task = Task(
+        id="task-host-sales-cleared-workflow-first",
+        context_id=context_id,
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=first_request)])),
+    )
+    first_events = [event async for event in processor(first_task, Message(role=Role.user, parts=[TextPart(text=first_request)]), None, None)]
+    assert any(isinstance(event, TaskStatus) and event.state == TaskState.input_required for event in first_events)
+
+    follow_up = "for the last one year"
+    second_task = Task(
+        id="task-host-sales-cleared-workflow-second",
+        context_id=context_id,
+        status=TaskStatus(state=TaskState.submitted, message=Message(role=Role.user, parts=[TextPart(text=follow_up)])),
+    )
+    second_events = [event async for event in processor(second_task, Message(role=Role.user, parts=[TextPart(text=follow_up)]), None, None)]
+    assert any(isinstance(event, TaskStatus) and event.state == TaskState.completed for event in second_events)
+
+    assert len(stores) == 1
+    persisted = await stores[0].get(context_id=context_id, principal=None)
+    assert persisted is not None
+    assert persisted.workflow_state is None
+    assert persisted.analysis is not None
+
+
+@pytest.mark.asyncio
+async def test_host_merges_business_review_follow_up_from_task_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_processor_clock(monkeypatch, year=2026, month=7, day=10)
     processor = make_langgraph_chat_processor_from_env(agent_name="host")
     original_request = "Can you help me analyze my business performance?"
     follow_up_answer = "last quarter"
@@ -2318,71 +3373,12 @@ async def test_host_merges_business_review_follow_up_from_task_history() -> None
 
     events = [event async for event in processor(task, message, None, None)]
 
-    assert fake_langgraph_components.FAKE_TOOL_CALLS[:5] == [
-        ("list_available_agents", {}),
-        (
-            "delegate_to_agent",
-            {
-                "request": (
-                    "Continue the user's multi-domain business review.\n"
-                    "Original user request: Analyze my business performance for the last quarter\n"
-                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
-                    "Run the full Point of Sale (POS) portion of the business review for that same time range.\n"
-                    "Use sensible defaults and do not ask the user for a menu selection unless access is genuinely blocked."
-                ),
-                "agent_name": "pos",
-            },
-        ),
-        (
-            "delegate_to_agent",
-            {
-                "request": (
-                    "Continue the user's multi-domain business review.\n"
-                    "Original user request: Analyze my business performance for the last quarter\n"
-                    "Completed steps so far: Point of Sale (POS).\n"
-                    "Latest completed step result: Sales performance for the last quarter is ready. Revenue was strongest in the final month and repeat purchasing improved.\n"
-                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
-                    "Run the full Inventory Management portion of the business review for that same time range.\n"
-                    "Cover all of these in one response: stock posture and availability; turnover and velocity; reorder recommendations; ageing and expiry analysis; valuation and carrying cost; fulfillment and reservation issues; and procurement or receiving signals that affect stock health.\n"
-                    "Use defaults without asking the user to choose a single focus: include all locations, provide both company-wide and per-location outputs, use POS sales from earlier steps as the demand signal where helpful, and only include lot or expiry-aware analysis if the workspace tracks it.\n"
-                    "Do not send a focus picker, a default-confirmation checklist, or any retry prompt unless required permissions or source data are truly unavailable."
-                ),
-                "agent_name": "inventory",
-            },
-        ),
-        (
-            "delegate_to_agent",
-            {
-                "request": (
-                    "Continue the user's multi-domain business review.\n"
-                    "Original user request: Analyze my business performance for the last quarter\n"
-                    "Completed steps so far: Point of Sale (POS), Inventory Management.\n"
-                    "Latest completed step result: Inventory health for the requested review period is ready. Stock posture was stable overall, slow movers tied up capital, several reorder candidates emerged, and fulfillment delays were concentrated in a small set of locations.\n"
-                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
-                    "Run the full Users and Workspace Controls portion of the business review for that same time range.\n"
-                    "Cover staff activity, audit anomalies, role or permission risks, and subscription or capacity pressure that could affect operations.\n"
-                    "Use sensible defaults and do not ask the user to choose a sub-focus unless access is genuinely blocked."
-                ),
-                "agent_name": "users",
-            },
-        ),
-        (
-            "delegate_to_agent",
-            {
-                "request": (
-                    "Continue the user's multi-domain business review.\n"
-                    "Original user request: Analyze my business performance for the last quarter\n"
-                    "Completed steps so far: Point of Sale (POS), Inventory Management, User and Workspace Management.\n"
-                    "Latest completed step result: Workspace controls for the requested review period are ready. Staff activity was concentrated in a few operators, audit activity stayed normal overall, and there was no immediate subscription-capacity pressure.\n"
-                    "Time range to use: last quarter (2026-04-01 to 2026-06-30).\n"
-                    "Run the full Product Management portion of the business review for that same time range.\n"
-                    "Cover catalog health, assortment gaps, duplicate-code risks, media or merchandising weaknesses, and global catalog import opportunities that could strengthen current demand coverage.\n"
-                    "Use sensible defaults and do not ask the user to choose a sub-focus unless access is genuinely blocked."
-                ),
-                "agent_name": "product",
-            },
-        ),
+    delegation_agents = [
+        args.get("agent_name")
+        for name, args in fake_langgraph_components.FAKE_TOOL_CALLS
+        if name == "delegate_to_agent"
     ]
+    assert delegation_agents == ["pos", "inventory", "product"]
 
     result_artifact = next(event for event in events if isinstance(event, Artifact) and event.name == "result")
     result_payload = result_artifact.parts[0].data
@@ -2392,7 +3388,7 @@ async def test_host_merges_business_review_follow_up_from_task_history() -> None
     section_titles = [section["title"] for section in result_payload["widgets"][1]["sections"]]
     assert "Inventory Management" in section_titles
     assert "Point of Sale (POS)" in section_titles
-    assert "User and Workspace Management" in section_titles
+    assert "User and Workspace Management" not in section_titles
     assert "Product Management" in section_titles
 
     status_events = [event for event in events if isinstance(event, TaskStatus)]
@@ -5614,7 +6610,10 @@ async def test_inventory_router_auto_delegates_to_inventory_setup_subspecialist(
 
 
 @pytest.mark.asyncio
-async def test_inventory_router_rewrites_comprehensive_business_review_for_visibility_specialist() -> None:
+async def test_inventory_router_rewrites_comprehensive_business_review_for_visibility_specialist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_processor_clock(monkeypatch, year=2026, month=7, day=10)
     processor = make_langgraph_chat_processor_from_env(agent_name="inventory")
     request = (
         "Continue the user's multi-domain business review.\n"
