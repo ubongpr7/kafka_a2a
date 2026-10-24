@@ -34,8 +34,10 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s' "${SSH_PRIVATE_KEY}" > ~/.ssh/deploy_key
           printf '%s\n' "${SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          printf '%s\n' 'Host *' '  IdentityFile ~/.ssh/deploy_key' '  IdentitiesOnly yes' > ~/.ssh/config
           chmod 400 ~/.ssh/deploy_key
           chmod 600 ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/config
 
       - name: Sync Repo
         run: |
