@@ -32,7 +32,7 @@ jobs:
           test -n "${SSH_PRIVATE_KEY}" || { echo "EC2_PRIVATE_KEY is required"; exit 1; }
           test -n "${SSH_KNOWN_HOSTS}" || { echo "EC2_KNOWN_HOSTS is required"; exit 1; }
           mkdir -p ~/.ssh
-          printf '%s' "${SSH_PRIVATE_KEY}" > ~/.ssh/deploy_key
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > ~/.ssh/deploy_key
           printf '%s\n' "${SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
           printf '%s\n' 'Host *' '  IdentityFile ~/.ssh/deploy_key' '  IdentitiesOnly yes' > ~/.ssh/config
           chmod 400 ~/.ssh/deploy_key
